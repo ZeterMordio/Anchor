@@ -1,5 +1,12 @@
 traindocs/
 session_logs/
-*.pyc
 __pycache__/
+*.pyc
 .DS_Store
+data_cache/
+toy1_model/
+*.safetensors
+*.bin
+checkpoints/
+runs/
+wandb/
