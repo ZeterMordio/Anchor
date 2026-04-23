@@ -1,240 +1,266 @@
-"""Toy Run 1: Minimal GRPO for negotiation (single-turn buyer, rule seller).
+"""
+Toy Run 1: Minimal GRPO for negotiation (single-turn buyer, rule seller).
 Goal: Validate pipeline: model loading, generation, reward computation, update.
-Uses Qwen3-1.7B on T4-small.
+Uses Qwen3-1.7B on a small GPU with LoRA to prevent OOM.
 """
 import os
+import sys
 import re
 import math
 import json
 import random
+import time
+import traceback
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model, TaskType
+
 from data_loader import load_dataset, format_inventory, format_shopping_list
 
+# ─── Diagnostics ──────────────────────────────────────────────────────────────
+def log_cuda():
+    print(f"torch.__version__: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        x = torch.randn(2, 2).cuda()
+        y = x @ x.T
+        print(f"CUDA tensor op OK: {y.device}")
+    else:
+        print("WARNING: No CUDA available — will fail!")
+        sys.exit(1)
 
-def parse_price(price_str: str) -> float:
-    return float(price_str.replace("$", "").replace(",", "").strip())
 
+# ─── Prompts ─────────────────────────────────────────────────────────────────
+BUYER_SYSTEM_PROMPT = """You are a buyer negotiating for the best possible price.
 
-BUYER_SYSTEM_PROMPT = """You are a buyer negotiating for the best price.
-
-Format your reply as:
-Thought: <your strategic thinking>
+Format your reply EXACTLY as:
+Thought: <your strategic reasoning>
 Talk: <what you say to the seller>
-Action: [BUY] $<price> (1x <codename>)"""
+Action: [BUY] $<price> (1x <codename>)
+
+You must include all three parts. The Action must be one of:
+- [BUY] $M (1x codename)  — make an offer
+- [DEAL] $M (1x codename) — accept seller's offer
+- [REJECT] — reject and wait
+- [QUIT] — give up and end negotiation"""
 
 
-def build_prompt(product: dict) -> str:
+def build_prompt(product: dict) -> list:
     inv = format_inventory(product)
     need = format_shopping_list(product)
-    user = f"{inv}\n\n{need}\n\nNegotiate in 6 turns. Make your first offer now."
-    messages = [
+    user = (
+        f"{inv}\n\n{need}\n\n"
+        f"Now, I play the role of seller and you play the role of buyer. "
+        f"We are going to negotiate based on the Inventory List in 6 turns. "
+        f"Make your first offer now."
+    )
+    return [
         {"role": "system", "content": BUYER_SYSTEM_PROMPT},
         {"role": "user", "content": user},
     ]
-    return messages
+
+
+# ─── Action Extraction ───────────────────────────────────────────────────────
+ACTION_RE = re.compile(
+    r'\[(BUY|SELL|DEAL|REJECT|QUIT)\]'
+    r'(?:\s*\$([\d,\.]+))?'
+    r'(?:\s*\(([^)]*)\))?',
+    re.IGNORECASE,
+)
 
 
 def extract_action(text: str) -> dict:
-    """Extract [BUY], [DEAL], [REJECT], [QUIT] and price."""
-    # Look for [BUY] $X or [BUY] $X.XX
-    m = re.search(r'\[(BUY|SELL|DEAL|REJECT|QUIT)\](?:\s*\$([\d,.]+))?(?:\s*\(([^)]*)\))?', text, re.I)
+    m = ACTION_RE.search(text)
     if m:
         price_str = m.group(2)
         price = float(price_str.replace(",", "")) if price_str else None
         return {"type": m.group(1).upper(), "price": price, "raw": m.group(0)}
-    return {"type": "UNKNOWN", "price": None, "raw": text[-80:]}
+    return {"type": "UNKNOWN", "price": None, "raw": text[-120:]}
 
 
+# ─── Simple Rule Seller ──────────────────────────────────────────────────────
 def simple_seller_responds(buyer_action: dict, product: dict) -> tuple:
-    """Rule-based seller. Returns (seller_text, final_price, done)."""
     cost = product["cost"]
     budget = product["budget"]
     list_price = product["list_price"]
     codename = product["codename"]
-    
     atype = buyer_action["type"]
     price = buyer_action["price"] or 0
-    
+
     if atype == "QUIT":
-        return "The buyer quit.", None, True
-    
+        return "The buyer has quit the negotiation.", None, True
     if atype == "UNKNOWN":
         return "Invalid format.", None, True
-    
+    if atype == "DEAL":
+        if price >= cost:
+            return "Deal accepted!", price, True
+        return "I cannot sell below my cost.", None, True
     if atype == "BUY":
         if price >= cost * 1.3:
-            # Good offer — accept
-            return f"[SELL] ${price:.0f} (1x {codename})", price, True
+            return f"Thought: Good offer.\nTalk: Works for me!\nAction: [DEAL] ${price:.0f} (1x {codename})", price, True
         elif price >= cost:
-            # Reasonable — counter
             counter = (price + list_price) / 2
-            return f"[SELL] ${counter:.0f} (1x {codename})", None, False
+            return f"Thought: I can counter.\nTalk: How about ${counter:.0f}?\nAction: [SELL] ${counter:.0f} (1x {codename})", None, False
         else:
-            # Too low
             counter = (price + list_price * 0.95) / 2
-            return f"[SELL] ${counter:.0f} (1x {codename})", None, False
-    
-    return "[REJECT]", None, False
+            return f"Thought: Too low.\nTalk: My best is ${counter:.0f}.\nAction: [SELL] ${counter:.0f} (1x {codename})", None, False
+    return "Thought: Waiting.\nTalk: ...\nAction: [REJECT]", None, False
 
 
-def compute_reward(final_price: float, budget: float, cost: float) -> float:
-    """Paper's reward formula, simplified for single-turn acceptance."""
+# ─── Reward ──────────────────────────────────────────────────────────────────
+def compute_reward(final_price, budget, cost):
     if final_price is None:
         return 0.0  # QUIT / no deal
-    
-    if budget > cost:
-        # MI scenario
-        reward = (budget - final_price) / abs(budget - cost)
-    else:
-        # CI scenario
-        reward = (budget - final_price) / abs(budget - cost)
-    
+    denom = abs(budget - cost)
+    if denom < 1e-6:
+        return 0.0
+    reward = (budget - final_price) / denom
     return max(-1.0, min(1.0, reward))
 
 
-def generate_completions(model, tokenizer, prompts: list, num_generations: int = 4,
-                         max_new_tokens: int = 150, temperature: float = 1.0, device: str = "cuda") -> list:
-    """Generate G completions for each prompt. Returns list of (text, logprob_sum) tuples per prompt."""
+# ─── Generation ──────────────────────────────────────────────────────────────
+@torch.no_grad()
+def generate_completions(model, tokenizer, prompts, num_generations=4,
+                         max_new_tokens=120, temperature=1.0):
+    """Generate G completions per prompt."""
     all_results = []
-    
     for prompt in prompts:
-        # Convert to text
-        prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True,
-                                                     enable_thinking=False)
-        prompt_ids = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=1024).to(device)
-        
+        prompt_text = tokenizer.apply_chat_template(
+            prompt, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        prompt_ids = tokenizer(prompt_text, return_tensors="pt",
+                               truncation=True, max_length=1024).to(model.device)
         results = []
         for _ in range(num_generations):
-            with torch.no_grad():
-                outputs = model.generate(
-                    **prompt_ids,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=True,
-                    temperature=temperature,
-                    top_p=1.0,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    return_dict_in_generate=True,
-                    output_scores=True,
-                )
-            
+            outputs = model.generate(
+                **prompt_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=1.0,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_scores=True,
+            )
             gen_tokens = outputs.sequences[0][prompt_ids["input_ids"].shape[1]:]
             gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
-            
-            # Compute logprob sum for generated tokens
-            scores = torch.stack(outputs.scores, dim=1)  # [1, gen_len, vocab]
+
+            # logprob sum
+            scores = torch.stack(outputs.scores, dim=1)
             log_probs = F.log_softmax(scores, dim=-1)
-            token_log_probs = torch.gather(log_probs[0], 1, gen_tokens.unsqueeze(-1)).squeeze(-1)
-            logprob_sum = token_log_probs.sum().item()
-            
+            token_lp = torch.gather(log_probs[0], 1, gen_tokens.unsqueeze(-1)).squeeze(-1)
+
             results.append({
                 "text": gen_text,
-                "logprob_sum": logprob_sum,
-                "token_log_probs": token_log_probs,
+                "logprob_sum": token_lp.sum().item(),
+                "token_log_probs": token_lp,
                 "gen_tokens": gen_tokens,
                 "prompt_text": prompt_text,
                 "prompt_ids": prompt_ids["input_ids"],
             })
-        
         all_results.append(results)
-    
     return all_results
 
 
-def grpo_update(model, ref_model, tokenizer, batch_data: list, optimizer, device: str, epsilon: float = 0.2):
-    """GRPO update for a batch of (prompt, completion, advantage) triples.
-    
-    batch_data: list of dicts with keys:
-        - prompt_text: str
-        - gen_tokens: tensor of completion token IDs
-        - advantages: scalar advantage value
-    """
+# ─── GRPO Update ─────────────────────────────────────────────────────────────
+def grpo_update(model, ref_model, tokenizer, batch_data, optimizer, epsilon=0.2):
     model.train()
     total_loss = 0.0
-    total_tokens = 0
-    
     for item in batch_data:
         prompt_text = item["prompt_text"]
         gen_tokens = item["gen_tokens"]
         advantage = item["advantage"]
-        
-        # Full text
+
         full_text = prompt_text + item["text"]
-        full_ids = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=2048).to(device)
-        
-        # Prompt length
-        prompt_ids = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=2048).to(device)["input_ids"]
+        full_ids = tokenizer(full_text, return_tensors="pt",
+                             truncation=True, max_length=2048).to(model.device)
+
+        prompt_ids = tokenizer(prompt_text, return_tensors="pt",
+                               truncation=True, max_length=2048).to(model.device)["input_ids"]
         prompt_len = prompt_ids.shape[1]
-        
-        # Forward pass policy
+
+        # Policy forward
         outputs = model(**full_ids)
         logits = outputs.logits
-        
         log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
-        token_log_probs = torch.gather(log_probs, 2, full_ids["input_ids"][:, 1:].unsqueeze(-1)).squeeze(-1)
-        
-        # Forward pass reference
+        token_lp = torch.gather(log_probs, 2,
+                                full_ids["input_ids"][:, 1:].unsqueeze(-1)).squeeze(-1)
+
+        # Reference forward
         with torch.no_grad():
             ref_outputs = ref_model(**full_ids)
             ref_logits = ref_outputs.logits
             ref_log_probs = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
-            ref_token_log_probs = torch.gather(ref_log_probs, 2, full_ids["input_ids"][:, 1:].unsqueeze(-1)).squeeze(-1)
-        
-        # Completion mask
+            ref_token_lp = torch.gather(ref_log_probs, 2,
+                                        full_ids["input_ids"][:, 1:].unsqueeze(-1)).squeeze(-1)
+
         mask = full_ids["attention_mask"][:, 1:].clone()
-        mask[:, :prompt_len - 1] = 0  # Only completion tokens
-        
-        # Ratio
-        ratio = torch.exp(token_log_probs - ref_token_log_probs)
-        clipped_ratio = torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
-        
-        # GRPO surrogate loss
+        mask[:, :prompt_len - 1] = 0
+
+        ratio = torch.exp(token_lp - ref_token_lp)
+        clipped = torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
+
         surr1 = ratio * advantage
-        surr2 = clipped_ratio * advantage
+        surr2 = clipped * advantage
         policy_loss = -torch.min(surr1, surr2)
-        
-        # Masked mean
+
         loss = (policy_loss * mask).sum() / (mask.sum() + 1e-8)
-        
         total_loss += loss
-        total_tokens += mask.sum().item()
-    
-    # Average
+
     avg_loss = total_loss / len(batch_data)
-    
     optimizer.zero_grad()
     avg_loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
-    
     return avg_loss.item()
 
 
+# ─── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
-    
-    # Load dataset
+    log_cuda()
+
+    # Dataset
+    print("\n[1/6] Loading dataset...")
     ds = load_dataset()
     train_products = ds["train"]
-    
-    # Load model
+    print(f"Train products: {len(train_products)}")
+
+    # Model + Tokenizer
     model_name = "Qwen/Qwen3-1.7B"
-    print(f"Loading {model_name}...")
+    print(f"\n[2/6] Loading tokenizer: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+
+    print(f"\n[3/6] Loading policy model...")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
     )
-    
-    # Reference model (frozen copy)
+
+    # LoRA
+    print("\n[4/6] Applying LoRA...")
+    lora_cfg = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+    model = get_peft_model(model, lora_cfg)
+    model.print_trainable_parameters()
+
+    # Reference model (frozen, no LoRA)
+    print("\n[5/6] Loading reference model...")
     ref_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
@@ -244,27 +270,37 @@ def main():
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad = False
-    
-    print(f"Model loaded. Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    
+
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
-    
-    # Training loop
+
+    # Training config
     num_iterations = 5
-    batch_size = 8  # products per iteration
-    group_size = 4   # generations per product
-    
+    batch_size = 8
+    group_size = 4
+    max_new_tokens = 100
+
+    print(f"\n[6/6] Starting training: {num_iterations} iters, {batch_size} products, G={group_size}")
+
+    metrics_log = []
+    start_time = time.time()
+
     for iteration in range(num_iterations):
+        iter_start = time.time()
+        print(f"\n--- Iteration {iteration} ---")
+
         # Sample products
         products = random.sample(train_products, min(batch_size, len(train_products)))
         prompts = [build_prompt(p) for p in products]
-        
-        # Generate completions
-        print(f"\nIter {iteration}: generating {len(products)} x {group_size} completions...")
-        completions = generate_completions(model, tokenizer, prompts, num_generations=group_size, device=device)
-        
-        # Evaluate each completion
+
+        # Generate
+        print("  Generating...")
+        completions = generate_completions(
+            model, tokenizer, prompts,
+            num_generations=group_size, max_new_tokens=max_new_tokens,
+        )
+
+        # Evaluate
         rewards_all = []
         for i, product in enumerate(products):
             group_rewards = []
@@ -274,44 +310,63 @@ def main():
                 seller_text, final_price, done = simple_seller_responds(action, product)
                 reward = compute_reward(final_price, product["budget"], product["cost"])
                 group_rewards.append(reward)
-                group_data.append({
-                    **comp,
-                    "action": action,
-                    "reward": reward,
-                    "final_price": final_price,
-                })
-            
-            # Compute advantages
+                group_data.append({**comp, "action": action, "reward": reward,
+                                   "final_price": final_price})
+
             mean_reward = sum(group_rewards) / len(group_rewards)
-            for j, gd in enumerate(group_data):
+            for gd in group_data:
                 gd["advantage"] = gd["reward"] - mean_reward
-            
             rewards_all.extend(group_data)
-        
-        # GRPO update
-        loss = grpo_update(model, ref_model, tokenizer, rewards_all, optimizer, device)
-        
+
+        # Update
+        print("  Updating...")
+        loss = grpo_update(model, ref_model, tokenizer, rewards_all, optimizer)
+
         # Metrics
         mean_reward = sum(d["reward"] for d in rewards_all) / len(rewards_all)
-        mean_advantage = sum(d["advantage"] for d in rewards_all) / len(rewards_all)
+        mean_adv = sum(d["advantage"] for d in rewards_all) / len(rewards_all)
         deal_rate = sum(1 for d in rewards_all if d["final_price"] is not None) / len(rewards_all)
-        
-        print(f"  Loss: {loss:.4f} | Mean Reward: {mean_reward:.4f} | "
-              f"Adv: {mean_advantage:.4f} | Deal Rate: {deal_rate:.2%}")
-        
-        # Sample one completion
+        mean_price = sum(d["final_price"] for d in rewards_all if d["final_price"] is not None) / max(1, sum(1 for d in rewards_all if d["final_price"] is not None))
+
+        print(f"  Loss: {loss:.4f} | Reward: {mean_reward:.4f} | "
+              f"Adv: {mean_adv:.4f} | Deal: {deal_rate:.1%} | "
+              f"MeanPrice: ${mean_price:.2f} | "
+              f"Time: {time.time() - iter_start:.1f}s")
+
+        metrics_log.append({
+            "iteration": iteration,
+            "loss": loss,
+            "mean_reward": mean_reward,
+            "mean_advantage": mean_adv,
+            "deal_rate": deal_rate,
+            "mean_price": mean_price,
+            "time": time.time() - iter_start,
+        })
+
+        # Sample
         sample = rewards_all[0]
         print(f"  Sample: {sample['action']['type']} ${sample['action']['price']} "
-              f"-> Reward: {sample['reward']:.4f}")
-    
-    print("\nToy Run 1 complete!")
-    
+              f"-> R={sample['reward']:.4f} | text[:80]: {sample['text'][:80]}")
+
     # Save
-    save_path = "/app/anchor_negotiation/toy1_model"
-    model.save_pretrained(save_path)
-    tokenizer.save_pretrained(save_path)
-    print(f"Model saved to {save_path}")
+    print("\nSaving model...")
+    save_dir = "/app/toy1_model"
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
+
+    # Save metrics
+    with open(f"{save_dir}/metrics.json", "w") as f:
+        json.dump(metrics_log, f, indent=2)
+
+    print(f"\nToy Run 1 complete! Total time: {time.time() - start_time:.1f}s")
+    print(f"Model saved to {save_dir}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"\nFATAL ERROR: {e}")
+        traceback.print_exc()
+        sys.exit(1)
