@@ -1,0 +1,5 @@
+traindocs/
+session_logs/
+*.pyc
+__pycache__/
+.DS_Store
