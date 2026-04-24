@@ -424,8 +424,6 @@ def grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, device):
     G = GROUP_SIZE
     num_groups = len(episodes) // G
 
-    total_loss = 0.0
-
     for g in range(num_groups):
         group_eps = episodes[g * G : (g + 1) * G]
         rewards = torch.tensor(
@@ -433,6 +431,8 @@ def grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, device):
         )
         mean_r = rewards.mean()
         advantages = rewards - mean_r
+
+        group_loss = 0.0
 
         for i, ep in enumerate(group_eps):
             # For each buyer turn in the episode, compute loss
@@ -493,18 +493,18 @@ def grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, device):
                     policy_loss = policy_loss + KL_COEF * kl
 
                 loss = (policy_loss * mask).sum() / (mask.sum() + 1e-8)
-                total_loss += loss
+                loss.backward()
+                group_loss += loss.item()
+
+        # After processing all episodes in the group, step optimizer
+        torch.nn.utils.clip_grad_norm_(buyer_model.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
 
     if num_groups == 0:
         return 0.0
 
-    avg_loss = total_loss / (num_groups * G)  # average per episode
-    optimizer.zero_grad()
-    avg_loss.backward()
-    torch.nn.utils.clip_grad_norm_(buyer_model.parameters(), 1.0)
-    optimizer.step()
-
-    return avg_loss.item()
+    return group_loss / (num_groups * G)  # average per episode
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
 def main():
@@ -633,9 +633,10 @@ def main():
     if HUB_MODEL_ID:
         try:
             from huggingface_hub import HfApi, create_repo
+            token = os.environ.get("HF_TOKEN")
             print(f"\nPushing to {HUB_MODEL_ID}...")
-            create_repo(HUB_MODEL_ID, exist_ok=True)
-            HfApi().upload_folder(folder_path=save_path, repo_id=HUB_MODEL_ID, repo_type="model")
+            create_repo(HUB_MODEL_ID, exist_ok=True, token=token)
+            HfApi(token=token).upload_folder(folder_path=save_path, repo_id=HUB_MODEL_ID, repo_type="model")
             print("  [OK] Push complete")
         except Exception as e:
             print(f"  [WARN] Push failed: {e}")
