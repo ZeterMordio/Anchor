@@ -130,10 +130,34 @@ For toy validation, we can use `Qwen/Qwen3-1.7B` (~3.4GB × 2 = ~7GB) on t4-smal
 
 ---
 
-## Next Steps (Immediate)
+## Bugs Encountered & Fixes (This Session — Toy Runs)
 
-1. Write dataset loader for AmazonHistoryPrice
-2. Write NegotiationEnv for TRL environment_factory
-3. Write training script with GRPOTrainer
-4. Local import smoke test (no GPU needed)
-5. Toy Run 1: t4-small with Qwen3-1.7B
+### Toy Run 1: Qwen3-1.7B on a10g-large (24GB)
+- **Status:** COMPLETED (17.6 min)
+- **Result:** Pipeline works! Iter 0 had 37.5% deals, then format collapsed (100% BUYER_FORMAT_ERROR)
+- **Analysis:** Format collapse is expected for 1.7B — too small to maintain structured output under RL pressure
+- **Action:** Reverted all format/KL fixes — not needed for larger models
+
+### HF Jobs API: `secrets` field
+- `secrets` must be an array of strings like `["HF_TOKEN"]` — not an object
+- But passing it as `"secrets": ["HF_TOKEN"]` in the JSON payload caused `Invalid input: expected record, received array`
+- **Fix:** Just put `"HF_TOKEN": "auto"` in `environment` dict — HF Jobs auto-injects it
+- BUT: `create_repo()` and `HfApi()` in the script still got 401 because they don't read env var automatically
+- **Fix:** Pass `token=os.environ.get("HF_TOKEN")` explicitly to both calls
+
+### Toy Run 2: Qwen3-4B on a100-large (80GB)
+- **Status:** SUBMITTED (Job ID: `69eabb91e8e12c6f0a675661`)
+- **Config:** 15 iters, batch=16, group=8, LR=3e-5, KL=0.0
+- **Expected:** ~2-4 hours, should show 4-phase convergence pattern
+
+### H200 Issue (GitHub #4128)
+- H200 nodes have NVIDIA Fabric Manager stuck at "In Progress" → CUDA Error 802
+- **Confirmed:** Waiting 30-60s after `nvidia-smi` does NOT fix it
+- **Workaround:** Use a10g-large or a100-large instead
+- a10g-large (24GB, Ampere) works with `pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime`
+
+## Next Steps
+1. Monitor Toy Run 2 (check logs in ~2 hours)
+2. If successful: analyze metrics for 4-phase pattern
+3. If successful: proceed to Toy Run 3 (dual-role) or Real Run (Qwen3-8B)
+4. Push final trained model to HF Hub (token fix now in place)
