@@ -44,7 +44,7 @@ EPSILON = float(os.environ.get("EPSILON", "0.2"))
 KL_COEF = float(os.environ.get("KL_COEF", "0.0"))
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "300"))
 BUYER_TEMP = float(os.environ.get("BUYER_TEMP", "1.0"))
-SELLER_TEMP = float(os.environ.get("SELLER_TEMP", "0.7"))  # Paper uses 0.7 for seller
+SELLER_TEMP = float(os.environ.get("SELLER_TEMP", "1.0"))  # Both roles need equal exploration in self-play
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/model")
 HUB_MODEL_ID = os.environ.get("HUB_MODEL_ID", "")
 GRADIENT_CHECKPOINTING = os.environ.get("GRADIENT_CHECKPOINTING", "1") == "1"
@@ -229,8 +229,8 @@ def extract_action(text):
 # ─── Reward formulas ──────────────────────────────────────────────────────────
 def compute_buyer_reward(final_price, budget, cost, outcome):
     """Buyer reward per paper Eq 1, with outcome awareness."""
-    if outcome in ("BUYER_FORMAT_ERROR", "SELLER_FORMAT_ERROR"):
-        return -1.0  # Format violation
+    if "FORMAT_ERROR" in outcome or "UNEXPECTED" in outcome:
+        return -1.0  # Format / protocol violation
     if final_price is None:
         return 0.0  # No deal / QUIT — rational walk-away
     if final_price > budget:
