@@ -1,8 +1,65 @@
 # Anchor Negotiation — Engineering Journal
 
 > Authored by: Anton Künzi
-> Last updated: 2026-04-27 01:39 UTC
+> Last updated: 2026-04-27 02:00 UTC
 > Session with: ZeterMordio
+
+This document is the single source of truth for all design decisions,
+bug fixes, hyperparameters, memory budgets, and experimental results.
+It replaces the old `engineering_notebook.md` which is archived for reference.
+
+---
+
+## Quick Reference
+
+### Hyperparameters (canonical)
+
+| Parameter | Toy Run 3 | Real Run (planned) |
+|-----------|-----------|-------------------|
+| Model | Qwen3-4B | Qwen3-8B |
+| Iters | 15 | 40-60 |
+| Batch (products) | 16 | 64 (paper) |
+| Group (rollouts/product) | 8 | 8 |
+| LR | 3e-5 | 3e-5 |
+| Max turns | 6 | 6 |
+| Max tokens/turn | 300 | 300 |
+| Buyer temp | 1.0 | 1.0 |
+| Seller temp | 1.0 | 1.0 (self-play) |
+| KL penalty | 0 | 0 |
+| RAE decay | 0.95 | 0.95 |
+| Dual-role ratio | 0.5 | 0.5-1.0 |
+| Clip epsilon | 0.2 | 0.2 |
+| Hardware | a100-large | a100x4 (planned) |
+
+### Verified Model IDs
+
+| Model | Exists | Size | Notes |
+|-------|--------|------|-------|
+| `Qwen/Qwen3-4B` | ✅ | ~7.5GB bf16 | Instruct-merged. Toy Run 3 current. |
+| `Qwen/Qwen3-8B` | ✅ | ~15GB bf16 | Real Run target. |
+| `Qwen/Qwen3-30B-A3B-Instruct-2507` | ✅ | ~56GB | Paper's exact model. |
+| `Qwen/Qwen3-1.7B` | ✅ | ~3.4GB | Toy Run 1 successful. |
+
+### Verified Dataset
+
+- **Name:** AmazonHistoryPrice (NOT on HF Hub direct)
+- **Source:** https://github.com/TianXiaSJTU/AmazonPriceHistory
+- **Products:** 930 total
+- **Split:** 802 train / 128 test  
+- **MI / CI:** 886 MI / 44 CI
+- **Per product:** title, description, list_price, cost, budget(=list×0.8)
+
+### Memory Budget
+
+Qwen3-4B dual-role on A100 (80GB):
+- Policy model: ~8GB bf16 parameters
+- Reference model: ~8GB (frozen, no grad)
+- AdamW states: ~16GB (2× fp32 per bf16 param)
+- Activations per turn: ~2GB (gradient checkpointing halves this)
+- **Total operational: ~32GB** ✓ fits with headroom
+
+Qwen3-8B would need ~64GB operational — fits on A100x1 but tight.
+Real Run needs A100x4 (320GB) safe.
 
 ---
 
@@ -125,3 +182,26 @@ of the compute budget.
 3. Add evaluation script: benchmark vs GPT-5.4, adversarial personas (RLVR §5).
 
 ---
+
+## Archived: Prior Session Notes (from engineering_notebook.md)
+
+### Toy Run 1
+- **Status:** COMPLETED (17.6 min)
+- **Result:** Pipeline works! Iter 0 had 37.5% deals, then format collapsed
+  (100% BUYER_FORMAT_ERROR)
+- **Analysis:** Format collapse expected for 1.7B — too small to maintain
+  structured output under RL pressure
+
+### Past Job IDs
+- Toy Run 2: `69eabb91e8e12c6f0a675661` (buyer-only, Qwen3-4B, 15 iters)
+- Toy Run 3: `69eeb7f6d70108f37ace04d5` (dual-role + RAE, Qwen3-4B, 15 iters)
+
+### Known HF Jobs Quirks
+- `secrets` must NOT be passed as array in REST API — causes "expected record"
+- Correct: put `"HF_TOKEN": "auto"` in `environment` dict
+- `create_repo()` and `HfApi()` need explicit `token=` param
+- REST endpoint for job submission: `POST /api/jobs/{namespace}`
+  **NOT** `/api/jobs` (404). Must include namespace in path.
+- Field is `flavor` not `hardware`
+- Field is `script` URL, not `spaceId` or `dockerImage` (unless Docker mode)
+
