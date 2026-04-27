@@ -526,6 +526,41 @@ For the $37-70 budget:
 | **Total** | **~28-30 GB** (was ~36 GB) |
 
 **Headroom: ~50 GB free** — could increase GEN_BATCH_LIMIT or run larger models.
+---
+
+## v9: Paper-Faithful Implementation Audit (2026-04-27)
+
+### Deep Paper Re-read: Three Discrepancies Found and Fixed
+
+**Discrepancy 1: Double-normalization (FIXED)**
+- SPIRAL Eq. 2: `A = R_p - b_EMA` — raw EMA-subtracted advantage, NO further normalization
+- GRPO: `A = (R - mean) / std` — group-level normalization
+- Our v8 code: `A = (R_p - b_EMA - mean) / std` — BOTH applied (hybrid from neither paper)
+- **Fix:** Removed group-level normalization. Pure RAE advantages as in SPIRAL.
+
+**Discrepancy 2: Single inner epoch (FIXED)**
+- SPIRAL Table 6: `Inner proximal update epochs: 2`
+- Our v8 code: 1 epoch per group
+- **Fix:** Added `NUM_INNER_EPOCHS=2`. Each epoch: forward pass on same trajectories with current (updated) weights → backward → step. 2nd epoch uses shifted weights, so gradients differ.
+
+**Discrepancy 3: KL=0.01 (FIXED)**
+- RLVR paper Table 5: `KL penalty: 0` (explicit)
+- SPIRAL Table 6: `KL loss coefficient: 0.0`, `KL penalty coefficient: 0.0` (explicit)
+- Our v8 code: `KL_COEF=0.01` (was no-op anyway since ref-free)
+- **Fix:** Set default to `0.0` to match both papers.
+
+### What the Audit Confirmed as Correct
+
+| Aspect | Paper Source | Our Implementation | Status |
+|--------|-------------|-------------------|--------|
+| Loss type | SPIRAL Eq. 3 | `-A * log_prob` (pure REINFORCE) | ✅ |
+| EMA baselines | SPIRAL Eq. 2, α=0.95 | Per-role EMA, α=0.95 | ✅ |
+| No IS ratio | SPIRAL (no π/π_old ratio) | No ratio | ✅ |
+| No ref model | SPIRAL (KL=0, no ref) | Single model, no ref | ✅ |
+| Optimizer | SPIRAL Table 6 | AdamW β=(0.9,0.95), wd=0.0 | ✅ |
+| LR | SPIRAL 1e-6 for dense 4B | 1e-6 | ✅ |
+| Grad clip | SPIRAL Table 6: 1.0 | 1.0 | ✅ |
+
 
 
 
