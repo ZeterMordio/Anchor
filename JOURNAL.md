@@ -14,28 +14,30 @@ It replaces the old `engineering_notebook.md` which is archived for reference.
 
 ### Hyperparameters (canonical)
 
-| Parameter | Toy Run 3 | Real Run (planned) |
+| Parameter | Toy Run 3 v7 | Real Run (planned) |
 |-----------|-----------|-------------------|
-| Model | Qwen3-4B | Qwen3-8B |
+| Model | Qwen3-4B-Instruct-2507 | Qwen3-8B |
 | Iters | 15 | 40-60 |
 | Batch (products) | 16 | 64 (paper) |
 | Group (rollouts/product) | 8 | 8 |
-| LR | 3e-5 | 3e-5 |
+| LR | 1e-6 | 1e-6 |
 | Max turns | 6 | 6 |
 | Max tokens/turn | 300 | 300 |
 | Buyer temp | 1.0 | 1.0 |
 | Seller temp | 1.0 | 1.0 (self-play) |
-| KL penalty | 0 | 0 |
+| KL penalty | 0.01 | 0.01 |
 | RAE decay | 0.95 | 0.95 |
 | Dual-role ratio | 0.5 | 0.5-1.0 |
 | Clip epsilon | 0.2 | 0.2 |
-| Hardware | a100-large | a100x4 (planned) |
+| AdamW betas | (0.9, 0.95) | (0.9, 0.95) |
+| Hardware | a100-large | a100-large |
 
 ### Verified Model IDs
 
 | Model | Exists | Size | Notes |
 |-------|--------|------|-------|
-| `Qwen/Qwen3-4B` | ✅ | ~7.5GB bf16 | Instruct-merged. Toy Run 3 current. |
+| `Qwen/Qwen3-4B` | ✅ | ~7.5GB bf16 | Instruct-merged. Toy Runs 1-3 v1-v6. |
+| `Qwen/Qwen3-4B-Instruct-2507` | ✅ | ~7.5GB bf16 | **Toy Run 3 v7+.** Aug 2025, better IFEval. |
 | `Qwen/Qwen3-8B` | ✅ | ~15GB bf16 | Real Run target. |
 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | ✅ | ~56GB | Paper's exact model. |
 | `Qwen/Qwen3-1.7B` | ✅ | ~3.4GB | Toy Run 1 successful. |
@@ -415,4 +417,68 @@ Just needs `pip install liger-kernel` and a one-line config change.
 3. **L40S hardware** — 28% cost savings with minimal time increase
 4. **vLLM colocate** — additional 2-3× on top of batching
 5. **Liger kernel** — easy 20% update phase speedup
+
+---
+
+## Toy Run 3 v6 Results & Collapse Analysis (2026-04-27 ~14:40 UTC)
+
+**Job ID:** `69ef56f8d70108f37ace0803` — CANCELED after 4 iterations (collapse confirmed)
+
+### Iteration-by-Iteration Results
+
+| Iter | Deal Rate | BuyerR | SellerR | Loss | Turns | Time | Top Outcome |
+|------|-----------|--------|---------|------|-------|------|-------------|
+| 0 | **53.9%** | +0.018 | -0.018 | 0.167 | 4.1 | 2305s | 51 seller accepts, 37 budget violations |
+| 1 | **0.0%** | -1.000 | +1.000 | 0.000 | 1.3 | 1352s | 92 BUYER_FORMAT_ERROR, 36 UNEXPECTED_BUY |
+| 2 | 0.0% | -0.992 | +0.992 | 0.240 | 1.1 | 1392s | 116 FORMAT_ERROR |
+| 3 | 0.0% | -1.000 | +1.000 | 0.000 | 1.0 | 1671s | 128 FORMAT_ERROR (100%) |
+
+### Root Cause: LR=3e-5 Too Aggressive for Dense 4B
+
+The RLVR paper used `lr=3e-5` with `Qwen3-30B-A3B-Instruct-2507` — a **MoE with only 3.3B active params**. 
+In MoE, only 8/128 experts receive gradient per token, so most parameters get zero gradient. 
+On our **dense** Qwen3-4B, ALL 4B params get gradient. So 3e-5 is effectively ~30× more destructive.
+
+SPIRAL used `lr=1e-6` on the exact same dense Qwen3-4B family. That's 30× lower.
+
+### v7 Fix: Three Changes
+
+1. **Model → `Qwen3-4B-Instruct-2507`**: Aug 2025 post-training with massively improved IFEval.
+   GPQA +20, AIME +28 pts vs original. Same size (7.5GB bf16), drop-in replacement.
+2. **LR → `1e-6`**: SPIRAL's proven stable value for dense Qwen3-4B. 30× lower than v6.
+3. **KL_COEF → `0.01`**: Small anchor to prevent format collapse. Both papers used KL=0,
+   but they had either (a) a much bigger MoE model or (b) games with much simpler output format.
+   Negotiation has complex structured output (Thought/Talk/Action) — a small KL helps.
+4. **AdamW betas → (0.9, 0.95)**: Match SPIRAL's optimizer config exactly.
+
+### Qwen3.6 Investigation — NOT SUITABLE
+
+Both `Qwen3.6-27B` and `Qwen3.6-35B-A3B` are **vision-language** models (`qwen3_5` architecture),
+NOT text-generation. They use hybrid DeltaNet + full attention layers with a vision encoder built in.
+Architecture type is `Qwen3_5ForConditionalGeneration` / `Qwen3_5MoeForConditionalGeneration`.
+
+| Model | Architecture | Type | Params | Active | Notes |
+|-------|-------------|------|--------|--------|-------|
+| Qwen3.6-27B | qwen3_5 (DeltaNet hybrid) | Vision-Language | 27.8B | 27.8B dense | NOT suitable for text negotiation |
+| Qwen3.6-35B-A3B | qwen3_5_moe (MoE + DeltaNet) | Vision-Language | 36.0B | ~3B active | NOT suitable — vision encoder + hybrid attention |
+
+**Key insight:** "Qwen3.6" is a collection name, not a model series. The text-only models with improved
+instruction following are the `-2507` suffix models: `Qwen3-4B-Instruct-2507` and `Qwen3-30B-A3B-Instruct-2507`.
+No `Qwen3-8B-Instruct-2507` exists.
+
+### GPU Sweep for Real Run (text-only models)
+
+| Model | Params | bf16 | Policy+Ref VRAM | GPU | Cost/hr |
+|-------|--------|------|-----------------|-----|---------|
+| Qwen3-4B-Instruct-2507 | 4.0B | 7.5GB | ~16GB | a10g-large (24GB) | $2/hr |
+| Qwen3-8B | 8.2B | 16.3GB | ~33GB | a100-large (80GB) | $4/hr |
+| Qwen3-30B-A3B-Instruct-2507 | 30.5B | 56.9GB | ~115GB | a100x4 (320GB) | $16/hr |
+
+### Real Run Recommendation
+
+For the $37-70 budget:
+- **Qwen3-8B** on **a100-large** ($4/hr) with batched generation
+- 40-60 iterations at ~15 min/iter (batched) = 10-15 hours → $40-60
+- LR=1e-6, same KL/RAE config as v7
+
 
