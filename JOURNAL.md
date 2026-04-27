@@ -560,6 +560,42 @@ For the $37-70 budget:
 | Optimizer | SPIRAL Table 6 | AdamW β=(0.9,0.95), wd=0.0 | ✅ |
 | LR | SPIRAL 1e-6 for dense 4B | 1e-6 | ✅ |
 | Grad clip | SPIRAL Table 6: 1.0 | 1.0 | ✅ |
+---
+
+## v10: Domain-Aware SPIRAL-RLVR Hybrid (2026-04-27)
+
+### Why v9's Pure SPIRAL Settings Don't Transfer to Negotiation
+
+SPIRAL trains on TicTacToe and Kuhn Poker — short outputs (~100 tokens), near-binary rewards (win/lose),
+simple action format. Our negotiation has ~200 tokens/turn, continuous rewards [-1,1] with mass at
+-1/0 boundaries, and complex Thought/Talk/Action structured output with price parsing.
+
+| Setting | SPIRAL (simple games) | v9 (copied SPIRAL) | v10 (domain-aware) | Reasoning |
+|---------|----------------------|--------------------|--------------------|-----------|
+| **Advantage norm** | OFF (binary rewards) | OFF | **ON** | Continuous multi-modal rewards need comparative within-group signal |
+| **KL penalty** | 0.0 (simple format) | 0.0 | **0.01** | Complex structured NL output needs format stability anchor |
+| **Ref model** | None (KL=0) | None | **Frozen copy** | Needed for meaningful KL; we have VRAM headroom on A100 |
+| **Inner epochs** | 2 (short episodes) | 2 | **1** | Long ~2K token episodes make 2nd epoch stale-gradient risky |
+| **Loss** | REINFORCE | REINFORCE | **Clipped surrogate + KL** | Bounds per-step drift on long sequences |
+| **RAE baselines** | ✅ | ✅ | ✅ | Core dual-role innovation, always keep |
+
+### What We Keep From SPIRAL (the part that actually matters)
+- RAE: per-role EMA baselines — this is THE contribution for dual-role training
+- Self-play: shared policy plays both roles via system prompt conditioning
+- Zero-sum rewards: R_seller = -R_buyer
+
+### What We Keep From RLVR/GRPO (domain-appropriate for NL negotiation)
+- Clipped IS ratio: bounds policy drift per step on long NL sequences
+- Group advantage normalization: comparative signal for continuous reward distributions
+- KL penalty (small): format stability for Thought/Talk/Action structure
+- Frozen reference model: provides meaningful KL anchor
+
+### All Configs Made Env-Var Overridable
+- `NORMALIZE_ADVANTAGES=1` (ON by default, set 0 for pure SPIRAL)
+- `KL_COEF=0.01` (set 0.0 for pure SPIRAL)
+- `NUM_INNER_EPOCHS=1` (set 2 for SPIRAL's config)
+- Everything else: same env vars as before
+
 
 
 
