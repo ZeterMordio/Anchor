@@ -55,6 +55,8 @@ HUB_MODEL_ID = os.environ.get("HUB_MODEL_ID", "")
 GRADIENT_CHECKPOINTING = os.environ.get("GRADIENT_CHECKPOINTING", "1") == "1"
 RAE_DECAY = float(os.environ.get("RAE_DECAY", "0.95"))  # EMA decay for baselines
 DUAL_ROLE_RATIO = float(os.environ.get("DUAL_ROLE_RATIO", "0.5"))  # Fraction seller training
+TRACKIO_SPACE = os.environ.get("TRACKIO_SPACE", "ZeterMordio/anchor-dashboard")
+RUN_NAME = os.environ.get("RUN_NAME", "")
 
 # ─── CUDA check ──────────────────────────────────────────────────────────────────
 def check_cuda():
@@ -649,6 +651,30 @@ def main():
     print(f"[CONFIG] RAE_Decay={RAE_DECAY} DualRoleRatio={DUAL_ROLE_RATIO}")
     print("=" * 60, flush=True)
     
+    # 0. Trackio monitoring
+    try:
+        import trackio
+        run_name = RUN_NAME or f"toy3-{MODEL_NAME.split('/')[-1]}-{NUM_ITERS}it"
+        trackio.init(
+            project="anchor-negotiation",
+            name=run_name,
+            space_id=TRACKIO_SPACE,
+            config={
+                "model": MODEL_NAME, "num_iters": NUM_ITERS,
+                "batch_size": BATCH_SIZE, "group_size": GROUP_SIZE,
+                "max_turns": MAX_TURNS, "lr": LR, "epsilon": EPSILON,
+                "kl_coef": KL_COEF, "max_new_tokens": MAX_NEW_TOKENS,
+                "buyer_temp": BUYER_TEMP, "seller_temp": SELLER_TEMP,
+                "grad_checkpoint": GRADIENT_CHECKPOINTING,
+                "rae_decay": RAE_DECAY, "dual_role_ratio": DUAL_ROLE_RATIO,
+            },
+        )
+        TRACKIO_OK = True
+        print(f"[TRACKIO] Dashboard: https://huggingface.co/spaces/{TRACKIO_SPACE}")
+    except Exception as e:
+        print(f"[TRACKIO] Init failed (non-fatal): {e}")
+        TRACKIO_OK = False
+    
     # 1. Dataset
     print("\n[1/5] Loading dataset...")
     train_products, test_products = load_products()
@@ -761,6 +787,24 @@ def main():
         print(f"  Outcomes: {dict(sorted(outcomes.items(), key=lambda x: -x[1])[:5])}")
         print(f"  VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB", flush=True)
         
+        # ── Trackio logging ──
+        if TRACKIO_OK:
+            try:
+                trackio.log({
+                    "train/loss": loss,
+                    "reward/buyer": mean_br,
+                    "reward/seller": mean_sr,
+                    "negotiation/deal_rate": deal_rate,
+                    "negotiation/mean_price": mean_price,
+                    "negotiation/mean_turns": mean_turns,
+                    "rae/b_buyer": rae.state_dict()["b_buyer"],
+                    "rae/b_seller": rae.state_dict()["b_seller"],
+                    "perf/iter_time_s": elapsed,
+                    "perf/vram_gb": torch.cuda.memory_allocated()/1e9,
+                }, step=iteration)
+            except Exception as e:
+                print(f"  [TRACKIO] Log failed (non-fatal): {e}")
+        
         metrics.append({
             "iteration": iteration,
             "loss": loss,
@@ -805,6 +849,14 @@ def main():
     print(f"COMPLETE  Total time: {total:.1f}s ({total/60:.1f} min)")
     print(f"Final RAE: {rae.state_dict()}")
     print(f"{'=' * 60}")
+    
+    # Finish trackio
+    if TRACKIO_OK:
+        try:
+            trackio.finish()
+            print(f"[TRACKIO] Run finished. Dashboard: https://huggingface.co/spaces/{TRACKIO_SPACE}")
+        except Exception as e:
+            print(f"[TRACKIO] Finish failed (non-fatal): {e}")
 
 
 if __name__ == "__main__":
