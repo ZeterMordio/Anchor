@@ -71,7 +71,7 @@ RUN_NAME = os.environ.get("RUN_NAME", "")
 # Limits peak VRAM during generation. 128 is fine for 4B on A100.
 GEN_BATCH_LIMIT = int(os.environ.get("GEN_BATCH_LIMIT", "128"))
 NUM_INNER_EPOCHS = int(os.environ.get("NUM_INNER_EPOCHS", "1"))  # 1 for long NL episodes; SPIRAL uses 2 for short games
-NORMALIZE_ADVANTAGES = os.environ.get("NORMALIZE_ADVANTAGES", "1") == "1"  # Group norm on top of RAE
+NORMALIZE_ADVANTAGES = os.environ.get("NORMALIZE_ADVANTAGES", "1") == "1"  # Group norm on top of RAEUSE_REF_MODEL = os.environ.get("USE_REF_MODEL", "1") == "1"  # Set 0 to skip ref model (saves 8GB, disables KL+IS ratio)
 
 # ─── CUDA check ──────────────────────────────────────────────────────────────────
 def check_cuda():
@@ -651,9 +651,12 @@ def dual_role_grpo_update(policy_model, ref_model, tokenizer, episodes,
                     # ── Policy log-probs (with grad) ──
                     pol_lp = _token_logprobs(policy_model, ids, attn)
 
-                    # ── Reference log-probs (frozen, no grad) ──
-                    with torch.no_grad():
-                        ref_lp = _token_logprobs(ref_model, ids, attn)
+                    # ── Reference log-probs (if ref model available) ──
+                    if ref_model is not None:
+                        with torch.no_grad():
+                            ref_lp = _token_logprobs(ref_model, ids, attn)
+                    else:
+                        ref_lp = pol_lp.detach()  # ratio = 1.0, degenerates to REINFORCE
 
                     # ── Completion-only mask ──
                     mask = attn[:, 1:].clone()
@@ -790,18 +793,22 @@ def main():
     dev = next(policy_model.parameters()).device
     print(f"  [OK] Device={dev} VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
     
-    # 4. Reference model (frozen — for KL penalty + IS ratio)
-    print(f"\n[4/5] Loading reference model (frozen)...")
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    ref_model.eval()
-    for p in ref_model.parameters():
-        p.requires_grad = False
-    print(f"  [OK] VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
+    # 4. Reference model (optional — for KL penalty + IS ratio)
+    ref_model = None
+    if USE_REF_MODEL:
+        print(f"\n[4/5] Loading reference model (frozen)...")
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad = False
+        print(f"  [OK] VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
+    else:
+        print(f"\n[4/5] Skipping reference model (USE_REF_MODEL=0, saves ~8GB VRAM)")
     
     # 5. Optimizer + RAE
     print(f"\n[5/5] Optimizer (AdamW, lr={LR}, betas=(0.9,0.95)) + RAE (decay={RAE_DECAY})...")
