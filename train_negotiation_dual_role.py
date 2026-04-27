@@ -71,7 +71,8 @@ RUN_NAME = os.environ.get("RUN_NAME", "")
 # Limits peak VRAM during generation. 128 is fine for 4B on A100.
 GEN_BATCH_LIMIT = int(os.environ.get("GEN_BATCH_LIMIT", "128"))
 NUM_INNER_EPOCHS = int(os.environ.get("NUM_INNER_EPOCHS", "1"))  # 1 for long NL episodes; SPIRAL uses 2 for short games
-NORMALIZE_ADVANTAGES = os.environ.get("NORMALIZE_ADVANTAGES", "1") == "1"  # Group norm on top of RAEUSE_REF_MODEL = os.environ.get("USE_REF_MODEL", "1") == "1"  # Set 0 to skip ref model (saves 8GB, disables KL+IS ratio)
+NORMALIZE_ADVANTAGES = os.environ.get("NORMALIZE_ADVANTAGES", "1") == "1"  # Group norm on top of RAE
+USE_REF_MODEL = os.environ.get("USE_REF_MODEL", "1") == "1"  # Set 0 to skip ref model (saves 8GB, disables KL+IS ratio)
 
 # ─── CUDA check ──────────────────────────────────────────────────────────────────
 def check_cuda():
