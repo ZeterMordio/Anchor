@@ -14,14 +14,17 @@ Key differences from train_negotiation_clean.py:
 5. Per-episode backward (no gradient accumulation across episodes) — fixes A100 OOM
 6. Detached logprob generation (no output_scores in generate) — fixes memory leak
 
-v9 — Paper-faithful implementation (2026-04-27):
+v10 — Domain-aware hybrid (2026-04-27):
+- From SPIRAL: RAE per-role EMA baselines (core dual-role innovation)
+- From RLVR/GRPO: group advantage normalization (needed for continuous rewards),
+  clipped IS ratio + KL penalty (needed for complex structured NL output),
+  reference model (KL anchor for format stability)
 - Batched turn-parallel generation: 10-15× rollout speedup
-- Reference model removed: saves 8GB VRAM + 50% update speedup
-- Pure SPIRAL REINFORCE loss: loss = -A * log_prob (no IS ratio, no clip)
-- Pure RAE advantages: A = R_p - b_EMA (no group normalization — SPIRAL Eq. 2)
-- 2 inner proximal epochs per group (SPIRAL Table 6)
-- KL_COEF = 0.0 (both papers explicit)
 - LR=1e-6, Qwen3-4B-Instruct-2507, AdamW betas=(0.9, 0.95)
+- NORMALIZE_ADVANTAGES=1 (default ON): RAE + group norm is the right hybrid
+  for negotiation's continuous multi-modal rewards (unlike SPIRAL's near-binary)
+- KL_COEF=0.01: small anchor prevents format collapse on complex NL output
+- NUM_INNER_EPOCHS=1: long episodes (~2K tokens) make 2nd epoch stale-gradient risky
 """
 
 import os
@@ -53,7 +56,7 @@ GROUP_SIZE = int(os.environ.get("GROUP_SIZE", "8"))
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "6"))
 LR = float(os.environ.get("LR", "1e-6"))
 EPSILON = float(os.environ.get("EPSILON", "0.2"))
-KL_COEF = float(os.environ.get("KL_COEF", "0.0"))  # Both papers use 0.0 explicitly
+KL_COEF = float(os.environ.get("KL_COEF", "0.01"))  # Small KL anchor for format stability on complex NL output
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "300"))
 BUYER_TEMP = float(os.environ.get("BUYER_TEMP", "1.0"))
 SELLER_TEMP = float(os.environ.get("SELLER_TEMP", "1.0"))  # Both roles need equal exploration in self-play
@@ -67,7 +70,8 @@ RUN_NAME = os.environ.get("RUN_NAME", "")
 # Maximum number of episodes to generate in a single batched call.
 # Limits peak VRAM during generation. 128 is fine for 4B on A100.
 GEN_BATCH_LIMIT = int(os.environ.get("GEN_BATCH_LIMIT", "128"))
-NUM_INNER_EPOCHS = int(os.environ.get("NUM_INNER_EPOCHS", "2"))  # SPIRAL Table 6: 2 inner proximal epochs
+NUM_INNER_EPOCHS = int(os.environ.get("NUM_INNER_EPOCHS", "1"))  # 1 for long NL episodes; SPIRAL uses 2 for short games
+NORMALIZE_ADVANTAGES = os.environ.get("NORMALIZE_ADVANTAGES", "1") == "1"  # Group norm on top of RAE
 
 # ─── CUDA check ──────────────────────────────────────────────────────────────────
 def check_cuda():
@@ -564,22 +568,23 @@ def _token_logprobs(model, input_ids, attention_mask):
     return target_logit - log_z                                   # [B, T-1]
 
 
-# ─── Dual-Role GRPO Update (no reference model) ──────────────────────────────
-def dual_role_grpo_update(policy_model, tokenizer, episodes,
+# ─── Dual-Role GRPO Update ────────────────────────────────────────────────────
+def dual_role_grpo_update(policy_model, ref_model, tokenizer, episodes,
                            optimizer, rae, device):
     """
-    Dual-role REINFORCE with SPIRAL's RAE — reference-free.
+    Dual-role GRPO with RAE — domain-aware hybrid of SPIRAL + RLVR.
 
-    Matches SPIRAL (2506.24119) Section 3, Algorithm 1:
-    - Loss = -A_{G,p}(τ) · log π_θ(y_t | s_t, p, G)  [Eq. 3]
-    - Advantage = R_p(τ) - b_{G,p}  [Eq. 2, pure EMA baseline, NO group normalization]
-    - 2 inner proximal epochs per batch (Table 6)
-    - No IS ratio, no clipping, no KL penalty (all 0.0 in Table 6)
+    From SPIRAL: RAE per-role EMA baselines (Eq. 2) for stable dual-role training.
+    From RLVR/GRPO: clipped IS ratio, group advantage normalization, KL penalty.
 
-    Changes from v8:
-    - Removed group-level (mean/std) normalization — SPIRAL uses raw EMA advantage
-    - Added 2 inner epochs — re-compute log-probs with updated weights in epoch 2
-    - KL penalty removed (was no-op anyway)
+    Why this hybrid:
+    - SPIRAL's pure REINFORCE works for short-output simple games (TicTacToe, Poker)
+    - Our negotiation has long NL outputs (~200 tokens/turn), complex structured format
+      (Thought/Talk/Action), and continuous multi-modal rewards [-1, 1]
+    - Group normalization gives comparative signal ("this negotiation was better than
+      that one") which is more informative than raw reward magnitude
+    - KL penalty provides format stability anchor for complex structured output
+    - Clipped IS ratio bounds per-step policy drift on long sequences
     """
     policy_model.train()
     G = GROUP_SIZE
@@ -590,7 +595,7 @@ def dual_role_grpo_update(policy_model, tokenizer, episodes,
     for g in range(num_groups):
         group_eps = episodes[g * G : (g + 1) * G]
 
-        # ── RAE advantages per role (Eq. 2: A = R - b_EMA, no further normalization) ──
+        # ── RAE advantages per role (SPIRAL Eq. 2) ──
         buyer_advs = torch.tensor(
             [rae.buyer_advantage(ep.buyer_reward) for ep in group_eps],
             dtype=torch.float32, device=device,
@@ -599,14 +604,21 @@ def dual_role_grpo_update(policy_model, tokenizer, episodes,
             [rae.seller_advantage(ep.seller_reward) for ep in group_eps],
             dtype=torch.float32, device=device,
         )
-        # NO group normalization — SPIRAL uses raw EMA-subtracted advantages.
-        # The EMA baseline provides sufficient variance reduction.
+
+        # Optional group normalization (default ON for negotiation's continuous rewards)
+        if NORMALIZE_ADVANTAGES:
+            def _norm(t):
+                if t.numel() < 2:
+                    return t
+                return (t - t.mean()) / (t.std() + 1e-8)
+            buyer_advs = _norm(buyer_advs)
+            seller_advs = _norm(seller_advs)
 
         # Update RAE baselines AFTER computing advantages for this group
         for ep in group_eps:
             rae.update(ep.buyer_reward, ep.seller_reward)
 
-        # ── Inner proximal epochs (SPIRAL Table 6: 2 epochs) ──
+        # ── Inner proximal epochs ──
         for inner_epoch in range(NUM_INNER_EPOCHS):
             for i, ep in enumerate(group_eps):
                 train_seller = random.random() < DUAL_ROLE_RATIO
@@ -615,7 +627,7 @@ def dual_role_grpo_update(policy_model, tokenizer, episodes,
                     if role == "seller" and not train_seller:
                         continue
 
-                    # ── Build & tokenise prompt + completion in one call ──
+                    # ── Build & tokenise prompt + completion ──
                     prompt_msgs = _build_turn_prompt(ep, turn_idx)
                     prompt_text = tokenizer.apply_chat_template(
                         prompt_msgs, tokenize=False,
@@ -623,7 +635,6 @@ def dual_role_grpo_update(policy_model, tokenizer, episodes,
                     )
                     full_text = prompt_text + text
 
-                    # Tokenise both; derive prompt_len from shared prefix
                     prompt_ids = tokenizer(
                         prompt_text, return_tensors="pt",
                         truncation=True, max_length=2048,
@@ -637,27 +648,39 @@ def dual_role_grpo_update(policy_model, tokenizer, episodes,
                     ids = full_enc["input_ids"]
                     attn = full_enc["attention_mask"]
 
-                    # ── Policy log-probs (with grad, re-computed each inner epoch) ──
-                    pol_lp = _token_logprobs(policy_model, ids, attn)  # [1, T-1]
+                    # ── Policy log-probs (with grad) ──
+                    pol_lp = _token_logprobs(policy_model, ids, attn)
+
+                    # ── Reference log-probs (frozen, no grad) ──
+                    with torch.no_grad():
+                        ref_lp = _token_logprobs(ref_model, ids, attn)
 
                     # ── Completion-only mask ──
                     mask = attn[:, 1:].clone()
                     mask[:, :prompt_len - 1] = 0
 
-                    # ── Advantage for this role (pure RAE, Eq. 2) ──
+                    # ── Advantage for this role ──
                     adv = buyer_advs[i] if role == "buyer" else seller_advs[i]
 
-                    # ── Weighted REINFORCE loss (SPIRAL Eq. 3) ──
-                    policy_loss = -adv * pol_lp
+                    # ── Clipped surrogate + KL (GRPO-style) ──
+                    log_ratio = (pol_lp - ref_lp).clamp(-5.0, 5.0)
+                    ratio = torch.exp(log_ratio)
+                    clipped = torch.clamp(ratio, 1 - EPSILON, 1 + EPSILON)
+
+                    surr1 = ratio * adv
+                    surr2 = clipped * adv
+                    policy_loss = -torch.min(surr1, surr2)
+
+                    if KL_COEF > 0:
+                        policy_loss = policy_loss + KL_COEF * log_ratio
 
                     loss = (policy_loss * mask).sum() / (mask.sum() + 1e-8)
 
-                    # Per-turn backward — accumulates grads, frees graph
                     loss.backward()
                     total_loss += loss.item()
                     turn_count += 1
 
-            # Step after each inner epoch (SPIRAL: 2 steps per batch of trajectories)
+            # Step after each inner epoch
             torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
@@ -711,14 +734,14 @@ def main():
     print(f"[CONFIG] BuyerTemp={BUYER_TEMP} SellerTemp={SELLER_TEMP} MaxNew={MAX_NEW_TOKENS}")
     print(f"[CONFIG] GradCheckpoint={GRADIENT_CHECKPOINTING}")
     print(f"[CONFIG] RAE_Decay={RAE_DECAY} DualRoleRatio={DUAL_ROLE_RATIO}")
-    print(f"[CONFIG] GenBatchLimit={GEN_BATCH_LIMIT} InnerEpochs={NUM_INNER_EPOCHS}")
-    print(f"[CONFIG] RefModel=NONE (pure REINFORCE, SPIRAL Eq. 3)")
+    print(f"[CONFIG] GenBatchLimit={GEN_BATCH_LIMIT} InnerEpochs={NUM_INNER_EPOCHS} NormAdvantages={NORMALIZE_ADVANTAGES}")
+    print(f"[CONFIG] RefModel=YES (frozen, for KL + IS ratio)")
     print("=" * 60, flush=True)
     
     # 0. Trackio monitoring
     try:
         import trackio
-        run_name = RUN_NAME or f"v9-{MODEL_NAME.split('/')[-1]}-{NUM_ITERS}it"
+        run_name = RUN_NAME or f"v10-{MODEL_NAME.split('/')[-1]}-{NUM_ITERS}it"
         trackio.init(
             project="anchor-negotiation",
             name=run_name,
@@ -731,9 +754,10 @@ def main():
                 "buyer_temp": BUYER_TEMP, "seller_temp": SELLER_TEMP,
                 "grad_checkpoint": GRADIENT_CHECKPOINTING,
                 "rae_decay": RAE_DECAY, "dual_role_ratio": DUAL_ROLE_RATIO,
-                "ref_model": "none (pure REINFORCE)",
+                "ref_model": "frozen (KL + IS ratio)",
                 "batched_gen": True,
                 "inner_epochs": NUM_INNER_EPOCHS,
+                "normalize_advantages": NORMALIZE_ADVANTAGES,
             },
         )
         TRACKIO_OK = True
@@ -743,19 +767,18 @@ def main():
         TRACKIO_OK = False
     
     # 1. Dataset
-    print("\n[1/4] Loading dataset...")
+    print("\n[1/5] Loading dataset...")
     train_products, test_products = load_products()
     
     # 2. Tokenizer
-    print(f"\n[2/4] Loading tokenizer ({MODEL_NAME})...")
+    print(f"\n[2/5] Loading tokenizer ({MODEL_NAME})...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     print("  [OK]")
     
     # 3. Policy model (shared — plays both buyer and seller)
-    # NO separate reference model — saves 8GB VRAM
-    print(f"\n[3/4] Loading policy model (shared buyer+seller)...")
+    print(f"\n[3/5] Loading policy model (shared buyer+seller)...")
     policy_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         dtype=torch.bfloat16,
@@ -766,10 +789,22 @@ def main():
         policy_model.gradient_checkpointing_enable()
     dev = next(policy_model.parameters()).device
     print(f"  [OK] Device={dev} VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
-    print(f"  [INFO] No reference model loaded (ref-free GRPO) — saving ~8GB VRAM")
     
-    # 4. Optimizer + RAE
-    print(f"\n[4/4] Optimizer (AdamW, lr={LR}, betas=(0.9,0.95)) + RAE (decay={RAE_DECAY})...")
+    # 4. Reference model (frozen — for KL penalty + IS ratio)
+    print(f"\n[4/5] Loading reference model (frozen)...")
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    ref_model.eval()
+    for p in ref_model.parameters():
+        p.requires_grad = False
+    print(f"  [OK] VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
+    
+    # 5. Optimizer + RAE
+    print(f"\n[5/5] Optimizer (AdamW, lr={LR}, betas=(0.9,0.95)) + RAE (decay={RAE_DECAY})...")
     optimizer = torch.optim.AdamW(policy_model.parameters(), lr=LR, betas=(0.9, 0.95), weight_decay=0.0)
     rae = RAE(decay=RAE_DECAY)
     n_params = sum(p.numel() for p in policy_model.parameters() if p.requires_grad)
@@ -777,7 +812,7 @@ def main():
     
     # Training
     print(f"\n{'=' * 60}")
-    print("DUAL-ROLE REINFORCE WITH RAE (v9: batched + ref-free + 2 inner epochs)")
+    print("DUAL-ROLE GRPO WITH RAE (v10: batched + RLVR-SPIRAL hybrid)")
     print(f"{'=' * 60}")
     
     metrics = []
@@ -811,7 +846,7 @@ def main():
         print(f"  Dual-role GRPO update on {len(episodes)} episodes (ref-free)...")
         print(f"  RAE state: {rae.state_dict()}")
         loss = dual_role_grpo_update(
-            policy_model, tokenizer, episodes, optimizer, rae, dev
+            policy_model, ref_model, tokenizer, episodes, optimizer, rae, dev
         )
         
         # Clear GPU cache after update
