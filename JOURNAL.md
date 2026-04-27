@@ -480,5 +480,52 @@ For the $37-70 budget:
 - **Qwen3-8B** on **a100-large** ($4/hr) with batched generation
 - 40-60 iterations at ~15 min/iter (batched) = 10-15 hours → $40-60
 - LR=1e-6, same KL/RAE config as v7
+---
+
+## v8: Batched Generation + Reference-Free GRPO (2026-04-27)
+
+### Changes
+
+**Optimization 1: Batched turn-parallel generation**
+- Replaced `run_dual_episode()` (sequential, 1 episode) with `run_dual_episodes_batched()` (all episodes in parallel)
+- Each turn round: one batched `model.generate()` for all active buyers, then one for all active sellers
+- Episodes that terminate early are masked out of subsequent turns
+- Left-padding for variable-length prompts in batched calls
+- Sub-batching via `GEN_BATCH_LIMIT=128` to cap peak VRAM
+- **Expected speedup: 10-15× on rollout phase** (2-4 min vs 34 min)
+- Bug fixed: buyer `[REJECT]` was falling through to `UNEXPECTED_REJECT` — now correctly routes to seller turn
+
+**Optimization 2: Reference model removed**
+- No separate frozen ref model → saves **8GB VRAM** (half of model memory)
+- GRPO update does ONE forward pass per turn instead of TWO
+- Within each group, `optimizer.step()` hasn't been called, so policy weights = rollout-time weights
+- `ratio = π/π_old = 1.0` → clipped surrogate degenerates to weighted REINFORCE
+- Loss = `-advantage * log_prob(completion)` — exactly what SPIRAL uses
+- **Expected speedup: ~50% on GRPO update phase** (1 forward pass vs 2)
+- KL_COEF kept as config but currently inert (KL between policy and itself = 0)
+
+### Combined Expected Impact
+
+| Phase | v6 (128 eps) | v8 (128 eps) | Speedup |
+|-------|-------------|-------------|---------|
+| Rollout | ~34 min | ~3-5 min | 7-10× |
+| GRPO update | ~3 min (2 fwd/turn) | ~1.5 min (1 fwd/turn) | ~2× |
+| **Total/iter** | **~38 min** | **~5-7 min** | **5-8×** |
+| **15 iters** | **~9.5 hr** | **~1.2-1.7 hr** | - |
+| **Est. cost** | ~$24 | **~$3-4** | 6-8× cheaper |
+
+### VRAM Budget (v8, Qwen3-4B-Instruct-2507 on A100-80GB)
+
+| Component | VRAM |
+|-----------|------|
+| Policy model (bf16) | ~8 GB |
+| ~~Ref model (bf16)~~ | ~~8 GB~~ → **0 GB** |
+| AdamW states (fp32) | ~16 GB |
+| Batched generation KV cache | ~2-4 GB (128 seqs × ~2K tokens) |
+| GRPO update activations | ~2 GB (grad checkpoint) |
+| **Total** | **~28-30 GB** (was ~36 GB) |
+
+**Headroom: ~50 GB free** — could increase GEN_BATCH_LIMIT or run larger models.
+
 
 
