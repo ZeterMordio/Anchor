@@ -14,7 +14,9 @@ Key differences from train_negotiation_clean.py:
 5. Per-episode backward (no gradient accumulation across episodes) — fixes A100 OOM
 6. Detached logprob generation (no output_scores in generate) — fixes memory leak
 
-Toy Run 3: 15 iters, Qwen3-4B, dual-role + RAE
+Toy Run 3 v7: 15 iters, Qwen3-4B-Instruct-2507 (better format adherence),
+LR=1e-6 (SPIRAL's value, 30x lower than v6), KL=0.01 (collapse prevention),
+AdamW betas=(0.9, 0.95) matching SPIRAL's optimizer config.
 """
 
 import os
@@ -39,14 +41,14 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # ─── Config ────────────────────────────────────────────────────────────────────
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-4B")
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-4B-Instruct-2507")
 NUM_ITERS = int(os.environ.get("NUM_ITERS", "15"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 GROUP_SIZE = int(os.environ.get("GROUP_SIZE", "8"))
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "6"))
-LR = float(os.environ.get("LR", "3e-5"))
+LR = float(os.environ.get("LR", "1e-6"))
 EPSILON = float(os.environ.get("EPSILON", "0.2"))
-KL_COEF = float(os.environ.get("KL_COEF", "0.0"))
+KL_COEF = float(os.environ.get("KL_COEF", "0.01"))
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "300"))
 BUYER_TEMP = float(os.environ.get("BUYER_TEMP", "1.0"))
 SELLER_TEMP = float(os.environ.get("SELLER_TEMP", "1.0"))  # Both roles need equal exploration in self-play
@@ -714,7 +716,7 @@ def main():
     
     # 5. Optimizer + RAE
     print(f"\n[5/5] Optimizer (AdamW, lr={LR}) + RAE (decay={RAE_DECAY})...")
-    optimizer = torch.optim.AdamW(policy_model.parameters(), lr=LR)
+    optimizer = torch.optim.AdamW(policy_model.parameters(), lr=LR, betas=(0.9, 0.95), weight_decay=0.0)
     rae = RAE(decay=RAE_DECAY)
     n_params = sum(p.numel() for p in policy_model.parameters() if p.requires_grad)
     print(f"  Trainable params: {n_params:,}")
