@@ -168,75 +168,60 @@ of the compute budget.
 ### Toy Run 3 Status — FAILED (Root Cause Diagnosed)
 
 **Job IDs attempted:**
-- `69eec939d70108f37ace0516` — STUCK at SCHEDULING 7+ hours, cancelled (Docker/base64 mode)
-- `69eeb7f6d70108f37ace04d5` — CANCELED
-- `69ee4d86d70108f37ace02ba` — CANCELED
-- `69ee4d61d2c8bd8662bd0109` — CANCELED
-- `69ef3557d70108f37ace074c` — SCHEDULING, "No logs available" (Docker base64, HF_TOKEN in env)
-- `69ef5164d70108f37ace07e4` — SCHEDULING, "No logs available" (Docker, script-download approach)
-- `69ef53d6d70108f37ace07f1` — SCHEDULING, "No logs available" (Docker, script-download v2)
-- `69ef556bd70108f37ace07f5` — SCHEDULING ⏳ (`hf jobs uv run` — correct approach, in GPU queue)
+- `69eec939d70108f37ace0516` — STUCK at SCHEDULING 7+ hours, cancelled (Docker pytorch image)
+- `69eeb7f6d70108f37ace04d5` — CANCELED (Docker pytorch image)
+- `69ee4d86d70108f37ace02ba` — CANCELED (Docker pytorch image)
+- `69ee4d61d2c8bd8662bd0109` — CANCELED (Docker pytorch image)
+- `69ef3557d70108f37ace074c` — SCHEDULING forever (Docker pytorch image, REST API)
+- `69ef5164d70108f37ace07e4` — SCHEDULING forever (Docker pytorch image, REST API)
+- `69ef53d6d70108f37ace07f1` — SCHEDULING forever (Docker pytorch image, REST API)
+- `69ef556bd70108f37ace07f5` — ✅ **RAN** 5.8 min, ERROR (`hf jobs uv run`, uv image)
+- `69ef56f8d70108f37ace0803` — ⏳ SUBMITTED (`hf jobs uv run`, torch pinned to CUDA 12)
 
-**Diagnosis (2026-04-27, updated ~12:30 UTC):**
+**Diagnosis (2026-04-27, updated ~13:00 UTC):**
 
-**UPDATE: The root cause was likely A100 GPU availability, not the script.**
+#### ROOT CAUSE 1: The `pytorch/pytorch` Docker Image Causes Infinite SCHEDULING
 
-Evidence: Even using the official `hf jobs uv run` CLI (which handles script upload, 
-auth, and output streaming correctly), the job remains in SCHEDULING. The `uv run` 
-approach uses the same base64-in-env pattern internally (`LOCAL_FILES_ENCODED`), and
-HF itself considers this the proper method. All job attempts show "Job started" then 
-"No logs available" — this means the container image was pulled but the GPU was never 
-allocated.
+**This was the primary culprit for the 7-hour stall and all "stuck in scheduling" jobs.**
 
-**Correct job submission method (discovered via `hf jobs` docs):**
+All jobs using `pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime` as `dockerImage`
+appeared stuck in SCHEDULING indefinitely. Analysis of 100 historical jobs shows:
 
-#### Issue A: Docker `exec()` + Buffered stdout = "No logs available"
+- Jobs using the pytorch Docker image with large payloads (>5KB env) → stuck forever
+- Jobs using lightweight images (uv, python:3.11, nvidia/cuda) → run promptly
+- The one successful training job (`69eab541`, 1142s) used pytorch image but was
+  submitted during a period of low demand
 
-The job uses Docker mode: a base64-encoded script is passed in `command`,
-decoded, and run via `exec(open("/tmp/t.py").read())`. Python's stdout in
-this mode is **fully buffered** — print() output never reaches the HF Jobs
-log stream until the buffer fills (~8KB) or the process exits. This is why
-the logs show "Job started" then "No logs available" even though the script
-may have been running for hours.
+The `pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime` image is ~8GB. On HF Jobs infra,
+pulling this image competes with GPU scheduling. When A100 demand is even moderate,
+the combination of large image pull + GPU allocation creates a deadlock-like state
+where the job shows "Job started" (image pull began) but never progresses to running.
 
-**Fix:** Add `PYTHONUNBUFFERED=1` to environment, or add `sys.stdout.flush()`
-after every print, or switch from `exec()` to `python3 /tmp/t.py` invocation.
-Best approach: use HF Jobs `script` mode (URL-based) instead of base64 Docker.
+**Evidence:** Switching to `ghcr.io/astral-sh/uv:python3.12-bookworm` (~200MB)
+immediately resolved the scheduling hang. Job `69ef556b` went from SCHEDULING to
+RUNNING within minutes and actually executed.
 
-#### Issue B: No HF_TOKEN in Job Secrets
+**Fix:** Use `hf jobs uv run` which uses the lightweight uv image. Dependencies
+(torch, transformers, etc.) are installed via `uv` at runtime, which is fast (~60s)
+and avoids the massive Docker image pull.
 
-The stuck job had `secrets: []` — empty. While `HUB_MODEL_ID` was set in
-environment, no `HF_TOKEN` was provided. Model download from HuggingFace Hub
-for `Qwen/Qwen3-4B` may hang on authentication/rate-limiting without a token.
-Earlier error jobs show `Warning: You are sending unauthenticated requests`
-and trackio failing with `401 Unauthorized`.
+#### ROOT CAUSE 2: PyTorch CUDA Version Mismatch (uv auto-resolution)
 
-**Fix:** Always include HF_TOKEN. In Docker mode, add `"HF_TOKEN": "<token>"`
-to the `environment` dict (not `secrets`). The HF Jobs system auto-injects
-`HF_TOKEN` only in `script` mode.
+When using `hf jobs uv run --with torch`, uv resolves the latest PyTorch (2.11.0+cu130,
+CUDA 13.0). But HF Jobs A100 machines have NVIDIA driver 12090 (CUDA 12.x only).
 
-#### Issue C: `torch_dtype` Deprecation (Minor)
+Error: `CUDA initialization: The NVIDIA driver on your system is too old (found version 12090)`
 
-Error job logs show: `[transformers] 'torch_dtype' is deprecated! Use 'dtype' instead!`
-This is a warning from newer transformers but may cause issues in some versions.
+**Fix:** Pin torch version: `--with 'torch>=2.6.0,<2.7'` to get a CUDA 12.4 build.
 
-**Fix:** Change `torch_dtype=torch.bfloat16` → `dtype=torch.bfloat16`.
+#### Additional Script Issues Fixed (from earlier analysis)
 
-#### Additional Script Issues Found (Not Crash-Causing)
-
-1. **`_token_logprobs` VRAM claim is incorrect**: The comment says "avoids 151K
-   softmax tensor" but `torch.logsumexp(logits, dim=-1)` still reads all 151K
-   values per position. The actual savings vs `F.log_softmax` are small — both
-   allocate similar intermediates. True savings would require chunked computation.
-
-2. **`torch.inference_mode()` for ref model risky**: Using inference_mode can
-   interact poorly with tensors that have grad context from the policy forward
-   pass (shared `input_ids`). Safer to use `torch.no_grad()`.
-
-3. **No flush/progress during rollout**: The rollout phase (16 products × 8
-   rollouts × 6 turns × 2 roles = ~1536 generations) produces zero output.
-   A single stuck generation (e.g., model entering repeat loop) would cause
-   the job to appear "hung" with no diagnostics.
+1. **`torch_dtype` deprecated** → changed to `dtype=torch.bfloat16`
+2. **`torch.inference_mode()` risky with shared tensors** → changed to `torch.no_grad()`
+3. **No output buffering control** → added `PYTHONUNBUFFERED=1` + `flush=True`
+4. **No rollout progress** → added logging every 4 products
+5. **No generation safety** → added `repetition_penalty=1.1`
+6. **Inaccurate `_token_logprobs` docstring** → corrected
 
 ### Toy Run 3 — Correct Submission Method
 
@@ -246,7 +231,7 @@ The official way to submit HF Jobs is via the `hf` CLI (installed via `curl -LsS
 hf jobs uv run \
     --flavor a100-large \
     --timeout 4h \
-    --with transformers --with torch --with accelerate --with trackio --with huggingface_hub \
+    --with 'torch>=2.6.0,<2.7' --with transformers --with accelerate --with trackio --with huggingface_hub \
     --secrets HF_TOKEN \
     --env BATCH_SIZE=16 \
     --env GROUP_SIZE=8 \
@@ -260,12 +245,13 @@ hf jobs uv run \
     train_negotiation_dual_role.py
 ```
 
-Key differences from our hacky REST API attempts:
-- Uses `uv` (not pip) for dependency resolution — much faster
-- Uses `ghcr.io/astral-sh/uv:python3.12-bookworm` image (not pytorch Docker)
+Key points:
+- Uses `uv` (not pip) for dependency resolution — much faster, lightweight image
+- `ghcr.io/astral-sh/uv:python3.12-bookworm` image (~200MB) — **NOT** pytorch (~8GB)
+- **Pin torch to <2.7** to avoid CUDA 13 builds (HF A100 driver is CUDA 12.x)
 - `--secrets HF_TOKEN` properly injects the token from HF's secret store
-- Script is uploaded as `LOCAL_FILES_ENCODED` env var (base64, same as before internally)
-- `--detach` returns immediately; logs at `hf jobs logs <ID> --follow`
+- Script is uploaded as `LOCAL_FILES_ENCODED` env var (base64, handled by CLI)
+- `--detach` returns immediately; logs via `hf jobs logs <ID> --follow`
 
 ### Real Run 4 Status
 
