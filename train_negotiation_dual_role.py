@@ -29,6 +29,11 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict
 
+# Force unbuffered output — critical for HF Jobs log streaming
+os.environ["PYTHONUNBUFFERED"] = "1"
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -291,13 +296,14 @@ def generate_turn(model, tokenizer, messages, max_new, temp, device):
     )
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=2048).to(device)
     
-    # Simple generation — no score storage
+    # Simple generation — no score storage, with repetition penalty to prevent loops
     output_ids = model.generate(
         **inputs,
         max_new_tokens=max_new,
         do_sample=True,
         temperature=max(temp, 0.01),  # Avoid div-by-zero
         top_p=1.0,
+        repetition_penalty=1.1,  # Prevent degenerate repeat loops
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
@@ -461,10 +467,11 @@ class RAE:
 
 # ─── Token-level log-prob helper (memory-efficient) ──────────────────────────
 def _token_logprobs(model, input_ids, attention_mask):
-    """Compute per-token log-probs WITHOUT materialising the full vocab softmax.
+    """Compute per-token log-probs via gather + logsumexp.
 
-    Standard approach:  log_softmax over [batch, seq, 151936] → 1.1 GB per call.
-    This helper:        logsumexp on the fly, gather first → ~0 extra VRAM.
+    Note: logsumexp still reads the full vocab dim but avoids materialising
+    a second [B, T, V] tensor (unlike F.log_softmax which allocates one).
+    Net savings ~0.6GB per call for V=151936.
     Returns shape [batch, seq-1] aligned with next-token prediction.
     """
     out = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -487,7 +494,7 @@ def dual_role_grpo_update(policy_model, ref_model, tokenizer, episodes,
         → saves ~1 GB VRAM per forward pass
     2.  Single tokenisation: prompt_len computed from the same token ids
         → removes a redundant tokenizer() call per turn
-    3.  torch.inference_mode for ref model → faster than no_grad
+    3.  torch.no_grad for ref model → safe with shared input tensors
     4.  Log-ratio clamped to [-5, 5] before exp → prevents inf ratios
         when policy drifts from ref (main cause of the loss explosion)
     5.  Advantages normalised (zero mean, unit std) per group+role
@@ -554,8 +561,8 @@ def dual_role_grpo_update(policy_model, ref_model, tokenizer, episodes,
                 # ── Policy log-probs (with grad) ──
                 pol_lp = _token_logprobs(policy_model, ids, attn)  # [1, T-1]
 
-                # ── Reference log-probs (no grad, inference mode) ──
-                with torch.inference_mode():
+                # ── Reference log-probs (no grad) ──
+                with torch.no_grad():
                     ref_lp = _token_logprobs(ref_model, ids, attn)
 
                 # ── Completion-only mask ──
@@ -640,7 +647,7 @@ def main():
     print(f"[CONFIG] BuyerTemp={BUYER_TEMP} SellerTemp={SELLER_TEMP} MaxNew={MAX_NEW_TOKENS}")
     print(f"[CONFIG] GradCheckpoint={GRADIENT_CHECKPOINTING}")
     print(f"[CONFIG] RAE_Decay={RAE_DECAY} DualRoleRatio={DUAL_ROLE_RATIO}")
-    print("=" * 60)
+    print("=" * 60, flush=True)
     
     # 1. Dataset
     print("\n[1/5] Loading dataset...")
@@ -657,7 +664,7 @@ def main():
     print(f"\n[3/5] Loading policy model (shared buyer+seller)...")
     policy_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
     )
@@ -670,7 +677,7 @@ def main():
     print(f"\n[4/5] Loading reference model (frozen)...")
     ref_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
     )
@@ -705,10 +712,16 @@ def main():
         # Rollout phase
         policy_model.eval()
         episodes = []
-        for p in products:
-            for _ in range(GROUP_SIZE):
+        rollout_t0 = time.time()
+        for pi, p in enumerate(products):
+            for gi in range(GROUP_SIZE):
                 ep = run_dual_episode(policy_model, tokenizer, p, dev)
                 episodes.append(ep)
+            # Progress every 4 products
+            if (pi + 1) % 4 == 0 or pi == len(products) - 1:
+                elapsed_r = time.time() - rollout_t0
+                print(f"  Rollout: {pi+1}/{len(products)} products, "
+                      f"{len(episodes)} episodes, {elapsed_r:.0f}s", flush=True)
         
         # Clear GPU cache after rollout
         torch.cuda.empty_cache()
@@ -746,7 +759,7 @@ def main():
               f"Deal={deal_rate:.1%} Price=${mean_price:.2f} Turns={mean_turns:.1f} "
               f"Time={elapsed:.1f}s")
         print(f"  Outcomes: {dict(sorted(outcomes.items(), key=lambda x: -x[1])[:5])}")
-        print(f"  VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB")
+        print(f"  VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB", flush=True)
         
         metrics.append({
             "iteration": iteration,

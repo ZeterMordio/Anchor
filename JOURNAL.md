@@ -165,14 +165,76 @@ of the compute budget.
 | `train_negotiation_dual_role.py` | Dual-role + RAE script (Toy Run 3+) |
 | `JOURNAL.md` | This file — living log of decisions |
 
-### Toy Run 3 Status
+### Toy Run 3 Status — FAILED (Root Cause Diagnosed)
 
-- **Job ID:** `69eeb7f6d70108f37ace04d5`
-- **Launched:** 2026-04-27 01:12 UTC
-- **Hardware:** a100-large (80GB VRAM)
-- **Status:** ⏳ **RUNNING** (started 02:04 UTC, ~52 min SCHEDULING)
-- **Expected runtime:** ~2.5–4 hours for 15 iterations
-- **Current time estimate:** Complete by ~04:30–06:00 UTC
+**Job IDs attempted:**
+- `69eec939d70108f37ace0516` — **STUCK at SCHEDULING 7+ hours**, cancelled
+- `69eeb7f6d70108f37ace04d5` — CANCELED (scheduling, never got GPU)
+- `69ee4d86d70108f37ace02ba` — CANCELED
+- `69ee4d61d2c8bd8662bd0109` — CANCELED
+
+**Diagnosis (2026-04-27, ~10:30 UTC):**
+
+Three root causes were identified by analyzing all 15 job attempts:
+
+#### Issue A: Docker `exec()` + Buffered stdout = "No logs available"
+
+The job uses Docker mode: a base64-encoded script is passed in `command`,
+decoded, and run via `exec(open("/tmp/t.py").read())`. Python's stdout in
+this mode is **fully buffered** — print() output never reaches the HF Jobs
+log stream until the buffer fills (~8KB) or the process exits. This is why
+the logs show "Job started" then "No logs available" even though the script
+may have been running for hours.
+
+**Fix:** Add `PYTHONUNBUFFERED=1` to environment, or add `sys.stdout.flush()`
+after every print, or switch from `exec()` to `python3 /tmp/t.py` invocation.
+Best approach: use HF Jobs `script` mode (URL-based) instead of base64 Docker.
+
+#### Issue B: No HF_TOKEN in Job Secrets
+
+The stuck job had `secrets: []` — empty. While `HUB_MODEL_ID` was set in
+environment, no `HF_TOKEN` was provided. Model download from HuggingFace Hub
+for `Qwen/Qwen3-4B` may hang on authentication/rate-limiting without a token.
+Earlier error jobs show `Warning: You are sending unauthenticated requests`
+and trackio failing with `401 Unauthorized`.
+
+**Fix:** Always include HF_TOKEN. In Docker mode, add `"HF_TOKEN": "<token>"`
+to the `environment` dict (not `secrets`). The HF Jobs system auto-injects
+`HF_TOKEN` only in `script` mode.
+
+#### Issue C: `torch_dtype` Deprecation (Minor)
+
+Error job logs show: `[transformers] 'torch_dtype' is deprecated! Use 'dtype' instead!`
+This is a warning from newer transformers but may cause issues in some versions.
+
+**Fix:** Change `torch_dtype=torch.bfloat16` → `dtype=torch.bfloat16`.
+
+#### Additional Script Issues Found (Not Crash-Causing)
+
+1. **`_token_logprobs` VRAM claim is incorrect**: The comment says "avoids 151K
+   softmax tensor" but `torch.logsumexp(logits, dim=-1)` still reads all 151K
+   values per position. The actual savings vs `F.log_softmax` are small — both
+   allocate similar intermediates. True savings would require chunked computation.
+
+2. **`torch.inference_mode()` for ref model risky**: Using inference_mode can
+   interact poorly with tensors that have grad context from the policy forward
+   pass (shared `input_ids`). Safer to use `torch.no_grad()`.
+
+3. **No flush/progress during rollout**: The rollout phase (16 products × 8
+   rollouts × 6 turns × 2 roles = ~1536 generations) produces zero output.
+   A single stuck generation (e.g., model entering repeat loop) would cause
+   the job to appear "hung" with no diagnostics.
+
+### Toy Run 3 — Fix Plan
+
+Switch from Docker/base64 mode to script-URL mode:
+1. Host the training script at a raw GitHub URL
+2. Submit job with `script` field pointing to the URL
+3. This auto-handles HF_TOKEN injection and output streaming
+4. Add `sys.stdout.flush()` after key prints as belt-and-suspenders
+5. Add progress logging during rollout phase
+6. Fix `torch_dtype` → `dtype`
+7. Use `torch.no_grad()` instead of `torch.inference_mode()`
 
 ### Real Run 4 Status
 
@@ -181,13 +243,13 @@ of the compute budget.
 - **Depends on:** Toy Run 3 results
 - **Current time estimate:** TBD
 
-### Next Steps (after Toy Run 3 completes)
+### Next Steps
 
-1. Evaluate: does buyer performance degrade vs buyer-only? If not → proceed
-   to dual-role Real Run (Qwen3-8B, 40 iters).
-2. If role confusion (UNEXPECTED_BUY >30% after iter 5) persists:
-   implement frozen-seller warmup (buyer-only iters 0-5, then dual-role).
-3. Add evaluation script: benchmark vs GPT-5.4, adversarial personas (RLVR §5).
+1. Fix and re-launch Toy Run 3 with corrected job submission
+2. Evaluate: does buyer performance degrade vs buyer-only?
+3. If OK → proceed to dual-role Real Run (Qwen3-8B, 40 iters)
+4. If role confusion persists: implement frozen-seller warmup
+5. Add evaluation script: benchmark vs GPT-5.4, adversarial personas (RLVR §5)
 
 ---
 
