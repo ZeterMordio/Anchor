@@ -284,11 +284,135 @@ Key points:
 - Toy Run 3: `69eeb7f6d70108f37ace04d5` (dual-role + RAE, Qwen3-4B, 15 iters)
 
 ### Known HF Jobs Quirks
-- `secrets` must NOT be passed as array in REST API — causes "expected record"
-- Correct: put `"HF_TOKEN": "auto"` in `environment` dict
+- **Use `hf jobs uv run`, NOT the REST API** — handles auth, script upload, log streaming
+- Pin `torch>=2.6.0,<2.7` to avoid CUDA 13 builds (HF A100 driver is 12090)
+- `--secrets HF_TOKEN` injects from HF secret store (NOT `--env HF_TOKEN=xxx`)
+- REST API `secrets` must NOT be passed as array — causes "expected record"
 - `create_repo()` and `HfApi()` need explicit `token=` param
-- REST endpoint for job submission: `POST /api/jobs/{namespace}`
-  **NOT** `/api/jobs` (404). Must include namespace in path.
-- Field is `flavor` not `hardware`
-- Field is `script` URL, not `spaceId` or `dockerImage` (unless Docker mode)
+
+---
+
+## Toy Run 3 — FINALLY RUNNING (2026-04-27 ~12:45 UTC)
+
+**Job ID:** `69ef56f8d70108f37ace0803`
+**Status:** ✅ RUNNING on A100-SXM4-80GB
+
+### What finally made it work
+
+| Change | Impact |
+|--------|--------|
+| `hf jobs uv run` instead of Docker REST API | **Unblocked scheduling** — uv image (~200MB) vs pytorch (~8GB) |
+| `--with 'torch>=2.6.0,<2.7'` | Fixed CUDA mismatch (torch 2.11 needs CUDA 13, HF has 12.x) |
+| `--secrets HF_TOKEN` | Proper auth for model download + trackio + hub push |
+| `PYTHONUNBUFFERED=1` + `flush=True` | Live log streaming from Python (uv install phase still batched) |
+
+### Observed Performance (Iteration 0)
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Rollout time (128 eps) | ~34 min | Sequential model.generate(), major bottleneck |
+| Time per episode | ~16s | 12 generate calls × ~1.3s each |
+| Time per generate call | ~1.3s | Qwen3-4B, 300 max_new_tokens, A100 |
+| GRPO update time | TBD | Awaiting iter 0 completion |
+| **Est. time per iteration** | **~40 min** | Rollout + update + cache clearing |
+| **Est. total (15 iters)** | **~10 hours** | ⚠️ Exceeds 4h timeout! |
+| **Est. total cost** | **~$25** | At $2.50/hr A100 |
+
+### Hyperparameter & Cost Tracking
+
+| Config | Batch | Group | Eps/Iter | Est. Iter Time | Est. Total (15it) | Est. Cost | Hardware |
+|--------|-------|-------|----------|----------------|-------------------|-----------|----------|
+| **Current (v6)** | 16 | 8 | 128 | ~40 min | ~10 hr | ~$25 | A100 $2.50/hr |
+| Reduced batch | 8 | 8 | 64 | ~20 min | ~5 hr | ~$12.50 | A100 $2.50/hr |
+| Reduced group | 16 | 4 | 64 | ~20 min | ~5 hr | ~$12.50 | A100 $2.50/hr |
+| Reduced both | 8 | 4 | 32 | ~10 min | ~2.5 hr | ~$6.25 | A100 $2.50/hr |
+| **Batched gen** (opt) | 16 | 8 | 128 | ~5-8 min | ~1.5-2 hr | ~$4-5 | A100 $2.50/hr |
+| Batched + L40S | 16 | 8 | 128 | ~8-12 min | ~2-3 hr | ~$4-5 | L40S $1.80/hr |
+| Batched + no ref | 16 | 8 | 128 | ~4-6 min | ~1-1.5 hr | ~$2.50-4 | A100 $2.50/hr |
+
+### Key for Qwen3-8B Real Run (planned)
+
+| Config | Batch | Group | Eps/Iter | Est. Iter Time | Est. Total (40it) | Est. Cost | Hardware |
+|--------|-------|-------|----------|----------------|-------------------|-----------|----------|
+| Sequential (current arch) | 64 | 8 | 512 | ~160 min | ~107 hr | ~$267 | A100 $2.50/hr |
+| **Batched gen** | 64 | 8 | 512 | ~15-25 min | ~10-17 hr | ~$25-42 | A100 $2.50/hr |
+| Batched + vLLM | 64 | 8 | 512 | ~8-12 min | ~5-8 hr | ~$12-20 | A100 $2.50/hr |
+
+**Conclusion:** Batched generation is mandatory for the Real Run. Without it, Qwen3-8B at paper scale (batch=64, group=8) would cost ~$267 and take 4+ days.
+
+---
+
+## Optimization Analysis (2026-04-27)
+
+### The Bottleneck
+
+Rollout is **>85% of iteration time**. Current approach calls `model.generate()` 
+sequentially 1,536 times per iteration (128 episodes × 12 turns). Each call is 
+~1.3s but the A100 is severely underutilized — it's doing single-sequence decoding
+at batch_size=1 while 80GB of VRAM sits mostly idle.
+
+### Optimization 1: Batched Turn-Parallel Generation (HIGH IMPACT, MODERATE EFFORT)
+
+**Core insight:** Episodes are independent of each other — only turns within an 
+episode are sequential. We can batch all 128 buyer-turn-1 prompts into a single 
+`model.generate()` call, then all 128 seller-turn-1, then buyer-turn-2, etc.
+
+- **Before:** 1,536 sequential generate calls (~34 min)
+- **After:** 12 batched calls (~2-4 min, depending on padding overhead)
+- **Speedup:** ~10-15×
+- **Effort:** Moderate refactor of `run_dual_episode()` → `run_dual_episodes_batched()`
+- **Complications:** Variable-length responses need left-padding; some episodes 
+  terminate early and need masking in subsequent turns.
+
+### Optimization 2: Drop the Reference Model (HIGH IMPACT, TRIVIAL EFFORT)
+
+SPIRAL (our RAE source paper) uses **no KL penalty** (`kl_loss_coefficient=0.0`,
+`kl_penalty_coefficient=0.0`). They validated this works for self-play. We're
+already at `KL_COEF=0.0`, so the ref model does nothing except consume:
+- ~8 GB VRAM (half the model memory)
+- ~50% of the GRPO update forward pass time
+
+**Fix:** Remove ref_model entirely. Use `ratio = 1.0` (no importance sampling) 
+or simply `policy_loss = -advantage * log_prob`. The clipping still prevents 
+catastrophic updates.
+
+**Risk:** Without KL anchor, policy might drift faster. But RAE baselines 
+provide variance reduction, and clip_epsilon=0.2 bounds step size. SPIRAL 
+shows this is fine for competitive self-play.
+
+### Optimization 3: vLLM / Prefix Caching (HIGH IMPACT, HIGHER EFFORT)
+
+Replace `model.generate()` with vLLM inference engine:
+- **Prefix caching:** System prompt (~200 tokens) computed once, reused for all 
+  128 episodes. Saves ~25% of prefill compute per generation.
+- **PagedAttention:** Handles variable-length batches efficiently, no padding waste.
+- **Continuous batching:** Better GPU utilization during decoding phase.
+- **Colocate mode:** Runs in same process, shares GPU with training. Use 
+  `vllm_enable_sleep_mode=True` to offload during GRPO update.
+
+### Optimization 4: L40S Instead of A100 (COST SAVING)
+
+If batched generation brings rollout under control, L40S (48GB, $1.80/hr) fits:
+- 2× Qwen3-4B bf16 = 16 GB
+- Optimizer states = 16 GB  
+- Activations + cache = ~8 GB
+- **Total: ~40 GB** fits in 48 GB
+
+L40S has lower memory bandwidth (864 GB/s vs 2 TB/s) so generation is ~30-50% 
+slower per token. But with batching, total wall time is dominated by compute 
+not bandwidth. **Estimated 28% cost savings** with ~20% time increase.
+
+### Optimization 5: Liger Kernel for GRPO Update (MODERATE IMPACT, TRIVIAL)
+
+Fuses cross-entropy + logprob computations in the update phase. Reported 
+20% throughput boost and 60% memory reduction on the forward/backward pass.
+Just needs `pip install liger-kernel` and a one-line config change.
+
+### Recommended Priority Order
+
+1. **Batched generation** — 10-15× rollout speedup, mandatory for Real Run
+2. **Drop ref model** — free 8GB VRAM + 50% update speedup, follows SPIRAL
+3. **L40S hardware** — 28% cost savings with minimal time increase
+4. **vLLM colocate** — additional 2-3× on top of batching
+5. **Liger kernel** — easy 20% update phase speedup
 
