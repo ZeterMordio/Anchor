@@ -1,7 +1,7 @@
 # Anchor Negotiation — Engineering Journal
 
 > Authored by: Anton Künzi
-> Last updated: 2026-04-27 02:00 UTC
+> Last updated: 2026-04-27 02:10 UTC
 > Session with: ZeterMordio
 
 This document is the single source of truth for all design decisions,
@@ -170,8 +170,16 @@ of the compute budget.
 - **Job ID:** `69eeb7f6d70108f37ace04d5`
 - **Launched:** 2026-04-27 01:12 UTC
 - **Hardware:** a100-large (80GB VRAM)
-- **Status:** SCHEDULING (normal — Docker pull + dep install takes ~20-30 min)
-- **Expected runtime:** ~2.5-4 hours for 15 iterations
+- **Status:** ⏳ **RUNNING** (started 02:04 UTC, ~52 min SCHEDULING)
+- **Expected runtime:** ~2.5–4 hours for 15 iterations
+- **Current time estimate:** Complete by ~04:30–06:00 UTC
+
+### Real Run 4 Status
+
+- **Status:** NOT YET LAUNCHED
+- **Planned:** Qwen3-8B, 40–60 iters, a100x4
+- **Depends on:** Toy Run 3 results
+- **Current time estimate:** TBD
 
 ### Next Steps (after Toy Run 3 completes)
 
