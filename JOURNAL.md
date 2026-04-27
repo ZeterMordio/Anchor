@@ -168,14 +168,27 @@ of the compute budget.
 ### Toy Run 3 Status — FAILED (Root Cause Diagnosed)
 
 **Job IDs attempted:**
-- `69eec939d70108f37ace0516` — **STUCK at SCHEDULING 7+ hours**, cancelled
-- `69eeb7f6d70108f37ace04d5` — CANCELED (scheduling, never got GPU)
+- `69eec939d70108f37ace0516` — STUCK at SCHEDULING 7+ hours, cancelled (Docker/base64 mode)
+- `69eeb7f6d70108f37ace04d5` — CANCELED
 - `69ee4d86d70108f37ace02ba` — CANCELED
 - `69ee4d61d2c8bd8662bd0109` — CANCELED
+- `69ef3557d70108f37ace074c` — SCHEDULING, "No logs available" (Docker base64, HF_TOKEN in env)
+- `69ef5164d70108f37ace07e4` — SCHEDULING, "No logs available" (Docker, script-download approach)
+- `69ef53d6d70108f37ace07f1` — SCHEDULING, "No logs available" (Docker, script-download v2)
+- `69ef556bd70108f37ace07f5` — SCHEDULING ⏳ (`hf jobs uv run` — correct approach, in GPU queue)
 
-**Diagnosis (2026-04-27, ~10:30 UTC):**
+**Diagnosis (2026-04-27, updated ~12:30 UTC):**
 
-Three root causes were identified by analyzing all 15 job attempts:
+**UPDATE: The root cause was likely A100 GPU availability, not the script.**
+
+Evidence: Even using the official `hf jobs uv run` CLI (which handles script upload, 
+auth, and output streaming correctly), the job remains in SCHEDULING. The `uv run` 
+approach uses the same base64-in-env pattern internally (`LOCAL_FILES_ENCODED`), and
+HF itself considers this the proper method. All job attempts show "Job started" then 
+"No logs available" — this means the container image was pulled but the GPU was never 
+allocated.
+
+**Correct job submission method (discovered via `hf jobs` docs):**
 
 #### Issue A: Docker `exec()` + Buffered stdout = "No logs available"
 
@@ -225,16 +238,34 @@ This is a warning from newer transformers but may cause issues in some versions.
    A single stuck generation (e.g., model entering repeat loop) would cause
    the job to appear "hung" with no diagnostics.
 
-### Toy Run 3 — Fix Plan
+### Toy Run 3 — Correct Submission Method
 
-Switch from Docker/base64 mode to script-URL mode:
-1. Host the training script at a raw GitHub URL
-2. Submit job with `script` field pointing to the URL
-3. This auto-handles HF_TOKEN injection and output streaming
-4. Add `sys.stdout.flush()` after key prints as belt-and-suspenders
-5. Add progress logging during rollout phase
-6. Fix `torch_dtype` → `dtype`
-7. Use `torch.no_grad()` instead of `torch.inference_mode()`
+The official way to submit HF Jobs is via the `hf` CLI (installed via `curl -LsSf https://hf.co/cli/install.sh | bash`):
+
+```bash
+hf jobs uv run \
+    --flavor a100-large \
+    --timeout 4h \
+    --with transformers --with torch --with accelerate --with trackio --with huggingface_hub \
+    --secrets HF_TOKEN \
+    --env BATCH_SIZE=16 \
+    --env GROUP_SIZE=8 \
+    --env MODEL_NAME=Qwen/Qwen3-4B \
+    --env NUM_ITERS=15 \
+    --env HUB_MODEL_ID=ZeterMordio/anchor-negotiation-dual-role \
+    --env PYTHONUNBUFFERED=1 \
+    --env RUN_NAME=toy3-qwen3-4b-15it \
+    --env TRACKIO_SPACE=ZeterMordio/anchor-dashboard \
+    --detach \
+    train_negotiation_dual_role.py
+```
+
+Key differences from our hacky REST API attempts:
+- Uses `uv` (not pip) for dependency resolution — much faster
+- Uses `ghcr.io/astral-sh/uv:python3.12-bookworm` image (not pytorch Docker)
+- `--secrets HF_TOKEN` properly injects the token from HF's secret store
+- Script is uploaded as `LOCAL_FILES_ENCODED` env var (base64, same as before internally)
+- `--detach` returns immediately; logs at `hf jobs logs <ID> --follow`
 
 ### Real Run 4 Status
 
