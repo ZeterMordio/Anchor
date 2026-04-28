@@ -292,13 +292,36 @@ def strip_thought(text):
     # Try to find "Talk:" and return everything from there
     m = re.search(r'(?:^|\n)\s*Talk\s*:', text, re.IGNORECASE)
     if m:
-        return text[m.start():].strip()
+        result = text[m.start():].strip()
+        _assert_strip_thought_complete(result, text)
+        return result
     # Fallback: try to remove "Thought: ... Talk:" prefix
     m = re.search(r'(?:^|\n)\s*Thought\s*:.*?(?=\n\s*Talk\s*:)', text, re.IGNORECASE | re.DOTALL)
     if m:
-        return text[m.end():].strip()
+        result = text[m.end():].strip()
+        _assert_strip_thought_complete(result, text)
+        return result
     # No recognizable structure — return as-is (safe: no Thought block to leak)
     return text
+
+
+def _assert_strip_thought_complete(stripped_text, original_text):
+    """Assert that strip_thought() didn't leave any Thought block in the output.
+    
+    Catches edge cases like 'Talk: blah Thought: secret' where the Thought block
+    appears AFTER Talk. Low risk (models follow format), but if it happens during
+    training, the private info leak is catastrophic.
+    
+    Only flags when the original had a structured Thought block (line starting with
+    'Thought:') AND one survived into the stripped output.
+    """
+    has_structured_thought = bool(re.search(r'(?:^|\n)\s*Thought\s*:', original_text))
+    leaked_thought = bool(re.search(r'(?:^|\n)\s*Thought\s*:', stripped_text))
+    if has_structured_thought and leaked_thought:
+        raise AssertionError(
+            f"strip_thought() INCOMPLETE: structured 'Thought:' block still present in stripped output. "
+            f"Original: {original_text[:200]}... Stripped: {stripped_text[:200]}..."
+        )
 
 
 def _assert_no_private_info_leak(prompt_text, product, role):
@@ -1023,12 +1046,35 @@ def main():
         for ep in episodes:
             outcomes[ep.outcome] = outcomes.get(ep.outcome, 0) + 1
         
+        # ── Sanity checks ──
+        # Zero-sum invariant: buyer_reward + seller_reward == 0 for every episode
+        for ep in episodes:
+            delta = abs(ep.buyer_reward + ep.seller_reward)
+            if delta > 1e-6:
+                raise AssertionError(
+                    f"ZERO-SUM VIOLATED: buyer_reward={ep.buyer_reward:.6f} + "
+                    f"seller_reward={ep.seller_reward:.6f} = {ep.buyer_reward + ep.seller_reward:.6f} "
+                    f"(expected 0). Product={ep.product['codename']}, outcome={ep.outcome}"
+                )
+        
+        # Role confusion counter: buyer using [SELL] or seller using [BUY]
+        role_confusions = 0
+        for ep in episodes:
+            for role, text in ep.turns:
+                act = extract_action(text)
+                if role == "buyer" and act["type"] == "SELL":
+                    role_confusions += 1
+                elif role == "seller" and act["type"] == "BUY":
+                    role_confusions += 1
+        
         elapsed = time.time() - t1
         update_time = elapsed - rollout_time
         print(f"  Loss={loss:.4f} BuyerR={mean_br:.4f} SellerR={mean_sr:.4f} "
               f"Deal={deal_rate:.1%} Price=${mean_price:.2f} Turns={mean_turns:.1f}")
         print(f"  Time={elapsed:.0f}s (rollout={rollout_time:.0f}s update={update_time:.0f}s)")
         print(f"  Outcomes: {dict(sorted(outcomes.items(), key=lambda x: -x[1])[:5])}")
+        if role_confusions > 0:
+            print(f"  ⚠️  ROLE CONFUSIONS: {role_confusions} (buyer→[SELL] or seller→[BUY])")
         print(f"  VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB", flush=True)
         
         # ── Trackio logging ──
@@ -1047,6 +1093,7 @@ def main():
                     "perf/rollout_time_s": rollout_time,
                     "perf/update_time_s": update_time,
                     "perf/vram_gb": torch.cuda.memory_allocated()/1e9,
+                    "sanity/role_confusions": role_confusions,
                 }, step=iteration)
             except Exception as e:
                 print(f"  [TRACKIO] Log failed (non-fatal): {e}")
@@ -1064,6 +1111,7 @@ def main():
             "update_time": update_time,
             "rae_state": rae.state_dict(),
             "outcomes": outcomes,
+            "role_confusions": role_confusions,
         })
     
     # Save
