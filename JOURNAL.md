@@ -776,5 +776,49 @@ remote data` warnings. Non-fatal — all metrics saved to `metrics.json` in the 
    - Group size: {4, 8, 16}
    - RAE decay: {0.9, 0.95, 0.99}
 
+---
+
+## v10.2: Liger Kernel Integration (2026-04-28)
+
+### What Changed
+
+Added Liger Kernel monkey-patching for Qwen3 before model loading. Two lines of core code:
+
+```python
+from liger_kernel.transformers import apply_liger_kernel_to_qwen3
+apply_liger_kernel_to_qwen3()
+```
+
+This replaces four Qwen3 module-level classes with fused Triton kernels:
+
+| Original | Liger Replacement | What it fuses | Impact |
+|----------|------------------|---------------|--------|
+| `Qwen3MLP` | `LigerSwiGLUMLP` | gate_proj + up_proj + SiLU + down_proj | **60% memory savings** on backward (no intermediate tensor) |
+| `Qwen3RMSNorm` | `LigerRMSNorm` | Norm + variance in single kernel | Minor speedup |
+| `apply_rotary_pos_emb` | `liger_rotary_pos_emb` | RoPE sin/cos fused | Minor speedup |
+| `CrossEntropyLoss` | `LigerFusedLinearCrossEntropy` | lm_head + CE in one pass | **Major**: 151K-vocab logit tensor never materialized |
+
+### Design Decisions
+
+- **Env-var toggle:** `USE_LIGER=1` (default ON). Set `USE_LIGER=0` to disable for debugging.
+- **Graceful fallback:** If `liger-kernel` not installed, prints a warning and continues without it.
+- **Global patch:** `apply_liger_kernel_to_qwen3()` patches the module-level classes, so BOTH
+  policy and ref models automatically use fused kernels.
+- **Dependency:** `pip install liger-kernel` (add `--with liger-kernel` to hf jobs command).
+
+### Expected Impact
+
+- **GRPO update phase:** ~20% speedup (fused SwiGLU backward + fused CE avoids 1.1GB logit tensor)
+- **Rollout phase:** ~5-10% (only forward pass, no backward — fused RMSNorm/RoPE help slightly)
+- **VRAM:** ~40-60% reduction in peak activation memory during backward. This may allow
+  disabling gradient checkpointing for an additional speedup, or fitting larger batch sizes.
+- **Quality:** No impact. Liger kernels are mathematically equivalent in bf16.
+
+### Risks
+
+- **Near zero.** Qwen3 is explicitly supported. Liger has dedicated `apply_liger_kernel_to_qwen3`.
+  Verified: Qwen3-4B-Instruct-2507 has `model_type: qwen3` which matches Liger's dispatch table.
+- Only risk is Liger version incompatibility with future transformers versions, handled by the
+  try/except fallback.
 
 
