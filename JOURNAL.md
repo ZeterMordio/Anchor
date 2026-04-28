@@ -945,5 +945,39 @@ Final model is still pushed to `main` branch as before.
 - Role confusions: should stay near 0
 
 **Checkpoints pushed to:** `ZeterMordio/anchor-negotiation-dual-role` branches `iter-10` through `iter-60`
+---
+
+## Bugfix: Shell Redirect in `torch>=2.6.0,<2.7` Dependency (2026-04-28)
+
+### THE BUG
+
+Job `69f0c5d8d70108f37ace1021` (and our first v10.4 attempt `69f0d5e1d70108f37ace10cb`)
+failed instantly with:
+
+```
+/bin/sh: 1: cannot open 2.7: No such file
+```
+
+**Root cause:** When submitting via the `hf_jobs` API tool (as opposed to the `hf` CLI),
+dependency strings are interpolated into a `/bin/sh -lc "..."` command **without quoting**.
+The `<2.7` in `torch>=2.6.0,<2.7` gets interpreted by the shell as an input redirect
+from a file called `2.7`.
+
+The successful v10 job (`69efcf15`) was submitted via the `hf` CLI which properly
+single-quotes each `--with` argument: `'--with' 'torch>=2.6.0,<2.7'`.
+
+### THE FIX
+
+Changed dependency from `torch>=2.6.0,<2.7` to `torch==2.6.0` (exact pin).
+No `<` character → no shell redirect ambiguity. This is the exact version that
+ran successfully on the v10 A100 job (CUDA 12.4, matches HF driver 12090).
+
+### Job IDs
+
+| Job | Torch Spec | Status |
+|-----|-----------|--------|
+| `69f0c5d8` | `torch>=2.6.0,<2.7` (unquoted) | ❌ shell redirect error |
+| `69f0d5e1` | `torch>=2.6.0,<2.7` (unquoted) | ❌ cancelled (same bug) |
+| `69f0d81e` | `torch==2.6.0` | ✅ submitted, scheduling |
 
 
