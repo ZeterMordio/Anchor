@@ -821,4 +821,82 @@ This replaces four Qwen3 module-level classes with fused Triton kernels:
 - Only risk is Liger version incompatibility with future transformers versions, handled by the
   try/except fallback.
 
+---
+
+## v10.3: Fix Thought Block Information Leakage in Self-Play (2026-04-28)
+
+### THE BUG
+
+**Severity: CRITICAL — invalidates all prior self-play training results.**
+
+In the model's output format (Thought/Talk/Action), the Thought block contains private strategic
+reasoning: the buyer's budget, the seller's cost, intended strategy, bottom-line prices. Example:
+
+```
+Thought: My budget is $278.40 and the list price is $348. I'll start low at $180 to leave room.
+Talk: Hi, I'm interested in these headphones. Would you accept $180?
+Action: [BUY] $180 (1x electronics_42)
+```
+
+This **entire text** — including the Thought block — was being injected verbatim into the
+counterparty's conversation context. The seller saw the buyer's budget and strategy; the buyer
+saw the seller's cost and reservation price.
+
+### WHY IT WASN'T CAUGHT BEFORE
+
+The RLVR paper (2604.09855) uses a **frozen seller** that doesn't see the buyer's output at all.
+The seller is a fixed policy that only generates from its own system prompt + the buyer's Talk/Action
+(implicitly, since the frozen seller doesn't process the buyer's Thought). So the paper's
+implementation doesn't need Thought stripping — it's architecturally impossible for the seller
+to see the buyer's Thought.
+
+Our SPIRAL dual-role setup breaks this assumption: the SAME model plays both roles, and both
+roles see the other's full output as conversation history. The Thought leak has been present
+since v6 (the first dual-role version).
+
+### IMPACT ON v10 RESULTS
+
+The v10 A100 run's results are **partially invalidated**:
+- The model was learning to negotiate, but also learning to read the counterparty's Thought
+- This artificially deflated the difficulty: the seller knew the budget, the buyer knew the cost
+- Deal rate (~46%) and buyer reward (+0.08 avg) were measured under "open cards" conditions
+- True adversarial negotiation (with information asymmetry) will be harder → expect:
+  - Lower deal rate initially (harder to find agreement zone without knowing limits)
+  - Slower reward improvement (must learn actual negotiation tactics, not just Thought-reading)
+  - But ultimately BETTER negotiation behavior (forced to develop real strategy)
+
+The good news: format stability, training dynamics, RAE baseline evolution, and performance
+benchmarks are all still valid. The algorithm works; it was just solving an easier problem.
+
+### THE FIX
+
+Added `strip_thought(text)` function that extracts only Talk+Action from model output:
+
+```python
+def strip_thought(text):
+    m = re.search(r'(?:^|\n)\s*Talk\s*:', text, re.IGNORECASE)
+    if m:
+        return text[m.start():].strip()
+    return text  # fallback: no Thought block found
+```
+
+Applied in THREE places:
+1. **Buyer prompt construction** (rollout): seller texts → `strip_thought(st)`
+2. **Seller prompt construction** (rollout): buyer texts → `strip_thought(bt)`
+3. **`_build_turn_prompt()`** (GRPO update): counterparty texts → `strip_thought(prev_text)`
+
+Design principle: **each role sees its OWN full text (Thought+Talk+Action) as `assistant`,
+but sees the OTHER role's text stripped (Talk+Action only) as `user`.**
+
+This preserves chain-of-thought continuity within each role while enforcing information asymmetry.
+
+### EXPECTED IMPACT ON NEXT RUN
+
+- Negotiation will be genuinely adversarial — the model must learn to infer the other side's
+  limits from Talk behavior (anchoring, concession patterns) rather than reading Thought
+- Initial deal rate will likely be lower (~35-40% vs 46%)
+- Reward improvement will be slower but more meaningful
+- The resulting negotiation strategies should transfer better to real-world settings
+  where counterparties don't share their internal reasoning
+
 

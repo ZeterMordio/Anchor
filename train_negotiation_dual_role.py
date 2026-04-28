@@ -14,6 +14,17 @@ Key differences from train_negotiation_clean.py:
 5. Per-episode backward (no gradient accumulation across episodes) — fixes A100 OOM
 6. Detached logprob generation (no output_scores in generate) — fixes memory leak
 
+v10.3 — Fix Thought block information leakage in self-play (2026-04-28):
+- BUG: counterparty's full output (including Thought: "my budget is $278...") was
+  injected verbatim into the other role's context. The seller could see the buyer's
+  budget and strategy; the buyer could see the seller's cost. This broke the
+  information asymmetry that makes negotiation meaningful.
+- The RLVR paper avoided this because the seller was frozen (never saw buyer output).
+  Our SPIRAL self-play setup requires explicit Thought stripping.
+- FIX: strip_thought() extracts only Talk+Action for cross-role context injection.
+  Each role's OWN prior texts keep full Thought for chain-of-thought continuity.
+- Applied in: run_dual_episodes_batched() (rollout) AND _build_turn_prompt() (GRPO update)
+
 v10.2 — Liger Kernel integration (2026-04-28):
 - Fused Triton kernels for Qwen3: SwiGLU, RMSNorm, RoPE, CrossEntropy
 - ~20% update phase speedup, ~60% peak memory reduction on backward pass
@@ -264,6 +275,31 @@ ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+def strip_thought(text):
+    """Remove Thought block from model output, keeping only Talk + Action.
+    
+    CRITICAL for self-play: the Thought block contains private strategic reasoning
+    (e.g., "my budget is $278", "the cost is $140"). If the counterparty sees this,
+    the negotiation game is broken — both sides can read each other's private info.
+    
+    The RLVR paper avoided this because the seller was frozen (never saw buyer output).
+    In our SPIRAL dual-role setup, we MUST strip Thought before injecting into the
+    other role's context.
+    
+    The model's own context keeps the full text (Thought+Talk+Action) so it can
+    maintain its own chain of thought across turns.
+    """
+    # Try to find "Talk:" and return everything from there
+    m = re.search(r'(?:^|\n)\s*Talk\s*:', text, re.IGNORECASE)
+    if m:
+        return text[m.start():].strip()
+    # Fallback: try to remove "Thought: ... Talk:" prefix
+    m = re.search(r'(?:^|\n)\s*Thought\s*:.*?(?=\n\s*Talk\s*:)', text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return text[m.end():].strip()
+    # No recognizable structure — return as-is (safe: no Thought block to leak)
+    return text
+
 def extract_action(text):
     m = ACTION_RE.search(text)
     if m:
@@ -425,10 +461,12 @@ def run_dual_episodes_batched(policy_model, tokenizer, products_expanded, device
         buyer_prompts = []
         for s in active_buyer:
             msgs = build_buyer_prompt(s.product)
-            # Add conversation history
+            # Add conversation history:
+            # - Buyer's OWN prior texts as "assistant" (FULL — keeps chain of thought)
+            # - Seller's texts as "user" (STRIPPED — no Thought leak)
             for bt, st in zip(s.buyer_texts, s.seller_texts):
                 msgs.append({"role": "assistant", "content": bt})
-                msgs.append({"role": "user", "content": st})
+                msgs.append({"role": "user", "content": strip_thought(st)})
             prompt_text = tokenizer.apply_chat_template(
                 msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False,
             )
@@ -485,12 +523,14 @@ def run_dual_episodes_batched(policy_model, tokenizer, products_expanded, device
         seller_prompts = []
         for s in still_active_for_seller:
             msgs = build_seller_prompt(s.product)
+            # - Buyer's texts as "user" (STRIPPED — no Thought leak)
+            # - Seller's OWN prior texts as "assistant" (FULL — keeps chain of thought)
             for bt, st in zip(s.buyer_texts, s.seller_texts):
-                msgs.append({"role": "user", "content": bt})
+                msgs.append({"role": "user", "content": strip_thought(bt)})
                 msgs.append({"role": "assistant", "content": st})
             # Add the latest buyer text that doesn't have a seller response yet
             if len(s.buyer_texts) > len(s.seller_texts):
-                msgs.append({"role": "user", "content": s.buyer_texts[-1]})
+                msgs.append({"role": "user", "content": strip_thought(s.buyer_texts[-1])})
             prompt_text = tokenizer.apply_chat_template(
                 msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False,
             )
@@ -721,9 +761,13 @@ def _build_turn_prompt(ep, turn_idx):
 
     Mirrors the RLVR paper prompt structure (Appendix C):
     - Buyer sees: system=BUYER_SYSTEM, user=setup+inventory+shopping list,
-      then alternating assistant=buyer_text / user=seller_text
+      then alternating assistant=buyer_text / user=seller_text(stripped)
     - Seller sees: system=SELLER_SYSTEM, user=setup+inventory+cost,
-      then alternating user=buyer_text / assistant=seller_text
+      then alternating user=buyer_text(stripped) / assistant=seller_text
+
+    CRITICAL: counterparty's Thought blocks are stripped via strip_thought()
+    to prevent private info leakage (budget, cost, strategy) in self-play.
+    Each role's OWN prior texts keep full Thought for chain-of-thought continuity.
 
     The loop adds ALL prior turns (j < turn_idx) in order.
     No extra message is appended — the loop already captures the full
@@ -737,16 +781,20 @@ def _build_turn_prompt(ep, turn_idx):
         for j in range(turn_idx):
             prev_role, prev_text = ep.turns[j]
             if prev_role == "buyer":
+                # Buyer's OWN text — keep full (Thought+Talk+Action)
                 prompt_msgs.append({"role": "assistant", "content": prev_text})
             else:  # seller
-                prompt_msgs.append({"role": "user", "content": prev_text})
+                # Seller's text — strip Thought (no cost/strategy leak to buyer)
+                prompt_msgs.append({"role": "user", "content": strip_thought(prev_text)})
     else:
         prompt_msgs = build_seller_prompt(product)
         for j in range(turn_idx):
             prev_role, prev_text = ep.turns[j]
             if prev_role == "buyer":
-                prompt_msgs.append({"role": "user", "content": prev_text})
+                # Buyer's text — strip Thought (no budget/strategy leak to seller)
+                prompt_msgs.append({"role": "user", "content": strip_thought(prev_text)})
             else:  # seller
+                # Seller's OWN text — keep full (Thought+Talk+Action)
                 prompt_msgs.append({"role": "assistant", "content": prev_text})
 
     return prompt_msgs
