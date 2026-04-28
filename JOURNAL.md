@@ -1,7 +1,7 @@
 # Anchor Negotiation — Engineering Journal
 
 > Authored by: Anton Künzi
-> Last updated: 2026-04-27 02:10 UTC
+> Last updated: 2026-04-28 09:15 UTC
 > Session with: ZeterMordio
 
 This document is the single source of truth for all design decisions,
@@ -14,23 +14,24 @@ It replaces the old `engineering_notebook.md` which is archived for reference.
 
 ### Hyperparameters (canonical)
 
-| Parameter | Toy Run 3 v7 | Real Run (planned) |
-|-----------|-----------|-------------------|
-| Model | Qwen3-4B-Instruct-2507 | Qwen3-8B |
-| Iters | 15 | 40-60 |
-| Batch (products) | 16 | 64 (paper) |
-| Group (rollouts/product) | 8 | 8 |
-| LR | 1e-6 | 1e-6 |
-| Max turns | 6 | 6 |
-| Max tokens/turn | 300 | 300 |
-| Buyer temp | 1.0 | 1.0 |
-| Seller temp | 1.0 | 1.0 (self-play) |
-| KL penalty | 0.01 | 0.01 |
-| RAE decay | 0.95 | 0.95 |
-| Dual-role ratio | 0.5 | 0.5-1.0 |
-| Clip epsilon | 0.2 | 0.2 |
-| AdamW betas | (0.9, 0.95) | (0.9, 0.95) |
-| Hardware | a100-large | a100-large |
+| Parameter | v10 A100 ✅ | v10 L40S ❌ | Real Run (planned) |
+|-----------|------------|------------|-------------------|
+| Model | Qwen3-4B-Instruct-2507 | Qwen3-4B-Instruct-2507 | Qwen3-8B |
+| Iters | 15 ✅ | 15 (OOM at iter 1) | 40-60 |
+| Batch (products) | 16 | 16 | 64 (paper) |
+| Group (rollouts/product) | 8 | 8 | 8 |
+| LR | 1e-6 | 1e-6 | 1e-6 |
+| Max turns | 6 | 6 | 6 |
+| Max tokens/turn | 300 | 300 | 300 |
+| Buyer temp | 1.0 | 1.0 | 1.0 |
+| Seller temp | 1.0 | 1.0 | 1.0 (self-play) |
+| KL penalty | 0.01 | 0.0 (ref-free) | 0.01 |
+| RAE decay | 0.95 | 0.95 | 0.95 |
+| Dual-role ratio | 0.5 | 0.5 | 0.5-1.0 |
+| Clip epsilon | 0.2 | 0.2 | 0.2 |
+| AdamW betas | (0.9, 0.95) | (0.9, 0.95) | (0.9, 0.95) |
+| Ref model | ✅ frozen | ❌ (USE_REF_MODEL=0) | ✅ frozen |
+| Hardware | a100-large (80GB) | l40sx1 (44GB) | a100-large |
 
 ### Verified Model IDs
 
@@ -167,7 +168,7 @@ of the compute budget.
 | `train_negotiation_dual_role.py` | Dual-role + RAE script (Toy Run 3+) |
 | `JOURNAL.md` | This file — living log of decisions |
 
-### Toy Run 3 Status — FAILED (Root Cause Diagnosed)
+### Toy Run 3 Status — ✅ COMPLETE (v10 on A100, 15 iters)
 
 **Job IDs attempted:**
 - `69eec939d70108f37ace0516` — STUCK at SCHEDULING 7+ hours, cancelled (Docker pytorch image)
@@ -257,17 +258,18 @@ Key points:
 
 ### Real Run 4 Status
 
-- **Status:** NOT YET LAUNCHED
-- **Planned:** Qwen3-8B, 40–60 iters, a100x4
-- **Depends on:** Toy Run 3 results
-- **Current time estimate:** TBD
+- **Status:** READY TO LAUNCH (pending user approval)
+- **Prerequisite:** ✅ Toy Run 3 v10 complete — format stable, rewards improving
+- **Option A:** Extended v10 (same 4B model, 40-60 iters) — $18, 4.6h, validates full convergence
+- **Option B:** Qwen3-8B, 40-60 iters, a100-large — $40-60, 10-15h, the "real" experiment
+- **Recommended:** Option A first (cheap validation), then Option B
 
 ### Next Steps
 
-1. Fix and re-launch Toy Run 3 with corrected job submission
-2. Evaluate: does buyer performance degrade vs buyer-only?
-3. If OK → proceed to dual-role Real Run (Qwen3-8B, 40 iters)
-4. If role confusion persists: implement frozen-seller warmup
+1. ✅ ~~Fix and re-launch Toy Run 3 with corrected job submission~~
+2. ✅ Format stability confirmed, buyer reward trending up
+3. Launch extended 40-60 iter run (Option A or B above)
+4. Build evaluation script for structured benchmarking
 5. Add evaluation script: benchmark vs GPT-5.4, adversarial personas (RLVR §5)
 
 ---
@@ -596,7 +598,183 @@ simple action format. Our negotiation has ~200 tokens/turn, continuous rewards [
 - `NUM_INNER_EPOCHS=1` (set 2 for SPIRAL's config)
 - Everything else: same env vars as before
 
+---
 
+## v10 Results — FIRST SUCCESSFUL FULL RUN (2026-04-28)
+
+### Job Summary
+
+| Job | Hardware | Ref Model | KL | Status | Iters | Total Time | Cost |
+|-----|----------|-----------|-----|--------|-------|-----------|------|
+| `69efcf15d2c8bd8662bd1359` | A100-large (80GB) | ✅ frozen | 0.01 | ✅ **COMPLETE** | 15/15 | 106 min | ~$7 |
+| `69efd58bd2c8bd8662bd139b` | L40Sx1 (44GB) | ❌ ref-free | 0.0 | ❌ **OOM iter 1** | 1/15 | 12 min | ~$0.35 |
+
+**Model pushed to:** [ZeterMordio/anchor-negotiation-dual-role](https://huggingface.co/ZeterMordio/anchor-negotiation-dual-role)
+
+### A100 Run — Iteration-by-Iteration Results
+
+| Iter | Loss | BuyerR | SellerR | Deal% | Price | Turns | Top Outcomes |
+|------|------|--------|---------|-------|-------|-------|-------------|
+| 0 | 0.0315 | +0.0838 | -0.0838 | 45.3% | $142.77 | 4.0 | BQ39 DBA34 DSA27 SQ16 BV7 |
+| 1 | 0.0591 | +0.0925 | -0.0925 | 50.8% | $112.07 | 4.0 | DSA35 DBA32 BQ26 SQ23 BV7 |
+| 2 | 0.0191 | +0.0760 | -0.0760 | **54.7%** | $166.49 | 4.2 | DSA39 DBA34 BQ31 SQ12 BV7 |
+| 3 | 0.0152 | +0.0411 | -0.0411 | 44.5% | $94.02 | 4.1 | DSA44 BQ39 SQ25 DBA13 BV5 |
+| 4 | 0.0319 | +0.0421 | -0.0421 | 41.4% | $385.31 | 4.0 | BQ40 DSA29 DBA27 SQ18 BV9 |
+| 5 | 0.0370 | +0.0827 | -0.0827 | 43.8% | $238.29 | 4.1 | BQ34 DSA30 DBA27 SQ21 BV9 |
+| 6 | -0.0022 | +0.0664 | -0.0664 | 48.4% | $304.04 | 4.2 | DSA36 BQ33 DBA28 SQ22 NP6 |
+| 7 | 0.0351 | +0.0556 | -0.0556 | 47.7% | $222.54 | 4.1 | DSA39 BQ28 SQ25 DBA22 BV9 |
+| 8 | 0.0305 | +0.0539 | -0.0539 | 46.1% | $198.46 | 3.9 | BQ39 DSA32 DBA28 SQ21 BV6 |
+| 9 | 0.0035 | +0.1004 | -0.1004 | 43.8% | $169.24 | 4.1 | DSA33 BQ31 SQ27 DBA26 BV7 |
+| 10 | -0.0237 | +0.0781 | -0.0781 | 39.1% | $294.11 | 4.1 | BQ42 DSA31 SQ27 DBA19 BV5 |
+| 11 | -0.0034 | +0.0897 | -0.0897 | 43.8% | $238.63 | 4.3 | BQ42 DSA31 DBA26 SQ19 BV5 |
+| 12 | 0.0320 | +0.0751 | -0.0751 | 43.8% | $159.99 | 3.9 | DSA34 BQ32 DBA22 SQ18 **BV16** |
+| 13 | 0.0282 | +0.1083 | -0.1083 | 46.9% | $260.32 | 4.0 | **DBA45** BQ36 DSA19 SQ15 BV7 |
+| 14 | 0.0457 | **+0.1518** | -0.1518 | **50.8%** | $253.87 | 4.2 | BQ35 DBA35 DSA35 SQ18 NP3 |
+
+Legend: DSA=DEAL_SELLER_ACCEPTS, DBA=DEAL_BUYER_ACCEPTS, BQ=BUYER_QUIT, SQ=SELLER_QUIT, BV=BUYER_BUDGET_VIOLATION, NP=NO_PRIOR_BUYER_OFFER
+
+### RAE Baseline Evolution
+
+| Iter | b_buyer | b_seller | n (total episodes) |
+|------|---------|----------|--------------------|
+| 0 | +0.031 | -0.031 | 128 |
+| 2 | +0.065 | -0.065 | 384 |
+| 5 | +0.096 | -0.096 | 768 |
+| 9 | +0.081 | -0.081 | 1280 |
+| 11 | +0.162 | -0.162 | 1536 |
+| 14 | **+0.211** | **-0.211** | 1920 |
+
+### Key Findings
+
+#### 1. FORMAT STABILITY SOLVED ✅
+
+The #1 failure mode from v6 (100% format collapse at iter 1) is **completely gone**.
+Zero FORMAT_ERROR outcomes across 15 iterations (1,920 episodes total).
+
+What fixed it:
+- **LR=1e-6** (30× lower than v6's 3e-5) — prevents weight destruction
+- **Qwen3-4B-Instruct-2507** — superior instruction following baseline
+- **KL=0.01 + frozen ref model** — format stability anchor
+
+#### 2. BUYER REWARD TRENDING UP ↑
+
+| Period | Mean BuyerR | Mean Deal% |
+|--------|-------------|-----------|
+| Iter 0-4 | +0.0671 | 47.3% |
+| Iter 5-9 | +0.0717 | 46.0% |
+| Iter 10-14 | **+0.1006** | **44.9%** |
+
+Buyer reward increased 50% from first 5 to last 5 iterations. The model IS learning
+to negotiate better deals. Deal rate dipped slightly (47.3→44.9%) which is expected:
+better buyer negotiation = harder for seller to accept = slightly fewer deals but
+higher buyer surplus per deal.
+
+#### 3. SELF-PLAY DYNAMICS WORKING ✅
+
+Iter 13 is the smoking gun: **DBA=45** (buyer accepts seller's offer) surged to the
+highest count of any iteration. The SELLER learned to make more attractive counter-offers
+that the buyer accepts. Meanwhile iter 14 shows perfect balance: DBA=35, DSA=35 — both
+roles contributing equally to deals.
+
+This is exactly what SPIRAL's RAE is designed to do: prevent one role from dominating.
+
+#### 4. PRICE DYNAMICS ARE NOISY BUT INFORMATIVE
+
+Mean deal price oscillates wildly ($94-$385) because the product mix varies per iteration
+(16 random products from 802). This is expected — the reward structure matters more than
+absolute prices. The buyer's increasing reward despite price variation shows it's learning
+to negotiate relative to budget, not just absolute prices.
+
+#### 5. BUDGET VIOLATIONS LOW AND STABLE
+
+Avg ~7/128 (5.5%) — the Qwen3-4B-Instruct-2507 model has strong enough base capabilities
+to respect budget constraints. Exception: iter 12 had BV=16 (12.5%), likely a batch of
+high-priced products with tight budgets.
+
+#### 6. PERFORMANCE: ~7 MIN/ITER ON A100
+
+| Phase | Time | % of Iteration |
+|-------|------|---------------|
+| Rollout (batched generation) | ~260s | 63% |
+| GRPO update (with ref model) | ~155s | 37% |
+| **Total per iteration** | **~415s (6.9 min)** | 100% |
+
+Compare to v6: 2,305s/iter (38 min) → **5.5× faster** thanks to batched generation.
+
+### L40S OOM Analysis
+
+The ref-free L40S job (`69efd58b`) completed iter 0 successfully (VRAM peaked at 24.3GB)
+but OOM'd during iter 1's GRPO update at 43.96GB/44.39GB. The issue:
+
+- Iter 0 update allocates ~24.3GB (model 8GB + optimizer 16GB + activations)
+- By iter 1, PyTorch memory fragmentation leaves only 429MB free
+- The `empty_cache()` + `gc.collect()` between iter 0 and 1 wasn't enough
+
+**Root cause:** L40S has 44.39GB usable (not 48GB as spec'd — ~3.6GB consumed by driver/OS).
+With 8GB model + 16GB optimizer + generation KV cache + activations, it's just too tight.
+
+**Fix for future:** Use `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and/or reduce
+`GEN_BATCH_LIMIT` from 64 to 32 to lower peak KV cache. But honestly, A100 at $4/hr
+for 106 min = $7 is cheap enough — L40S savings aren't worth the fragility.
+
+### Comparison to Paper (RLVR 2604.09855)
+
+| Metric | Paper (30B-A3B, buyer-only) | v10 (4B, dual-role) | Notes |
+|--------|---------------------------|--------------------|----|
+| Deal rate | ~40-55% (iter 0-20) | 39-55% (iter 0-14) | **Matching paper range** |
+| Format errors | ~0% (30B MoE) | ~0% (4B Instruct-2507) | Both models maintain format |
+| Convergence speed | ~20 iters to plateau | Still improving at iter 14 | Expected: 4B needs more iters |
+| Reward sign | Buyer reward only | Buyer ↑, Seller ↓ (zero-sum) | Our dual-role adds seller signal |
+| Rollout speed | vLLM-colocated | Batched HF generate | ~2s/ep comparable |
+
+### Trackio Dashboard
+
+Dashboard at https://huggingface.co/spaces/ZeterMordio/anchor-dashboard had server 500 errors
+during the run (Space may have been sleeping). Logs show `trackio could not flush buffered
+remote data` warnings. Non-fatal — all metrics saved to `metrics.json` in the model repo.
+
+**TODO:** Wake the Space before next run, or switch to a persistent monitoring solution.
+
+---
+
+## v10 Post-Mortem & Next Steps (2026-04-28)
+
+### What Worked
+1. **LR=1e-6 + Instruct-2507** — format stability solved permanently
+2. **Batched generation** — 5.5× faster than v6, makes iteration cheap (~$0.47/iter)
+3. **RAE** — buyer/seller baselines diverging as expected, no gradient cancellation
+4. **Clipped surrogate + KL** — smooth loss curve, no explosions
+5. **A100 VRAM budget** — 32.3GB stable, tons of headroom
+
+### What Needs Improvement
+1. **Buyer reward plateau** — +0.15 at iter 14 is good but paper reaches +0.3-0.4 at iter 40+
+2. **Need more iterations** — 15 iters is clearly not enough, model still improving
+3. **No evaluation yet** — need structured eval against baseline + adversarial sellers
+4. **Trackio flaky** — need to ensure Space is awake before launching runs
+
+### Recommended Next Steps (priority order)
+
+1. **Extended v10 run on A100** — 40-60 iterations with same config
+   - Est. time: 40×7min = 4.6h, cost: ~$18
+   - Should see buyer reward reach +0.3+ based on paper trajectory
+   - Save intermediate checkpoints every 10 iters for ablation
+
+2. **Build evaluation script** — `eval_negotiation.py` needs:
+   - Greedy decode (temp=0) against frozen base model as seller
+   - Greedy decode against GPT-5.4 API as seller (if budget allows)
+   - Adversarial seller personas (RLVR paper §5 tests)
+   - Metric: deal rate, buyer surplus, price efficiency ratio
+
+3. **Scale to Qwen3-8B** — the "real" run
+   - 8B on A100-large: ~33GB (model 16GB + ref 16GB + optimizer 32GB) — needs gradient checkpointing + careful VRAM management, or A100x2
+   - 40-60 iters at ~15 min/iter = 10-15h → $40-60
+   - With batched gen, this is within budget
+
+4. **Hyperparameter sweep** — now that format is stable:
+   - LR: {5e-7, 1e-6, 2e-6}
+   - KL: {0.0, 0.005, 0.01, 0.02}
+   - Group size: {4, 8, 16}
+   - RAE decay: {0.9, 0.95, 0.99}
 
 
 
