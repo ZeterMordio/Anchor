@@ -300,6 +300,78 @@ def strip_thought(text):
     # No recognizable structure — return as-is (safe: no Thought block to leak)
     return text
 
+
+def _assert_no_private_info_leak(prompt_text, product, role):
+    """Validate that a prompt does NOT contain the counterparty's private information.
+    
+    For buyer prompts: must NOT contain seller's cost_price
+    For seller prompts: must NOT contain buyer's budget
+    
+    Runs on every prompt during rollout and GRPO update. Raises AssertionError
+    on violation — we want training to CRASH rather than silently train on
+    leaked data. This is the negotiation equivalent of a data contamination check.
+    """
+    cost_str = f"${product['cost']:.2f}"
+    budget_str = f"${product['budget']:.2f}"
+    
+    if role == "buyer":
+        # Buyer must NOT see cost_price anywhere in its prompt
+        # (The buyer prompt legitimately contains list_price and budget, but never cost)
+        if f"cost_price" in prompt_text or f"cost_price (private)" in prompt_text:
+            raise AssertionError(
+                f"INFORMATION LEAK: buyer prompt contains 'cost_price'! "
+                f"Product={product['codename']}, cost={cost_str}"
+            )
+        # Also check for the cost value appearing in a Thought block from seller
+        # (This catches cases where strip_thought() failed)
+        if f"Thought:" in prompt_text:
+            # Extract all "user" messages (which should be stripped seller texts)
+            # If any user message contains "Thought:", strip_thought() failed
+            # But the buyer's OWN Thought blocks (in "assistant" messages) are fine
+            # Simple heuristic: check if cost appears right after "Thought:" in a user context
+            # More robust: just verify no seller Thought blocks survived
+            pass  # The cost_price string check above is the primary guard
+    
+    elif role == "seller":
+        # Seller must NOT see budget anywhere in its prompt
+        if f"budget_limit" in prompt_text or f"budget" in prompt_text.lower().split("inventory")[0]:
+            # Be careful: "budget" might appear in product descriptions legitimately
+            # Only flag if it appears in the structured prompt section (before conversation history)
+            pass  # Too many false positives from product descriptions containing "budget"
+        # Primary check: seller prompt should not contain the buyer's Shopping List section
+        if "Shopping List" in prompt_text:
+            raise AssertionError(
+                f"INFORMATION LEAK: seller prompt contains 'Shopping List' (buyer's private section)! "
+                f"Product={product['codename']}, budget={budget_str}"
+            )
+        if f"budget_limit: {budget_str}" in prompt_text:
+            raise AssertionError(
+                f"INFORMATION LEAK: seller prompt contains buyer's budget_limit={budget_str}! "
+                f"Product={product['codename']}"
+            )
+    
+    # Cross-role Thought leak check: verify strip_thought() worked
+    # In user messages (counterparty text), there should be no "Thought:" prefix
+    # We can't easily parse chat-template formatted text, but we CAN check:
+    # if the prompt contains the counterparty's private value inside a "Thought:" block
+    if role == "buyer" and cost_str in prompt_text:
+        # cost_str might appear legitimately if the buyer happens to guess it in Talk
+        # But it should NOT appear in a Thought block from the seller
+        # Heuristic: check for "Thought:.*cost.*{cost_str}" pattern
+        if re.search(rf'Thought:.*(?:cost|private).*{re.escape(cost_str)}', prompt_text, re.IGNORECASE):
+            raise AssertionError(
+                f"INFORMATION LEAK: buyer prompt contains seller's cost ({cost_str}) in a Thought block! "
+                f"strip_thought() may have failed. Product={product['codename']}"
+            )
+    
+    if role == "seller" and budget_str in prompt_text:
+        if re.search(rf'Thought:.*(?:budget|limit).*{re.escape(budget_str)}', prompt_text, re.IGNORECASE):
+            raise AssertionError(
+                f"INFORMATION LEAK: seller prompt contains buyer's budget ({budget_str}) in a Thought block! "
+                f"strip_thought() may have failed. Product={product['codename']}"
+            )
+
+
 def extract_action(text):
     m = ACTION_RE.search(text)
     if m:
@@ -470,6 +542,7 @@ def run_dual_episodes_batched(policy_model, tokenizer, products_expanded, device
             prompt_text = tokenizer.apply_chat_template(
                 msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False,
             )
+            _assert_no_private_info_leak(prompt_text, s.product, "buyer")
             buyer_prompts.append(prompt_text)
         
         # Single batched generate call for all buyers
@@ -534,6 +607,7 @@ def run_dual_episodes_batched(policy_model, tokenizer, products_expanded, device
             prompt_text = tokenizer.apply_chat_template(
                 msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False,
             )
+            _assert_no_private_info_leak(prompt_text, s.product, "seller")
             seller_prompts.append(prompt_text)
         
         seller_texts = generate_batched(
@@ -697,6 +771,7 @@ def dual_role_grpo_update(policy_model, ref_model, tokenizer, episodes,
                         prompt_msgs, tokenize=False,
                         add_generation_prompt=True, enable_thinking=False,
                     )
+                    _assert_no_private_info_leak(prompt_text, ep.product, role)
                     full_text = prompt_text + text
 
                     prompt_ids = tokenizer(
