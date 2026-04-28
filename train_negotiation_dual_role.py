@@ -14,6 +14,12 @@ Key differences from train_negotiation_clean.py:
 5. Per-episode backward (no gradient accumulation across episodes) — fixes A100 OOM
 6. Detached logprob generation (no output_scores in generate) — fixes memory leak
 
+v10.4 — Periodic checkpoint saving (2026-04-28):
+- Save model + metrics + RAE state to HF Hub branch every CHECKPOINT_EVERY iters
+- Each checkpoint pushed as branch 'iter-N' for easy comparison and rollback
+- Enables analyzing phase transitions across 60-iter runs
+- Final model still pushed to main branch as before
+
 v10.3 — Fix Thought block information leakage in self-play (2026-04-28):
 - BUG: counterparty's full output (including Thought: "my budget is $278...") was
   injected verbatim into the other role's context. The seller could see the buyer's
@@ -107,6 +113,7 @@ GEN_BATCH_LIMIT = int(os.environ.get("GEN_BATCH_LIMIT", "128"))
 NUM_INNER_EPOCHS = int(os.environ.get("NUM_INNER_EPOCHS", "1"))  # 1 for long NL episodes; SPIRAL uses 2 for short games
 NORMALIZE_ADVANTAGES = os.environ.get("NORMALIZE_ADVANTAGES", "1") == "1"  # Group norm on top of RAE
 USE_REF_MODEL = os.environ.get("USE_REF_MODEL", "1") == "1"  # Set 0 to skip ref model (saves 8GB, disables KL+IS ratio)
+CHECKPOINT_EVERY = int(os.environ.get("CHECKPOINT_EVERY", "10"))  # Save checkpoint every N iters (0 = disabled)
 
 # ─── CUDA check ──────────────────────────────────────────────────────────────────
 def check_cuda():
@@ -909,6 +916,7 @@ def main():
     print(f"[CONFIG] RAE_Decay={RAE_DECAY} DualRoleRatio={DUAL_ROLE_RATIO}")
     print(f"[CONFIG] GenBatchLimit={GEN_BATCH_LIMIT} InnerEpochs={NUM_INNER_EPOCHS} NormAdvantages={NORMALIZE_ADVANTAGES}")
     print(f"[CONFIG] RefModel={'YES' if USE_REF_MODEL else 'NO'} Liger={'YES' if USE_LIGER else 'NO'}")
+    print(f"[CONFIG] CheckpointEvery={CHECKPOINT_EVERY}")
     print("=" * 60, flush=True)
     
     # 0. Trackio monitoring
@@ -1113,6 +1121,44 @@ def main():
             "outcomes": outcomes,
             "role_confusions": role_confusions,
         })
+        
+        # ── Periodic checkpoint save + push ──
+        is_checkpoint_iter = (
+            CHECKPOINT_EVERY > 0
+            and (iteration + 1) % CHECKPOINT_EVERY == 0
+            and iteration < NUM_ITERS - 1  # skip if last iter (final save handles it)
+        )
+        if is_checkpoint_iter and HUB_MODEL_ID:
+            ckpt_tag = f"iter-{iteration+1}"
+            print(f"  [CHECKPOINT] Saving iter {iteration+1} → {HUB_MODEL_ID} (branch: {ckpt_tag})...")
+            ckpt_path = Path(f"/tmp/ckpt-{iteration+1}")
+            ckpt_path.mkdir(parents=True, exist_ok=True)
+            try:
+                policy_model.save_pretrained(ckpt_path)
+                tokenizer.save_pretrained(ckpt_path)
+                with open(ckpt_path / "metrics.json", "w") as f:
+                    json.dump(metrics, f, indent=2)
+                with open(ckpt_path / "rae_state.json", "w") as f:
+                    json.dump(rae.state_dict(), f, indent=2)
+                from huggingface_hub import HfApi, create_repo
+                token = os.environ.get("HF_TOKEN")
+                api = HfApi(token=token)
+                create_repo(HUB_MODEL_ID, exist_ok=True, token=token)
+                try:
+                    api.create_branch(HUB_MODEL_ID, branch=ckpt_tag, repo_type="model")
+                except Exception:
+                    pass  # branch may already exist
+                api.upload_folder(
+                    folder_path=ckpt_path, repo_id=HUB_MODEL_ID,
+                    repo_type="model", revision=ckpt_tag,
+                    commit_message=f"Checkpoint iter {iteration+1}: BuyerR={mean_br:.4f} Deal={deal_rate:.1%}",
+                )
+                print(f"  [CHECKPOINT] ✅ Pushed to branch '{ckpt_tag}'")
+                # Clean up local checkpoint to save disk space
+                import shutil
+                shutil.rmtree(ckpt_path, ignore_errors=True)
+            except Exception as e:
+                print(f"  [CHECKPOINT] ⚠️ Failed (non-fatal): {e}")
     
     # Save
     print(f"\n{'=' * 60}")
@@ -1124,6 +1170,8 @@ def main():
     tokenizer.save_pretrained(save_path)
     with open(save_path / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
+    with open(save_path / "rae_state.json", "w") as f:
+        json.dump(rae.state_dict(), f, indent=2)
     print(f"  Saved to {save_path}")
     
     # Push to hub

@@ -898,5 +898,52 @@ This preserves chain-of-thought continuity within each role while enforcing info
 - Reward improvement will be slower but more meaningful
 - The resulting negotiation strategies should transfer better to real-world settings
   where counterparties don't share their internal reasoning
+  where counterparties don't share their internal reasoning
+
+---
+
+## v10.4: Periodic Checkpoint Saving + Extended 60-Iter Run (2026-04-28)
+
+### What Changed
+
+Added `CHECKPOINT_EVERY` env var (default: 10). Every N iterations, the script:
+1. Saves model weights + tokenizer to a temp directory
+2. Saves `metrics.json` (all iters so far) and `rae_state.json`
+3. Pushes to HF Hub as a **named branch** `iter-N` (e.g. `iter-10`, `iter-20`, ...)
+4. Cleans up local checkpoint to save disk space
+
+This enables:
+- **Phase transition analysis**: compare model behavior at iter 10 vs 20 vs 30 etc.
+- **Rollback**: if training degrades, we can revert to a known-good checkpoint
+- **Intermediate evaluation**: run `eval_negotiation.py` against any checkpoint branch
+
+Final model is still pushed to `main` branch as before.
+
+### Run 4 Plan — First Adversarial Self-Play (v10.3 + v10.4)
+
+| Setting | Value |
+|---------|-------|
+| Model | Qwen3-4B-Instruct-2507 |
+| Iterations | **60** |
+| Hardware | A100-large (80GB) |
+| Timeout | 8h |
+| Checkpoint every | 10 iters |
+| Est. time | 60 × 7 min = ~7h |
+| Est. cost | ~$28 |
+| Key change | v10.3 Thought stripping — first genuinely adversarial run |
+
+**Expected trajectory** (based on RLVR paper 4-phase evolution):
+- Iter 0-12: Aggressive anchoring, deal rate may dip as buyer learns to lowball
+- Iter 12-20: Temporary deadlock — aggressive offers without persuasion skill
+- Iter 20-40: Rational concession — learns moderate openers that sellers engage with
+- Iter 40-60: Advanced persuasion — re-aggresses with linguistic skill
+
+**Key metrics to watch:**
+- Buyer reward: should reach +0.2 to +0.3 by iter 40-60 (paper got +0.77 at 60 with 30B MoE)
+- Deal rate: initial dip then recovery to ~50-60%
+- Budget violations: should stay <5% (Instruct-2507 has strong constraint following)
+- Role confusions: should stay near 0
+
+**Checkpoints pushed to:** `ZeterMordio/anchor-negotiation-dual-role` branches `iter-10` through `iter-60`
 
 
