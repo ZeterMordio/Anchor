@@ -1070,7 +1070,10 @@ def main():
         print(f"  Outcomes: {dict(sorted(outcomes.items(), key=lambda x: -x[1])[:5])}")
         if role_confusions > 0:
             print(f"  ⚠️  ROLE CONFUSIONS: {role_confusions} (buyer→[SELL] or seller→[BUY])")
-        print(f"  VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB", flush=True)
+        peak_vram = torch.cuda.max_memory_allocated() / 1e9
+        current_vram = torch.cuda.memory_allocated() / 1e9
+        print(f"  VRAM: {current_vram:.1f}GB current, {peak_vram:.1f}GB peak", flush=True)
+        torch.cuda.reset_peak_memory_stats()  # reset so peak is per-iteration
         
         # ── Trackio logging ──
         if TRACKIO_OK:
@@ -1087,7 +1090,8 @@ def main():
                     "perf/iter_time_s": elapsed,
                     "perf/rollout_time_s": rollout_time,
                     "perf/update_time_s": update_time,
-                    "perf/vram_gb": torch.cuda.memory_allocated()/1e9,
+                    "perf/vram_gb": current_vram,
+                    "perf/vram_peak_gb": peak_vram,
                     "sanity/role_confusions": role_confusions,
                 }, step=iteration)
             except Exception as e:
@@ -1104,6 +1108,8 @@ def main():
             "time": elapsed,
             "rollout_time": rollout_time,
             "update_time": update_time,
+            "vram_current_gb": current_vram,
+            "vram_peak_gb": peak_vram,
             "rae_state": rae.state_dict(),
             "outcomes": outcomes,
             "role_confusions": role_confusions,
