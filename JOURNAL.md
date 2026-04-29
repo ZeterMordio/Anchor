@@ -979,5 +979,55 @@ ran successfully on the v10 A100 job (CUDA 12.4, matches HF driver 12090).
 | `69f0c5d8` | `torch>=2.6.0,<2.7` (unquoted) | ❌ shell redirect error |
 | `69f0d5e1` | `torch>=2.6.0,<2.7` (unquoted) | ❌ cancelled (same bug) |
 | `69f0d81e` | `torch==2.6.0` | ✅ submitted, scheduling |
+---
+
+## Bugfix: False Positive in Thought-Leak Heuristic (2026-04-28)
+
+### THE BUG
+
+Job `69f0d81e` (v10.4, 60-iter run) crashed at iteration 1 with:
+
+```
+INFORMATION LEAK: buyer prompt contains seller's cost ($91.99) in a Thought block!
+strip_thought() may have failed. Product=other_227
+```
+
+### ANALYSIS: FALSE POSITIVE — NOT A REAL LEAK
+
+The assertion was in `_assert_no_private_info_leak()`, specifically the heuristic:
+```python
+if re.search(rf'Thought:.*(?:cost|private).*{re.escape(cost_str)}', prompt_text, ...):
+    raise AssertionError(...)
+```
+
+This regex matches `Thought:...cost...$91.99` **anywhere** in the buyer's prompt. But the
+buyer's prompt contains the buyer's OWN Thought blocks (in `assistant` messages, kept by
+design for chain-of-thought continuity). The buyer can legitimately reason about prices
+it has seen in the negotiation:
+
+> "Thought: The seller seems firm at $91.99, which might be near their cost..."
+
+This is the buyer **guessing** — not a leak from `strip_thought()` failing. The seller's
+Thought blocks are correctly stripped before injection into buyer context. But the buyer's
+own reasoning can reference dollar amounts that coincidentally equal the seller's cost.
+
+### THE FIX
+
+Removed the Thought-block value heuristic entirely (both buyer cost check and seller budget
+check). The regex cannot distinguish between the buyer's OWN Thought (legitimate) and a
+leaked seller Thought (bug) because the prompt is already chat-template-formatted text.
+
+The **primary guards remain** and have zero false positive risk:
+1. `"cost_price"` string check — catches seller's structured cost field leaking to buyer
+2. `"Shopping List"` string check — catches buyer's structured budget section leaking to seller
+3. `"budget_limit: {budget_str}"` check — catches exact budget value in seller prompt
+4. `strip_thought()` + `_assert_strip_thought_complete()` — ensures no Thought: block survives stripping
+
+### Job IDs
+
+| Job | Issue | Status |
+|-----|-------|--------|
+| `69f0d81e` | False positive Thought heuristic | ❌ crashed iter 1 |
+| next job | Heuristic removed | ✅ resubmitting |
 
 

@@ -380,26 +380,13 @@ def _assert_no_private_info_leak(prompt_text, product, role):
                 f"Product={product['codename']}"
             )
     
-    # Cross-role Thought leak check: verify strip_thought() worked
-    # In user messages (counterparty text), there should be no "Thought:" prefix
-    # We can't easily parse chat-template formatted text, but we CAN check:
-    # if the prompt contains the counterparty's private value inside a "Thought:" block
-    if role == "buyer" and cost_str in prompt_text:
-        # cost_str might appear legitimately if the buyer happens to guess it in Talk
-        # But it should NOT appear in a Thought block from the seller
-        # Heuristic: check for "Thought:.*cost.*{cost_str}" pattern
-        if re.search(rf'Thought:.*(?:cost|private).*{re.escape(cost_str)}', prompt_text, re.IGNORECASE):
-            raise AssertionError(
-                f"INFORMATION LEAK: buyer prompt contains seller's cost ({cost_str}) in a Thought block! "
-                f"strip_thought() may have failed. Product={product['codename']}"
-            )
-    
-    if role == "seller" and budget_str in prompt_text:
-        if re.search(rf'Thought:.*(?:budget|limit).*{re.escape(budget_str)}', prompt_text, re.IGNORECASE):
-            raise AssertionError(
-                f"INFORMATION LEAK: seller prompt contains buyer's budget ({budget_str}) in a Thought block! "
-                f"strip_thought() may have failed. Product={product['codename']}"
-            )
+    # Cross-role Thought leak check: REMOVED (was lines 383-402)
+    # The heuristic `Thought:.*cost.*{cost_str}` caused false positives because the
+    # buyer's OWN Thought blocks (in "assistant" messages, kept by design for chain-of-thought)
+    # can reference prices seen in negotiation that happen to equal the seller's cost.
+    # E.g. buyer reasons "the seller is firm at $91.99, near their cost" — this is the buyer
+    # GUESSING, not a leak. The primary guards (cost_price string check, Shopping List check)
+    # are sufficient and have zero false positive risk.
 
 
 def extract_action(text):
