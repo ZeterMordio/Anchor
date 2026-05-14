@@ -1030,4 +1030,80 @@ The **primary guards remain** and have zero false positive risk:
 | `69f0d81e` | False positive Thought heuristic | ❌ crashed iter 1 |
 | next job | Heuristic removed | ✅ resubmitting |
 
+---
+
+## 2026-05-14: Pure Negotiation-RLVR Script Rebuild
+
+### Request
+
+After evaluating the SPIRAL/RLVR hybrid (`ZeterMordio/69f1dc2bd70108f37ace15b8`), we decided to try a pure implementation of the negotiation paper first. Hypothesis: the self-play run learned slowly because buyer and seller co-evolved at roughly equal strength, making progress harder to measure. The new experiment should use the negotiation paper's buyer-only structure, but keep non-conflicting engineering improvements from the SPIRAL script.
+
+### Repository Cleanup
+
+- Deleted stale `train_negotiation_clean.py`.
+- Added `train_negotiation_pure.py`.
+- Kept `train_negotiation_dual_role.py` for the SPIRAL/RLVR hybrid comparison.
+
+### Pure Script Design
+
+`train_negotiation_pure.py` implements the paper's structure:
+
+- Trainable buyer policy only.
+- Frozen seller/reference model as environment.
+- Buyer always starts.
+- Only buyer turns receive GRPO updates.
+- Seller temperature restored to paper value `0.7`.
+- Seller regulation retained: seller cannot accept/propose below private cost.
+- Reward retained: `(budget - final_price) / |budget - cost|`, clipped to `[-1, 1]`.
+- No-deal/quit/timeout reward is `0`; buyer format/budget/protocol errors are `-1`.
+
+Explicitly removed SPIRAL components:
+
+- Shared-policy self-play.
+- Seller training and seller rewards.
+- Zero-sum objective.
+- RAE / role-conditioned baselines.
+- `DUAL_ROLE_RATIO`.
+
+### Non-Conflicting Improvements Kept
+
+- Batched turn-parallel generation.
+- Hidden `Thought:` stripping before cross-role context injection, matching paper §3.1.
+- Runtime private-info guards (`cost_price` must not enter buyer prompt; `Shopping List` / exact `budget_limit` must not enter seller prompt).
+- Memory-efficient token log-probs via target-gather + `logsumexp`; no full-vocab softmax tensor.
+- Clamped log-ratio before exponentiation.
+- Group-level advantage normalization for continuous rewards.
+- Small KL/reference anchor (`KL_COEF=0.01`) and `LR=1e-6`, matching the stable dense-4B settings from v10 rather than the paper's 30B-MoE `3e-5`.
+- AdamW betas `(0.9, 0.95)` and gradient clip `1.0`.
+- Optional Liger kernel patching.
+- Trackio metrics + alerts.
+- Periodic checkpoint branches every `CHECKPOINT_EVERY` iterations.
+- All 18 AmazonHistoryPrice categories included (930 valid products). Older scripts omitted two categories and loaded 901.
+
+### Initial Run Config (Prepared, Not Launched)
+
+| Setting | Value |
+|---------|-------|
+| Script | `train_negotiation_pure.py` |
+| Model | `Qwen/Qwen3-4B-Instruct-2507` |
+| Seller/reference | `Qwen/Qwen3-4B-Instruct-2507` frozen |
+| Iterations | **42** |
+| Batch | 16 products |
+| Group | 8 rollouts/product |
+| Episodes/iter | 128 |
+| Max turns | 6 |
+| Max tokens/turn | 300 |
+| LR | 1e-6 |
+| KL | 0.01 |
+| Buyer temp | 1.0 |
+| Seller temp | 0.7 |
+| Hardware | a100-large |
+| Timeout | 8h |
+| Hub target | `ZeterMordio/anchor-negotiation-pure` |
+| Trackio project | `anchor-negotiation-pure` |
+
+### Launch Notes
+
+Do not use dependency spec `torch>=2.6.0,<2.7` with `hf_jobs`; the `<` can be interpreted as shell redirection. Use exact `torch==2.6.0` or the quoted `hf jobs uv run --with 'torch>=2.6.0,<2.7'` CLI form.
+
 
