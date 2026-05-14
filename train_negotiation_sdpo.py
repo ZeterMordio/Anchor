@@ -44,7 +44,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 # ─── Liger Kernel: optional fused Triton kernels for Qwen3 ────────────────────
-USE_LIGER = os.environ.get("USE_LIGER", "1") == "1"
+# Liger's Triton kernels are safe on a single fully-GPU-resident model, but they
+# are not safe with Accelerate device_map CPU/offload. The previous a10g-largex4
+# run used MAX_MEMORY_PER_GPU_GIB and hit:
+#   ValueError: Pointer argument ... cannot be accessed from Triton (cpu tensor?)
+# Default Liger off whenever explicit multi-GPU memory caps are requested; users
+# can still force USE_LIGER=1 for a known fully GPU-resident sharded setup.
+_MULTI_GPU_MEMORY_CAP_REQUESTED = bool(os.environ.get("MAX_MEMORY_PER_GPU_GIB", "").strip())
+_DEFAULT_USE_LIGER = "0" if _MULTI_GPU_MEMORY_CAP_REQUESTED else "1"
+USE_LIGER = os.environ.get("USE_LIGER", _DEFAULT_USE_LIGER) == "1"
+if _MULTI_GPU_MEMORY_CAP_REQUESTED and USE_LIGER:
+    print("[LIGER] WARNING: USE_LIGER=1 with explicit max_memory caps; disable it if device_map offloads to CPU")
 if USE_LIGER:
     try:
         from liger_kernel.transformers import apply_liger_kernel_to_qwen3
@@ -98,6 +108,11 @@ SDPO_MAX_FEEDBACK_CHARS = int(os.environ.get("SDPO_MAX_FEEDBACK_CHARS", "1800"))
 # On 8B full fine-tuning, foreach AdamW briefly materializes extra tensor lists
 # at optimizer.step(); disabling foreach preserves the objective and lowers peak VRAM.
 ADAMW_FOREACH = os.environ.get("ADAMW_FOREACH", "0") == "1"
+# Optimizer choice is an implementation detail, not a training-method change. The
+# default remains exact full-parameter AdamW updates, but stores optimizer state
+# on CPU to avoid the 8B A100 optimizer.step OOM seen in job 6a05acb... .
+# Set OPTIMIZER=adamw_cuda for a fully CUDA AdamW attempt; keep it only if VRAM is enough.
+OPTIMIZER = os.environ.get("OPTIMIZER", "adamw_cpu").lower()
 
 random.seed(SEED)
 torch.manual_seed(SEED)
@@ -114,7 +129,10 @@ def _model_load_kwargs():
         if not torch.cuda.is_available():
             return kwargs
         n_gpu = torch.cuda.device_count()
+        # Reserve a CPU entry so Accelerate has an explicit place for layers that
+        # do not fit on the GPUs instead of failing unpredictably.
         kwargs["max_memory"] = {i: f"{MAX_MEMORY_PER_GPU_GIB}GiB" for i in range(n_gpu)}
+        kwargs["max_memory"]["cpu"] = "240GiB"
     return kwargs
 
 
@@ -127,15 +145,43 @@ def _model_input_device(model):
 
     Accelerate-dispatched models can span multiple GPUs. For those, inputs must
     start on the first layer's device, not necessarily on the lm_head device.
+    If the map starts on CPU, fail early: generation with CPU-dispatched input
+    layers is incompatible with the CUDA/Triton path we use for training.
     """
     hf_map = getattr(model, "hf_device_map", None)
     if isinstance(hf_map, dict):
         for key in ("model.embed_tokens", "transformer.wte", "model"):  # Qwen, GPT-like, fallback
             if key in hf_map:
-                return torch.device(hf_map[key])
+                dev = torch.device(hf_map[key])
+                if dev.type == "cpu":
+                    raise RuntimeError(f"Input layer {key} is on CPU in hf_device_map; use larger GPU memory or lower MAX_MEMORY_PER_GPU_GIB")
+                return dev
         first = next(iter(hf_map.values()))
-        return torch.device(first)
+        dev = torch.device(first)
+        if dev.type == "cpu":
+            raise RuntimeError("First model shard is on CPU; use larger GPU memory or lower MAX_MEMORY_PER_GPU_GIB")
+        return dev
     return _first_model_device(model)
+
+
+def _assert_no_cpu_offload(model, name):
+    """Fail fast if Accelerate placed any module on CPU/disk.
+
+    The previous a10g-largex4 run allowed CPU/offload and then failed inside a
+    Triton RMSNorm during generation. Full fine-tuning also needs all trainable
+    buyer weights on GPU for meaningful optimizer updates.
+    """
+    hf_map = getattr(model, "hf_device_map", None)
+    if not isinstance(hf_map, dict):
+        return
+    bad = {k: v for k, v in hf_map.items() if str(v).startswith("cpu") or str(v).startswith("disk")}
+    if bad:
+        sample = list(bad.items())[:8]
+        raise RuntimeError(
+            f"{name} has CPU/disk-offloaded modules in hf_device_map (sample={sample}). "
+            "This script does full-parameter training/generation and requires all modules on GPU. "
+            "Use A100/L40S-class memory or reduce per-GPU memory caps; do not use Liger with CPU offload."
+        )
 
 
 # ─── Dataset: AmazonHistoryPrice ─────────────────────────────────────────────
@@ -845,9 +891,57 @@ def _scatter_completion_values(template, mask, values):
     return out, n
 
 
-def sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, device):
+def _cpu_adamw_step(params, state, lr=LR, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.0):
+    """Exact AdamW step with optimizer state kept on CPU.
+
+    This preserves full fine-tuning and AdamW semantics while removing ~2x
+    parameter-size optimizer state from CUDA memory. Gradients are copied to CPU
+    one parameter at a time, so peak VRAM stays close to forward/backward memory.
+    """
+    with torch.no_grad():
+        for p in params:
+            if p.grad is None:
+                continue
+            sid = id(p)
+            st = state.get(sid)
+            if st is None:
+                st = {
+                    "step": 0,
+                    "exp_avg": torch.zeros_like(p.detach(), device="cpu", dtype=torch.float32),
+                    "exp_avg_sq": torch.zeros_like(p.detach(), device="cpu", dtype=torch.float32),
+                }
+                state[sid] = st
+            st["step"] += 1
+            grad = p.grad.detach().to(device="cpu", dtype=torch.float32)
+            exp_avg = st["exp_avg"]
+            exp_avg_sq = st["exp_avg_sq"]
+            exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+            bias_correction1 = 1.0 - beta1 ** st["step"]
+            bias_correction2 = 1.0 - beta2 ** st["step"]
+            denom = (exp_avg_sq.sqrt() / (bias_correction2 ** 0.5)).add_(eps)
+            update = exp_avg / bias_correction1 / denom
+            if weight_decay:
+                update.add_(p.detach().to(device="cpu", dtype=torch.float32), alpha=weight_decay)
+            update = update.to(device=p.device, dtype=p.dtype)
+            p.add_(update, alpha=-lr)
+            p.grad = None
+            del grad, update
+
+
+def _optimizer_step(buyer_model, optimizer, cpu_adamw_state):
+    torch.nn.utils.clip_grad_norm_(buyer_model.parameters(), 1.0)
+    if OPTIMIZER == "adamw_cpu":
+        _cpu_adamw_step([p for p in buyer_model.parameters() if p.requires_grad], cpu_adamw_state)
+    else:
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+
+def sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, device, cpu_adamw_state=None):
     """Buyer-only GRPO update augmented with strict feedback-conditioned SDPO."""
     buyer_model.train()
+    cpu_adamw_state = {} if cpu_adamw_state is None else cpu_adamw_state
     G = GROUP_SIZE
     num_groups = len(episodes) // G
     total_loss = 0.0
@@ -942,9 +1036,7 @@ def sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, dev
                     total_loss += loss.item()
                     turn_count += 1
 
-            torch.nn.utils.clip_grad_norm_(buyer_model.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            _optimizer_step(buyer_model, optimizer, cpu_adamw_state)
 
     return {
         "loss": total_loss / max(turn_count, 1),
@@ -1093,6 +1185,7 @@ def main():
                 "sdpo_adv_clip": SDPO_ADV_CLIP,
                 "sdpo_max_demo_chars": SDPO_MAX_DEMO_CHARS,
                 "sdpo_max_feedback_chars": SDPO_MAX_FEEDBACK_CHARS,
+                "optimizer": OPTIMIZER,
                 "adamw_foreach": ADAMW_FOREACH,
                 "model_device_map": MODEL_DEVICE_MAP,
                 "max_memory_per_gpu_gib": MAX_MEMORY_PER_GPU_GIB,
@@ -1121,6 +1214,7 @@ def main():
         MODEL_NAME,
         **_model_load_kwargs(),
     )
+    _assert_no_cpu_offload(buyer_model, "buyer_model")
     if GRADIENT_CHECKPOINTING:
         buyer_model.gradient_checkpointing_enable()
         if hasattr(buyer_model, "config"):
@@ -1133,6 +1227,7 @@ def main():
         SELLER_MODEL_NAME,
         **_model_load_kwargs(),
     )
+    _assert_no_cpu_offload(seller_model, "seller_model")
     seller_model.eval()
     for p in seller_model.parameters():
         p.requires_grad = False
@@ -1141,19 +1236,31 @@ def main():
         **_model_load_kwargs(),
     )
     if ref_model is not seller_model:
+        _assert_no_cpu_offload(ref_model, "ref_model")
         ref_model.eval()
         for p in ref_model.parameters():
             p.requires_grad = False
     print(f"  [OK] VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
 
-    print(f"\n[5/5] Optimizer (AdamW, lr={LR}, betas=(0.9,0.95), wd=0.0, foreach={ADAMW_FOREACH})...")
-    optimizer = torch.optim.AdamW(
-        buyer_model.parameters(),
-        lr=LR,
-        betas=(0.9, 0.95),
-        weight_decay=0.0,
-        foreach=ADAMW_FOREACH,
+    print(
+        f"\n[5/5] Optimizer (AdamW, lr={LR}, betas=(0.9,0.95), wd=0.0, "
+        f"optimizer={OPTIMIZER}, foreach={ADAMW_FOREACH})..."
     )
+    if OPTIMIZER == "adamw_cpu":
+        optimizer = None
+        cpu_adamw_state = {}
+        print("  [OK] AdamW optimizer state will be stored on CPU to avoid CUDA optimizer-step OOM")
+    elif OPTIMIZER == "adamw_cuda":
+        optimizer = torch.optim.AdamW(
+            buyer_model.parameters(),
+            lr=LR,
+            betas=(0.9, 0.95),
+            weight_decay=0.0,
+            foreach=ADAMW_FOREACH,
+        )
+        cpu_adamw_state = None
+    else:
+        raise ValueError(f"Unsupported OPTIMIZER={OPTIMIZER}; use adamw_cpu or adamw_cuda")
     n_params = sum(p.numel() for p in buyer_model.parameters() if p.requires_grad)
     print(f"  Trainable params: {n_params:,}")
 
@@ -1182,7 +1289,7 @@ def main():
 
         buyer_model.train()
         print("  SDPO+GRPO update on buyer turns only...")
-        update_stats = sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, dev)
+        update_stats = sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, dev, cpu_adamw_state)
         loss = update_stats["loss"]
         torch.cuda.empty_cache()
         gc.collect()
