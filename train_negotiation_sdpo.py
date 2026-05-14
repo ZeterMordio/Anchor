@@ -77,6 +77,8 @@ SELLER_TEMP = float(os.environ.get("SELLER_TEMP", "0.7"))  # paper Table 5
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/model")
 HUB_MODEL_ID = os.environ.get("HUB_MODEL_ID", "")
 GRADIENT_CHECKPOINTING = os.environ.get("GRADIENT_CHECKPOINTING", "1") == "1"
+MODEL_DEVICE_MAP = os.environ.get("MODEL_DEVICE_MAP", "auto")
+MAX_MEMORY_PER_GPU_GIB = os.environ.get("MAX_MEMORY_PER_GPU_GIB", "").strip()
 GEN_BATCH_LIMIT = int(os.environ.get("GEN_BATCH_LIMIT", "128"))
 NUM_INNER_EPOCHS = int(os.environ.get("NUM_INNER_EPOCHS", "1"))
 NORMALIZE_ADVANTAGES = os.environ.get("NORMALIZE_ADVANTAGES", "1") == "1"
@@ -93,9 +95,47 @@ SDPO_FEEDBACK_MODE = os.environ.get("SDPO_FEEDBACK_MODE", "strict").lower()
 SDPO_ADV_CLIP = float(os.environ.get("SDPO_ADV_CLIP", "5.0"))
 SDPO_MAX_DEMO_CHARS = int(os.environ.get("SDPO_MAX_DEMO_CHARS", "1400"))
 SDPO_MAX_FEEDBACK_CHARS = int(os.environ.get("SDPO_MAX_FEEDBACK_CHARS", "1800"))
+# On 8B full fine-tuning, foreach AdamW briefly materializes extra tensor lists
+# at optimizer.step(); disabling foreach preserves the objective and lowers peak VRAM.
+ADAMW_FOREACH = os.environ.get("ADAMW_FOREACH", "0") == "1"
 
 random.seed(SEED)
 torch.manual_seed(SEED)
+
+
+def _model_load_kwargs():
+    """Shared model loading kwargs, with optional multi-GPU memory caps."""
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "device_map": MODEL_DEVICE_MAP,
+        "trust_remote_code": True,
+    }
+    if MAX_MEMORY_PER_GPU_GIB:
+        if not torch.cuda.is_available():
+            return kwargs
+        n_gpu = torch.cuda.device_count()
+        kwargs["max_memory"] = {i: f"{MAX_MEMORY_PER_GPU_GIB}GiB" for i in range(n_gpu)}
+    return kwargs
+
+
+def _first_model_device(model):
+    return next(model.parameters()).device
+
+
+def _model_input_device(model):
+    """Device where tokenized inputs should be placed.
+
+    Accelerate-dispatched models can span multiple GPUs. For those, inputs must
+    start on the first layer's device, not necessarily on the lm_head device.
+    """
+    hf_map = getattr(model, "hf_device_map", None)
+    if isinstance(hf_map, dict):
+        for key in ("model.embed_tokens", "transformer.wte", "model"):  # Qwen, GPT-like, fallback
+            if key in hf_map:
+                return torch.device(hf_map[key])
+        first = next(iter(hf_map.values()))
+        return torch.device(first)
+    return _first_model_device(model)
 
 
 # ─── Dataset: AmazonHistoryPrice ─────────────────────────────────────────────
@@ -1015,10 +1055,11 @@ def main():
     print(f"[CONFIG] Turns={MAX_TURNS} LR={LR} Eps={EPSILON} KL={KL_COEF}")
     print(f"[CONFIG] BuyerTemp={BUYER_TEMP} SellerTemp={SELLER_TEMP} MaxNew={MAX_NEW_TOKENS}")
     print(f"[CONFIG] GradCheckpoint={GRADIENT_CHECKPOINTING} GenBatchLimit={GEN_BATCH_LIMIT}")
+    print(f"[CONFIG] DeviceMap={MODEL_DEVICE_MAP} MaxMemoryPerGPUGiB={MAX_MEMORY_PER_GPU_GIB or '(unset)'}")
     print(f"[CONFIG] InnerEpochs={NUM_INNER_EPOCHS} NormAdvantages={NORMALIZE_ADVANTAGES}")
     print(
         f"[CONFIG] SDPO_Lambda={SDPO_LAMBDA} FeedbackMode={SDPO_FEEDBACK_MODE} "
-        f"AdvClip={SDPO_ADV_CLIP} MaxFeedbackChars={SDPO_MAX_FEEDBACK_CHARS}"
+        f"AdvClip={SDPO_ADV_CLIP} MaxFeedbackChars={SDPO_MAX_FEEDBACK_CHARS} AdamWForeach={ADAMW_FOREACH}"
     )
     print(f"[CONFIG] CheckpointEvery={CHECKPOINT_EVERY} Hub={HUB_MODEL_ID or '(disabled)'}")
     print("=" * 70, flush=True)
@@ -1052,6 +1093,9 @@ def main():
                 "sdpo_adv_clip": SDPO_ADV_CLIP,
                 "sdpo_max_demo_chars": SDPO_MAX_DEMO_CHARS,
                 "sdpo_max_feedback_chars": SDPO_MAX_FEEDBACK_CHARS,
+                "adamw_foreach": ADAMW_FOREACH,
+                "model_device_map": MODEL_DEVICE_MAP,
+                "max_memory_per_gpu_gib": MAX_MEMORY_PER_GPU_GIB,
                 "liger_kernel": USE_LIGER,
                 "dataset_categories": CATEGORIES,
             },
@@ -1075,32 +1119,26 @@ def main():
     print("\n[3/5] Loading trainable buyer model...")
     buyer_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
+        **_model_load_kwargs(),
     )
     if GRADIENT_CHECKPOINTING:
         buyer_model.gradient_checkpointing_enable()
         if hasattr(buyer_model, "config"):
             buyer_model.config.use_cache = False
-    dev = next(buyer_model.parameters()).device
-    print(f"  [OK] Device={dev} VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
+    dev = _model_input_device(buyer_model)
+    print(f"  [OK] InputDevice={dev} FirstParamDevice={_first_model_device(buyer_model)} VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
 
     print("\n[4/5] Loading frozen seller/reference model...")
     seller_model = AutoModelForCausalLM.from_pretrained(
         SELLER_MODEL_NAME,
-        dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
+        **_model_load_kwargs(),
     )
     seller_model.eval()
     for p in seller_model.parameters():
         p.requires_grad = False
     ref_model = seller_model if SELLER_MODEL_NAME == MODEL_NAME else AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
+        **_model_load_kwargs(),
     )
     if ref_model is not seller_model:
         ref_model.eval()
@@ -1108,8 +1146,14 @@ def main():
             p.requires_grad = False
     print(f"  [OK] VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
 
-    print(f"\n[5/5] Optimizer (AdamW, lr={LR}, betas=(0.9,0.95), wd=0.0)...")
-    optimizer = torch.optim.AdamW(buyer_model.parameters(), lr=LR, betas=(0.9, 0.95), weight_decay=0.0)
+    print(f"\n[5/5] Optimizer (AdamW, lr={LR}, betas=(0.9,0.95), wd=0.0, foreach={ADAMW_FOREACH})...")
+    optimizer = torch.optim.AdamW(
+        buyer_model.parameters(),
+        lr=LR,
+        betas=(0.9, 0.95),
+        weight_decay=0.0,
+        foreach=ADAMW_FOREACH,
+    )
     n_params = sum(p.numel() for p in buyer_model.parameters() if p.requires_grad)
     print(f"  Trainable params: {n_params:,}")
 
