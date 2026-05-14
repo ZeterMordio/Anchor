@@ -1003,20 +1003,20 @@ def main():
                     trackio.alert(
                         "pure_negotiation_started",
                         f"iter=0 reward={iter_metrics['mean_reward']:.4f} deal_rate={iter_metrics['deal_rate']:.3f}; continue 42-iter run if format errors stay low",
-                        level="INFO",
+                        level=trackio.AlertLevel.INFO,
                     )
                 if iter_metrics["mean_reward"] < -0.5:
                     trackio.alert(
                         "low_reward_warning",
                         f"reward={iter_metrics['mean_reward']:.4f} at iter={iteration}; if persistent, reduce LR or increase KL anchor",
-                        level="WARN",
+                        level=trackio.AlertLevel.WARN,
                     )
                 fmt_errors = iter_metrics["outcomes"].get("BUYER_FORMAT_ERROR", 0)
                 if fmt_errors > 0.25 * n_episodes:
                     trackio.alert(
                         "format_collapse_warning",
                         f"buyer_format_errors={fmt_errors}/{n_episodes} at iter={iteration}; try LR x0.1 or KL x2",
-                        level="WARN",
+                        level=trackio.AlertLevel.WARN,
                     )
             except Exception as e:
                 print(f"  [TRACKIO] Log/alert failed (non-fatal): {e}")
@@ -1054,7 +1054,7 @@ def main():
 
     if TRACKIO_OK:
         try:
-            trackio.alert("pure_negotiation_complete", f"iters={NUM_ITERS}; final_reward={metrics[-1]['mean_reward']:.4f}; final_deal_rate={metrics[-1]['deal_rate']:.3f}", level="INFO")
+            trackio.alert("pure_negotiation_complete", f"iters={NUM_ITERS}; final_reward={metrics[-1]['mean_reward']:.4f}; final_deal_rate={metrics[-1]['deal_rate']:.3f}", level=trackio.AlertLevel.INFO)
             trackio.finish()
             print(f"[TRACKIO] Finished. Dashboard: https://huggingface.co/spaces/{TRACKIO_SPACE}")
         except Exception as e:

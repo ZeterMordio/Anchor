@@ -1107,3 +1107,42 @@ Explicitly removed SPIRAL components:
 Do not use dependency spec `torch>=2.6.0,<2.7` with `hf_jobs`; the `<` can be interpreted as shell redirection. Use exact `torch==2.6.0` or the quoted `hf jobs uv run --with 'torch>=2.6.0,<2.7'` CLI form.
 
 
+---
+
+## 2026-05-14: SDPO+GRPO Buyer-Only Training File
+
+### Request
+
+Add a separate self-distillation training script rather than mutating the pure GRPO baseline, and default the serious experiment to a larger Qwen3-8B model because SDPO relies on the model's retrospective in-context learning ability.
+
+### File Added
+
+- `train_negotiation_sdpo.py`
+
+The script forks the pure buyer-only environment from `train_negotiation_pure.py` and preserves the HF Jobs-compatible shape: single-file entrypoint, env-var config, Trackio logging, periodic Hub checkpoints, and the same frozen regulated seller setup.
+
+### Design Decisions
+
+- `MODEL_NAME=Qwen/Qwen3-8B`: chosen over 4B because the SDPO paper's scaling study shows self-teacher retrospection improves with model scale. Use 4B only for cheap smoke tests.
+- `SDPO_LAMBDA=0.9`: conservative hybrid. The 8B self-teacher should help, but the GRPO scalar reward remains the stable anchor for the first expensive run.
+- `SDPO_FEEDBACK_MODE=strict`: default teacher feedback does not include exact seller cost/private floor. Oracle feedback is supported only as an explicit ablation.
+- `SDPO_ADV_CLIP=5.0`: clips teacher-student token logprob gaps before mixing into the PPO-style surrogate, preventing a bad feedback prompt from dominating the update.
+- Token-level SDPO first, not top-K logit SDPO: cheaper, easier to audit, and enough to prove signal before adding full logit-level memory complexity.
+- Same-product on-policy rollout demos: failed or weak rollouts can learn from better sibling rollouts inside the same GRPO group, matching SDPO's no-external-teacher premise.
+- `CHECKPOINT_EVERY=10`: keeps the existing phase-analysis cadence without adding much upload overhead.
+- `TRACKIO_PROJECT=anchor-negotiation-sdpo`, Hub target in README: `ZeterMordio/anchor-negotiation-sdpo`.
+
+### Expected First Run
+
+Use A100-large, 12h timeout, exact `torch==2.6.0`, `NUM_ITERS=42`, `BATCH_SIZE=16`, `GROUP_SIZE=8`, and `GEN_BATCH_LIMIT=128`. Run a tiny smoke job first with `NUM_ITERS=1`, `BATCH_SIZE=1`, `GROUP_SIZE=2`, `MODEL_NAME=Qwen/Qwen3-4B-Instruct-2507`, `SELLER_MODEL_NAME=Qwen/Qwen3-4B-Instruct-2507`, `CHECKPOINT_EVERY=0`, and a smoke Hub repo before the 8B run.
+
+### 2026-05-14 Resume Note
+
+The pure 42-iter run `6a0538b5e48bea4538b9c3cf` completed successfully and pushed `ZeterMordio/anchor-negotiation-pure`. Logs exposed a Trackio API issue: `trackio.alert()` now expects `trackio.AlertLevel.*`, not string levels (`"INFO"` / `"WARN"`). Updated both `train_negotiation_pure.py` and `train_negotiation_sdpo.py` to use enum levels before launching the SDPO smoke test.
+
+### SDPO Smoke Tests
+
+1. `6a05a1b73308d79117b8f55e` used tiny truncating settings (`MAX_TURNS=2`, `MAX_NEW_TOKENS=120`) to validate loading/update/push quickly. It completed and pushed `ZeterMordio/anchor-negotiation-sdpo-smoke`, but both buyer outputs were format errors; this was attributed to the artificial token/turn truncation, not to the SDPO update path.
+2. `6a05a28a3308d79117b8f560` reran with full format settings (`MAX_TURNS=6`, `MAX_NEW_TOKENS=300`) while keeping tiny batch/group (`BATCH_SIZE=1`, `GROUP_SIZE=2`). It completed successfully and pushed `ZeterMordio/anchor-negotiation-sdpo-smoke-fullfmt`.
+
+Full-format smoke metrics: loss `0.3836`, buyer reward `+0.4573`, deal rate `50.0%`, mean turns `4.0`, first-offer ratio `0.7344`, overshoot `0.0%`, outcomes `{DEAL_SELLER_ACCEPTS: 1, SELLER_QUIT: 1}`, SDPO tokens `523`, mean |SDPO advantage| `0.8184`, demos `2`, peak VRAM `48.5GB`. Trackio alerts printed cleanly with enum levels. The SDPO script is ready for the 8B run, subject to launching with a long enough timeout (`12h`) and A100-large or larger.
