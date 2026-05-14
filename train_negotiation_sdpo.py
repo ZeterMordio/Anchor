@@ -1,40 +1,24 @@
 """
-Pure Negotiation-RLVR training for bilateral price negotiation.
+Negotiation SDPO+GRPO training for bilateral price negotiation.
 
-This script implements the buyer-only setup from paper 2604.09855
-("Instructing LLMs to Negotiate using Reinforcement Learning with
-Verifiable Rewards") while preserving non-conflicting engineering fixes from
-our SPIRAL/RLVR hybrid script.
+This script is a separate experimental sibling of train_negotiation_pure.py.
+It keeps the negotiation paper's buyer-only RLVR setup but augments the buyer
+update with Self-Distillation Policy Optimization (SDPO):
 
-Pure paper structure:
 - Trainable buyer policy.
-- Frozen seller / reference model as the environment counterparty.
-- Buyer always starts; only buyer turns receive policy-gradient updates.
-- Seller is regulated: it cannot accept/propose below private cost.
-- Verifiable buyer reward: R = (budget - final_price) / |budget - cost|,
-  clipped to [-1, 1]; no-deal/quit/timeout = 0; buyer format/budget errors = -1.
+- Frozen regulated seller / reference model as the environment counterparty.
+- Buyer always starts; only buyer turns receive updates.
+- Verifiable reward remains the paper's economic-surplus scalar.
+- SDPO adds feedback-conditioned self-teacher log-probs for dense token credit.
 
-Kept from the newer SPIRAL script where non-conflicting:
-- Batched turn-parallel generation for rollout speed.
-- Thought stripping before cross-role context injection (paper §3.1 hidden scratchpad).
-- Runtime private-information leak guards.
-- Memory-efficient token log-prob computation (gather + logsumexp; no full softmax tensor).
-- Clamped log-ratio before exp to prevent PPO/GRPO loss explosions.
-- Group-level advantage normalization for continuous negotiation rewards.
-- Small KL/reference anchor by default for dense 4B format stability (env-overridable).
-- Liger kernel optional integration.
-- Trackio metrics + alerts.
-- Periodic HF Hub branch checkpoints.
-
-Explicitly removed from SPIRAL:
-- Shared policy self-play.
-- Seller training.
-- Seller reward = -buyer reward.
-- Role-conditioned advantage estimation (RAE).
-- Dual-role ratio / per-role baselines.
-
-Default initial run is configured but NOT launched here:
-- NUM_ITERS=42, BATCH_SIZE=16, GROUP_SIZE=8, a100-large recommended.
+Default run policy:
+- Use Qwen/Qwen3-8B, not 4B. SDPO depends on retrospective in-context learning,
+  and the self-distillation paper shows this improves with model scale.
+- Keep a conservative hybrid: A_total = 0.9 * A_GRPO + 0.1 * A_SDPO.
+- Use strict feedback by default: no exact seller cost or private floor is placed
+  into the teacher prompt. Oracle feedback is an explicit ablation only.
+- Keep the HF Jobs shape analogous to train_negotiation_pure.py: one standalone
+  file, env-var config, Trackio logging, and periodic Hub checkpoints.
 """
 
 import gc
@@ -76,10 +60,9 @@ if USE_LIGER:
 
 
 # ─── Config ──────────────────────────────────────────────────────────────────
-# Model choice: paper exact model is Qwen/Qwen3-30B-A3B-Instruct-2507. For the
-# comparable small-scale run requested here we use the verified dense 4B model
-# used in the SPIRAL test run; override MODEL_NAME for the paper MoE model.
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-4B-Instruct-2507")
+# SDPO is scale-sensitive. The default serious run uses Qwen3-8B; override for
+# smoke tests or the paper's exact 30B-A3B model.
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-8B")
 SELLER_MODEL_NAME = os.environ.get("SELLER_MODEL_NAME", MODEL_NAME)
 NUM_ITERS = int(os.environ.get("NUM_ITERS", "42"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
@@ -102,9 +85,14 @@ SEED = int(os.environ.get("SEED", "42"))
 TRAIN_SPLIT_SIZE = int(os.environ.get("TRAIN_SPLIT_SIZE", "802"))
 TEST_SPLIT_SIZE = int(os.environ.get("TEST_SPLIT_SIZE", "128"))
 TRACKIO_SPACE = os.environ.get("TRACKIO_SPACE", "ZeterMordio/anchor-dashboard")
-TRACKIO_PROJECT = os.environ.get("TRACKIO_PROJECT", "anchor-negotiation-pure")
+TRACKIO_PROJECT = os.environ.get("TRACKIO_PROJECT", "anchor-negotiation-sdpo")
 RUN_NAME = os.environ.get("RUN_NAME", "")
 PUSH_TRAINING_SCRIPT = os.environ.get("PUSH_TRAINING_SCRIPT", "1") == "1"
+SDPO_LAMBDA = float(os.environ.get("SDPO_LAMBDA", "0.9"))  # 1.0 = pure GRPO, 0.0 = pure SDPO
+SDPO_FEEDBACK_MODE = os.environ.get("SDPO_FEEDBACK_MODE", "strict").lower()
+SDPO_ADV_CLIP = float(os.environ.get("SDPO_ADV_CLIP", "5.0"))
+SDPO_MAX_DEMO_CHARS = int(os.environ.get("SDPO_MAX_DEMO_CHARS", "1400"))
+SDPO_MAX_FEEDBACK_CHARS = int(os.environ.get("SDPO_MAX_FEEDBACK_CHARS", "1800"))
 
 random.seed(SEED)
 torch.manual_seed(SEED)
@@ -635,7 +623,7 @@ def run_episodes_batched(buyer_model, seller_model, tokenizer, products_expanded
     return episodes
 
 
-# ─── Log-probs and pure buyer GRPO update ────────────────────────────────────
+# ─── Log-probs and SDPO+GRPO buyer update ────────────────────────────────────
 def _token_logprobs(model, input_ids, attention_mask):
     """Per-token log-probs using gather + logsumexp, avoiding full softmax tensor."""
     out = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -666,18 +654,177 @@ def build_buyer_turn_prompt(ep, turn_idx):
     return prompt_msgs
 
 
-def pure_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, device):
-    """GRPO update on buyer turns only, grouped by product rollouts."""
+def _public_transcript(ep, max_chars=SDPO_MAX_DEMO_CHARS):
+    """Public Talk/Action-only transcript for feedback demos."""
+    lines = []
+    for role, text in ep.turns:
+        speaker = "Buyer" if role == "buyer" else "Seller"
+        lines.append(f"{speaker}: {strip_thought(text)}")
+    transcript = "\n".join(lines).strip()
+    if len(transcript) <= max_chars:
+        return transcript
+    return transcript[:max_chars].rstrip() + "\n[truncated]"
+
+
+def _quality_label(reward):
+    if reward >= 0.75:
+        return "strong surplus"
+    if reward >= 0.35:
+        return "moderate surplus"
+    if reward > 0:
+        return "weak surplus"
+    if reward == 0:
+        return "no positive surplus"
+    return "negative outcome"
+
+
+def _best_demo_for(ep, group_eps):
+    """Pick an on-policy same-product demo without using any external teacher."""
+    better = [
+        other
+        for other in group_eps
+        if other.final_price is not None and other.reward > max(ep.reward + 1e-6, 0.0)
+    ]
+    if better:
+        return max(better, key=lambda other: other.reward), "sibling"
+    if ep.final_price is not None and ep.reward > 0:
+        return ep, "self"
+    return None, ""
+
+
+def _format_outcome_feedback(ep):
+    product = ep.product
+    budget = product["budget"]
+    lines = [
+        "Verifier feedback for the previous negotiation rollout:",
+        f"- Outcome: {ep.outcome}.",
+    ]
+
+    if "FORMAT_ERROR" in ep.outcome:
+        lines.append("- Diagnosis: the buyer output was not parseable as Thought/Talk/Action with a valid Action tag.")
+        lines.append("- Fix: keep the exact format and end with one explicit Action line.")
+    elif ep.outcome in {"BUYER_BUDGET_VIOLATION", "BUYER_DEAL_PRICE_MISMATCH", "BUYER_DEAL_INVALID_SELLER_OFFER"}:
+        lines.append("- Diagnosis: the buyer violated a hard protocol or budget constraint.")
+        lines.append("- Fix: never offer above the private budget; only DEAL an exact prior seller SELL offer.")
+    elif ep.final_price is None:
+        lines.append("- Diagnosis: no deal was reached, so the buyer captured no surplus.")
+        lines.append("- Fix: use an opening anchor and concessions that keep the seller engaged without revealing the budget.")
+    else:
+        price_ratio = ep.final_price / max(budget, 1e-6)
+        lines.append(f"- Final price: ${ep.final_price:.2f} against buyer budget ${budget:.2f}.")
+        lines.append(f"- Verifier label: {_quality_label(ep.reward)}.")
+        if price_ratio > 0.85:
+            lines.append("- Fix: the deal was too close to the budget; anchor lower and concede more slowly.")
+        elif price_ratio > 0.60:
+            lines.append("- Fix: valid deal, but there may be room for stronger anchoring or persuasion.")
+        else:
+            lines.append("- Keep: the price was meaningfully below budget; preserve the pressure-and-concession pattern.")
+
+    if SDPO_FEEDBACK_MODE == "oracle":
+        lines.extend(
+            [
+                "",
+                "Oracle-only ablation details:",
+                f"- Seller private cost: ${product['cost']:.2f}.",
+                f"- Mutual-interest instance: {product['mi']}.",
+                f"- Numeric reward: {ep.reward:.4f}.",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def build_sdpo_feedback(ep, group_eps):
+    """Build concise feedback for the self-teacher prompt.
+
+    Strict mode intentionally avoids exact seller cost/private floor text. It may
+    use qualitative verifier labels and on-policy public sibling demos.
+    """
+    if SDPO_FEEDBACK_MODE not in {"strict", "oracle"}:
+        raise ValueError(f"Unsupported SDPO_FEEDBACK_MODE={SDPO_FEEDBACK_MODE!r}")
+
+    feedback_parts = [_format_outcome_feedback(ep)]
+    demo, demo_kind = _best_demo_for(ep, group_eps)
+    has_demo = demo is not None
+    if demo is not None:
+        if demo_kind == "sibling":
+            feedback_parts.append(
+                "\nA better rollout sampled by the current policy for this same product is shown below. "
+                "It is a public Talk/Action transcript, not an external teacher answer."
+            )
+        else:
+            feedback_parts.append(
+                "\nThis rollout itself reached a positive deal. Use the public transcript below to reinforce "
+                "the useful parts without overfitting to wording."
+            )
+        feedback_parts.append(_public_transcript(demo))
+
+    feedback_parts.append(
+        "\nCorrectly continue the original buyer turn. Prefer valid format, budget discipline, "
+        "low but plausible anchoring, and concise persuasion."
+    )
+    feedback = "\n".join(feedback_parts).strip()
+    if len(feedback) > SDPO_MAX_FEEDBACK_CHARS:
+        feedback = feedback[:SDPO_MAX_FEEDBACK_CHARS].rstrip() + "\n[feedback truncated]"
+
+    if SDPO_FEEDBACK_MODE == "strict" and "cost_price" in feedback:
+        raise AssertionError("Strict SDPO feedback leaked cost_price field.")
+    return feedback, has_demo
+
+
+def build_sdpo_teacher_turn_prompt(ep, turn_idx, feedback):
+    """Prompt the same buyer model as a hindsight self-teacher."""
+    prompt_msgs = build_buyer_turn_prompt(ep, turn_idx)
+    prompt_msgs.append(
+        {
+            "role": "user",
+            "content": (
+                "Hindsight training feedback is available for your previous negotiation attempt. "
+                "Use it only to judge what the next buyer message should make more or less likely.\n\n"
+                f"{feedback}"
+            ),
+        }
+    )
+    return prompt_msgs
+
+
+def _completion_logprobs(logprobs, mask):
+    keep = mask.bool()
+    if logprobs.shape != mask.shape:
+        raise ValueError(f"logprobs/mask shape mismatch: {tuple(logprobs.shape)} vs {tuple(mask.shape)}")
+    return logprobs[keep]
+
+
+def _scatter_completion_values(template, mask, values):
+    out = torch.zeros_like(template)
+    keep = mask.bool()
+    idx = keep.nonzero(as_tuple=False)
+    n = min(idx.shape[0], values.numel())
+    if n:
+        out[idx[:n, 0], idx[:n, 1]] = values[:n]
+    return out, n
+
+
+def sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, device):
+    """Buyer-only GRPO update augmented with strict feedback-conditioned SDPO."""
     buyer_model.train()
     G = GROUP_SIZE
     num_groups = len(episodes) // G
     total_loss = 0.0
     turn_count = 0
+    sdpo_tokens = 0
+    sdpo_abs_adv = 0.0
+    sdpo_demo_count = 0
 
     for g in range(num_groups):
         group_eps = episodes[g * G : (g + 1) * G]
         rewards = torch.tensor([ep.reward for ep in group_eps], dtype=torch.float32, device=device)
         advantages = _norm_advantages(rewards - rewards.mean())
+        feedbacks = []
+        for ep in group_eps:
+            feedback, has_demo = build_sdpo_feedback(ep, group_eps)
+            feedbacks.append(feedback)
+            sdpo_demo_count += int(has_demo)
 
         for _inner in range(NUM_INNER_EPOCHS):
             for i, ep in enumerate(group_eps):
@@ -707,7 +854,40 @@ def pure_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, dev
                     mask = attn[:, 1:].clone()
                     mask[:, : prompt_len - 1] = 0
 
-                    adv = advantages[i]
+                    teacher_prompt_msgs = build_sdpo_teacher_turn_prompt(ep, turn_idx, feedbacks[i])
+                    teacher_prompt_text = tokenizer.apply_chat_template(
+                        teacher_prompt_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+                    )
+                    _assert_no_private_info_leak(teacher_prompt_text, ep.product, "buyer")
+                    teacher_full_text = teacher_prompt_text + text
+                    teacher_prompt_ids = tokenizer(
+                        teacher_prompt_text, return_tensors="pt", truncation=True, max_length=2048
+                    )["input_ids"]
+                    teacher_prompt_len = teacher_prompt_ids.shape[1]
+                    teacher_enc = tokenizer(
+                        teacher_full_text, return_tensors="pt", truncation=True, max_length=2048
+                    ).to(device)
+                    teacher_mask = teacher_enc["attention_mask"][:, 1:].clone()
+                    teacher_mask[:, : teacher_prompt_len - 1] = 0
+                    with torch.no_grad():
+                        teacher_lp = _token_logprobs(
+                            buyer_model, teacher_enc["input_ids"], teacher_enc["attention_mask"]
+                        )
+                        student_completion_lp = _completion_logprobs(pol_lp.detach(), mask)
+                        teacher_completion_lp = _completion_logprobs(teacher_lp, teacher_mask)
+                        n_align = min(student_completion_lp.numel(), teacher_completion_lp.numel())
+                        if n_align:
+                            sdpo_values = (
+                                teacher_completion_lp[:n_align] - student_completion_lp[:n_align]
+                            ).clamp(-SDPO_ADV_CLIP, SDPO_ADV_CLIP)
+                            sdpo_abs_adv += float(sdpo_values.abs().sum().item())
+                            sdpo_tokens += int(n_align)
+                        else:
+                            sdpo_values = torch.empty(0, dtype=pol_lp.dtype, device=device)
+                    sdpo_adv, _ = _scatter_completion_values(pol_lp.detach(), mask, sdpo_values)
+
+                    grpo_adv = advantages[i]
+                    adv = SDPO_LAMBDA * grpo_adv + (1.0 - SDPO_LAMBDA) * sdpo_adv
                     log_ratio = (pol_lp - ref_lp).clamp(-5.0, 5.0)
                     ratio = torch.exp(log_ratio)
                     clipped = torch.clamp(ratio, 1 - EPSILON, 1 + EPSILON)
@@ -726,7 +906,12 @@ def pure_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, dev
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-    return total_loss / max(turn_count, 1)
+    return {
+        "loss": total_loss / max(turn_count, 1),
+        "sdpo_tokens": sdpo_tokens,
+        "sdpo_mean_abs_adv": sdpo_abs_adv / max(sdpo_tokens, 1),
+        "sdpo_demo_count": sdpo_demo_count,
+    }
 
 
 # ─── Metrics / checkpoint helpers ────────────────────────────────────────────
@@ -769,7 +954,7 @@ def save_and_push_checkpoint(buyer_model, tokenizer, metrics, iteration, final=F
         return
     branch = "main" if final else f"iter-{iteration + 1}"
     label = "FINAL" if final else f"iter {iteration + 1}"
-    path = Path(OUTPUT_DIR if final else f"/tmp/pure-ckpt-{iteration+1}")
+    path = Path(OUTPUT_DIR if final else f"/tmp/sdpo-ckpt-{iteration+1}")
     path.mkdir(parents=True, exist_ok=True)
     buyer_model.save_pretrained(path)
     tokenizer.save_pretrained(path)
@@ -777,7 +962,7 @@ def save_and_push_checkpoint(buyer_model, tokenizer, metrics, iteration, final=F
         json.dump(metrics, f, indent=2)
     if PUSH_TRAINING_SCRIPT:
         try:
-            shutil.copyfile(__file__, path / "train_negotiation_pure.py")
+            shutil.copyfile(__file__, path / "train_negotiation_sdpo.py")
         except Exception:
             pass
 
@@ -797,7 +982,7 @@ def save_and_push_checkpoint(buyer_model, tokenizer, metrics, iteration, final=F
             repo_id=HUB_MODEL_ID,
             repo_type="model",
             revision=branch,
-            commit_message=f"Pure negotiation {label}",
+            commit_message=f"SDPO negotiation {label}",
         )
         print(f"  [CHECKPOINT] ✅ Pushed {label} to {HUB_MODEL_ID}@{branch}")
     except Exception as e:
@@ -824,26 +1009,30 @@ def check_cuda():
 def main():
     check_cuda()
 
-    print(f"[CONFIG] Pure Negotiation-RLVR buyer-only training")
+    print("[CONFIG] Negotiation SDPO+GRPO buyer-only training")
     print(f"[CONFIG] BuyerModel={MODEL_NAME} SellerModel={SELLER_MODEL_NAME}")
     print(f"[CONFIG] Iters={NUM_ITERS} Batch={BATCH_SIZE} Group={GROUP_SIZE} Episodes/iter={BATCH_SIZE*GROUP_SIZE}")
     print(f"[CONFIG] Turns={MAX_TURNS} LR={LR} Eps={EPSILON} KL={KL_COEF}")
     print(f"[CONFIG] BuyerTemp={BUYER_TEMP} SellerTemp={SELLER_TEMP} MaxNew={MAX_NEW_TOKENS}")
     print(f"[CONFIG] GradCheckpoint={GRADIENT_CHECKPOINTING} GenBatchLimit={GEN_BATCH_LIMIT}")
     print(f"[CONFIG] InnerEpochs={NUM_INNER_EPOCHS} NormAdvantages={NORMALIZE_ADVANTAGES}")
+    print(
+        f"[CONFIG] SDPO_Lambda={SDPO_LAMBDA} FeedbackMode={SDPO_FEEDBACK_MODE} "
+        f"AdvClip={SDPO_ADV_CLIP} MaxFeedbackChars={SDPO_MAX_FEEDBACK_CHARS}"
+    )
     print(f"[CONFIG] CheckpointEvery={CHECKPOINT_EVERY} Hub={HUB_MODEL_ID or '(disabled)'}")
     print("=" * 70, flush=True)
 
     try:
         import trackio
 
-        run_name = RUN_NAME or f"pure-{MODEL_NAME.split('/')[-1]}-{NUM_ITERS}it"
+        run_name = RUN_NAME or f"sdpo-{MODEL_NAME.split('/')[-1]}-{NUM_ITERS}it"
         trackio.init(
             project=TRACKIO_PROJECT,
             name=run_name,
             space_id=TRACKIO_SPACE,
             config={
-                "method": "pure_negotiation_rlvr",
+                "method": "negotiation_sdpo_grpo",
                 "buyer_model": MODEL_NAME,
                 "seller_model": SELLER_MODEL_NAME,
                 "num_iters": NUM_ITERS,
@@ -858,6 +1047,11 @@ def main():
                 "seller_temp": SELLER_TEMP,
                 "normalize_advantages": NORMALIZE_ADVANTAGES,
                 "num_inner_epochs": NUM_INNER_EPOCHS,
+                "sdpo_lambda": SDPO_LAMBDA,
+                "sdpo_feedback_mode": SDPO_FEEDBACK_MODE,
+                "sdpo_adv_clip": SDPO_ADV_CLIP,
+                "sdpo_max_demo_chars": SDPO_MAX_DEMO_CHARS,
+                "sdpo_max_feedback_chars": SDPO_MAX_FEEDBACK_CHARS,
                 "liger_kernel": USE_LIGER,
                 "dataset_categories": CATEGORIES,
             },
@@ -878,7 +1072,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     print("  [OK]")
 
-    print(f"\n[3/5] Loading trainable buyer model...")
+    print("\n[3/5] Loading trainable buyer model...")
     buyer_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         dtype=torch.bfloat16,
@@ -892,7 +1086,7 @@ def main():
     dev = next(buyer_model.parameters()).device
     print(f"  [OK] Device={dev} VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
 
-    print(f"\n[4/5] Loading frozen seller/reference model...")
+    print("\n[4/5] Loading frozen seller/reference model...")
     seller_model = AutoModelForCausalLM.from_pretrained(
         SELLER_MODEL_NAME,
         dtype=torch.bfloat16,
@@ -919,7 +1113,7 @@ def main():
     n_params = sum(p.numel() for p in buyer_model.parameters() if p.requires_grad)
     print(f"  Trainable params: {n_params:,}")
 
-    print(f"\n{'=' * 70}\nPURE NEGOTIATION-RLVR TRAINING\n{'=' * 70}")
+    print(f"\n{'=' * 70}\nNEGOTIATION SDPO+GRPO TRAINING\n{'=' * 70}")
     metrics = []
     t0 = time.time()
 
@@ -943,8 +1137,9 @@ def main():
         gc.collect()
 
         buyer_model.train()
-        print(f"  Pure GRPO update on buyer turns only...")
-        loss = pure_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, dev)
+        print("  SDPO+GRPO update on buyer turns only...")
+        update_stats = sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, dev)
+        loss = update_stats["loss"]
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -960,6 +1155,11 @@ def main():
             f"Deal={iter_metrics['deal_rate']:.1%} Price=${iter_metrics['mean_price']:.2f} "
             f"Turns={iter_metrics['mean_turns']:.1f}"
         )
+        print(
+            f"  SDPO tokens={update_stats['sdpo_tokens']} "
+            f"mean|A|={update_stats['sdpo_mean_abs_adv']:.4f} "
+            f"demos={update_stats['sdpo_demo_count']}"
+        )
         print(f"  FirstOfferRatio={iter_metrics['first_offer_ratio']} Overshoot={iter_metrics['price_overshoot_rate']:.1%}")
         print(f"  Time={elapsed:.0f}s (rollout={rollout_time:.0f}s update={update_time:.0f}s)")
         print(f"  Outcomes: {dict(list(iter_metrics['outcomes'].items())[:6])}")
@@ -971,6 +1171,9 @@ def main():
             "iteration": iteration,
             "loss": loss,
             **iter_metrics,
+            "sdpo_tokens": update_stats["sdpo_tokens"],
+            "sdpo_mean_abs_adv": update_stats["sdpo_mean_abs_adv"],
+            "sdpo_demo_count": update_stats["sdpo_demo_count"],
             "time": elapsed,
             "rollout_time": rollout_time,
             "update_time": update_time,
@@ -990,6 +1193,9 @@ def main():
                         "negotiation/mean_turns": iter_metrics["mean_turns"],
                         "negotiation/first_offer_ratio": iter_metrics["first_offer_ratio"] or 0.0,
                         "negotiation/price_overshoot_rate": iter_metrics["price_overshoot_rate"],
+                        "sdpo/tokens": update_stats["sdpo_tokens"],
+                        "sdpo/mean_abs_adv": update_stats["sdpo_mean_abs_adv"],
+                        "sdpo/demo_count": update_stats["sdpo_demo_count"],
                         "perf/iter_time_s": elapsed,
                         "perf/rollout_time_s": rollout_time,
                         "perf/update_time_s": update_time,
@@ -1001,7 +1207,7 @@ def main():
                 )
                 if iteration == 0:
                     trackio.alert(
-                        "pure_negotiation_started",
+                        "sdpo_negotiation_started",
                         f"iter=0 reward={iter_metrics['mean_reward']:.4f} deal_rate={iter_metrics['deal_rate']:.3f}; continue 42-iter run if format errors stay low",
                         level=trackio.AlertLevel.INFO,
                     )
@@ -1039,7 +1245,7 @@ def main():
         json.dump(metrics, f, indent=2)
     if PUSH_TRAINING_SCRIPT:
         try:
-            shutil.copyfile(__file__, save_path / "train_negotiation_pure.py")
+            shutil.copyfile(__file__, save_path / "train_negotiation_sdpo.py")
         except Exception:
             pass
     print(f"  Saved to {save_path}")
@@ -1054,7 +1260,7 @@ def main():
 
     if TRACKIO_OK:
         try:
-            trackio.alert("pure_negotiation_complete", f"iters={NUM_ITERS}; final_reward={metrics[-1]['mean_reward']:.4f}; final_deal_rate={metrics[-1]['deal_rate']:.3f}", level=trackio.AlertLevel.INFO)
+            trackio.alert("sdpo_negotiation_complete", f"iters={NUM_ITERS}; final_reward={metrics[-1]['mean_reward']:.4f}; final_deal_rate={metrics[-1]['deal_rate']:.3f}", level=trackio.AlertLevel.INFO)
             trackio.finish()
             print(f"[TRACKIO] Finished. Dashboard: https://huggingface.co/spaces/{TRACKIO_SPACE}")
         except Exception as e:
