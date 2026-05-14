@@ -310,61 +310,106 @@ def build_seller_prompt(product):
 
 
 # ─── Action extraction + hidden scratchpad stripping ─────────────────────────
-ACTION_RE = re.compile(
-    r"\[(BUY|SELL|DEAL|REJECT|QUIT)\]" r"(?:\s*\$([\d,\.]+))?" r"(?:\s*\(([^)]*)\))?",
-    re.IGNORECASE,
-)
+ACTION_PATTERN = r"\[(BUY|SELL|DEAL|REJECT|QUIT)\](?:\s*\$([\d,\.]+))?(?:\s*\(([^)]*)\))?"
+ACTION_RE = re.compile(ACTION_PATTERN, re.IGNORECASE)
+ACTION_LINE_RE = re.compile(r"(?:^|\n)\s*Action\s*:\s*" + ACTION_PATTERN, re.IGNORECASE)
+QWEN_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
+QWEN_THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
+QWEN_THINK_CLOSE_RE = re.compile(r"</think\s*>", re.IGNORECASE)
+
+
+def strip_qwen_native_thinking(text):
+    """Remove Qwen3 native <think>...</think> content from visible text."""
+    text = text or ""
+    text = QWEN_THINK_BLOCK_RE.sub("", text)
+    closes = list(QWEN_THINK_CLOSE_RE.finditer(text))
+    if closes and not QWEN_THINK_OPEN_RE.search(text):
+        text = text[closes[-1].end() :]
+    m = QWEN_THINK_OPEN_RE.search(text)
+    if m:
+        tail = text[m.end() :]
+        public = re.search(r"(?:^|\n)\s*(?:Thought|Talk|Action)\s*:", tail, re.IGNORECASE)
+        text = text[: m.start()] + (tail[public.start() :] if public else "")
+    return text.strip()
+
+
+def _parse_action_match(m):
+    ps = m.group(2)
+    price = float(ps.replace(",", "")) if ps else None
+    return {"type": m.group(1).upper(), "price": price, "objects": m.group(3)}
 
 
 def extract_action(text):
-    matches = list(ACTION_RE.finditer(text or ""))
-    # Use the final action-like span. Models sometimes mention an action in Thought;
-    # the last span is the explicit Action line in well-formed outputs.
+    public_text = strip_qwen_native_thinking(text or "")
+    line_matches = list(ACTION_LINE_RE.finditer(public_text))
+    if line_matches:
+        return _parse_action_match(line_matches[-1])
+    public_text = strip_thought(public_text)
+    matches = list(ACTION_RE.finditer(public_text or ""))
     m = matches[-1] if matches else None
     if m:
-        ps = m.group(2)
-        price = float(ps.replace(",", "")) if ps else None
-        return {"type": m.group(1).upper(), "price": price, "objects": m.group(3)}
+        return _parse_action_match(m)
     return {"type": "UNKNOWN", "price": None, "objects": None}
 
 
 def replace_final_action(text, action_type, price, product):
-    """Replace the final structured action span after environment regulation."""
+    """Replace the final public structured action after environment regulation."""
     replacement = f"[{action_type}] ${price:.2f} (1x {product['codename']})"
-    text = text or ""
-    matches = list(ACTION_RE.finditer(text))
+    text = strip_qwen_native_thinking(text or "")
+    line_matches = list(ACTION_LINE_RE.finditer(text))
+    if line_matches:
+        m = line_matches[-1]
+        old_match = list(ACTION_RE.finditer(m.group(0)))[-1]
+        start = m.start() + old_match.start()
+        end = m.start() + old_match.end()
+        return text[:start] + replacement + text[end:]
+    visible = strip_thought(text)
+    matches = list(ACTION_RE.finditer(visible))
     if not matches:
         return text.rstrip() + f"\nAction: {replacement}"
-    m = matches[-1]
-    return text[: m.start()] + replacement + text[m.end() :]
+    old = matches[-1].group(0)
+    idx = text.rfind(old)
+    if idx < 0:
+        return text.rstrip() + f"\nAction: {replacement}"
+    return text[:idx] + replacement + text[idx + len(old) :]
 
 
 def strip_thought(text):
-    """Remove Thought block, keeping only Talk + Action for the counterparty.
+    """Remove hidden scratchpads, keeping only Talk + Action for the counterparty.
 
     Paper §3.1: reasoning is a hidden scratchpad and is trimmed before being
-    passed to the opponent. Own-role context keeps full prior text.
+    passed to the opponent. This also strips Qwen3 native <think> blocks so a
+    Qwen thinking-mode ablation does not leak private reasoning.
     """
-    text = text or ""
+    text = strip_qwen_native_thinking(text or "")
     m = re.search(r"(?:^|\n)\s*Talk\s*:", text, re.IGNORECASE)
     if m:
         result = text[m.start() :].strip()
         _assert_strip_thought_complete(result, text)
         return result
-    m = re.search(r"(?:^|\n)\s*Thought\s*:.*?(?=\n\s*Talk\s*:)", text, re.IGNORECASE | re.DOTALL)
+    m = re.search(r"(?:^|\n)\s*Action\s*:", text, re.IGNORECASE)
+    if m and re.search(r"(?:^|\n)\s*Thought\s*:", text[: m.start()], re.IGNORECASE):
+        result = text[m.start() :].strip()
+        _assert_strip_thought_complete(result, text)
+        return result
+    m = re.search(r"(?:^|\n)\s*Thought\s*:.*?(?=\n\s*(?:Talk|Action)\s*:)", text, re.IGNORECASE | re.DOTALL)
     if m:
         result = text[m.end() :].strip()
         _assert_strip_thought_complete(result, text)
         return result
+    if re.search(r"(?:^|\n)\s*Thought\s*:", text, re.IGNORECASE):
+        return ""
+    _assert_strip_thought_complete(text, text)
     return text
 
 
 def _assert_strip_thought_complete(stripped_text, original_text):
     has_structured_thought = bool(re.search(r"(?:^|\n)\s*Thought\s*:", original_text or ""))
     leaked_thought = bool(re.search(r"(?:^|\n)\s*Thought\s*:", stripped_text or ""))
-    if has_structured_thought and leaked_thought:
+    leaked_qwen_think = bool(QWEN_THINK_OPEN_RE.search(stripped_text or "") or QWEN_THINK_CLOSE_RE.search(stripped_text or ""))
+    if (has_structured_thought and leaked_thought) or leaked_qwen_think:
         raise AssertionError(
-            "strip_thought() INCOMPLETE: structured Thought block survived. "
+            "strip_thought() INCOMPLETE: hidden reasoning block survived. "
             f"Original={original_text[:200]!r}; Stripped={stripped_text[:200]!r}"
         )
 
@@ -472,7 +517,10 @@ def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device)
         for i in range(len(batch_prompts)):
             gen_tokens = output_ids[i][prompt_len:]
             gen_tokens = gen_tokens[gen_tokens != tokenizer.pad_token_id]
-            all_results.append(tokenizer.decode(gen_tokens, skip_special_tokens=True))
+            # Protocol is Thought/Talk/Action with Qwen native thinking disabled.
+            # If a backend/model still emits <think>, strip it before storing history;
+            # keep our explicit Thought: field intact.
+            all_results.append(strip_qwen_native_thinking(tokenizer.decode(gen_tokens, skip_special_tokens=True)))
     return all_results
 
 

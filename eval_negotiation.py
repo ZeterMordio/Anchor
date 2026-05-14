@@ -236,30 +236,62 @@ def build_seller_prompt(product):
 
 
 # ─── Action extraction (identical to training) ──────────────────────────────
-ACTION_RE = re.compile(
-    r'\[(BUY|SELL|DEAL|REJECT|QUIT)\]'
-    r'(?:\s*\$([\d,\.]+))?'
-    r'(?:\s*\(([^)]*)\))?',
-    re.IGNORECASE,
-)
+ACTION_PATTERN = r'\[(BUY|SELL|DEAL|REJECT|QUIT)\](?:\s*\$([\d,\.]+))?(?:\s*\(([^)]*)\))?'
+ACTION_RE = re.compile(ACTION_PATTERN, re.IGNORECASE)
+ACTION_LINE_RE = re.compile(r'(?:^|\n)\s*Action\s*:\s*' + ACTION_PATTERN, re.IGNORECASE)
+QWEN_THINK_BLOCK_RE = re.compile(r'<think\b[^>]*>.*?</think\s*>', re.IGNORECASE | re.DOTALL)
+QWEN_THINK_OPEN_RE = re.compile(r'<think\b[^>]*>', re.IGNORECASE)
+QWEN_THINK_CLOSE_RE = re.compile(r'</think\s*>', re.IGNORECASE)
+
+
+def strip_qwen_native_thinking(text):
+    """Remove Qwen3 native <think>...</think> content from visible text."""
+    text = text or ""
+    text = QWEN_THINK_BLOCK_RE.sub("", text)
+    closes = list(QWEN_THINK_CLOSE_RE.finditer(text))
+    if closes and not QWEN_THINK_OPEN_RE.search(text):
+        text = text[closes[-1].end():]
+    m = QWEN_THINK_OPEN_RE.search(text)
+    if m:
+        tail = text[m.end():]
+        public = re.search(r'(?:^|\n)\s*(?:Thought|Talk|Action)\s*:', tail, re.IGNORECASE)
+        text = text[:m.start()] + (tail[public.start():] if public else "")
+    return text.strip()
+
+
+def _parse_action_match(m):
+    ps = m.group(2)
+    price = float(ps.replace(",", "")) if ps else None
+    return {"type": m.group(1).upper(), "price": price, "objects": m.group(3)}
+
 
 def extract_action(text):
-    m = ACTION_RE.search(text)
+    public_text = strip_qwen_native_thinking(text or "")
+    line_matches = list(ACTION_LINE_RE.finditer(public_text))
+    if line_matches:
+        return _parse_action_match(line_matches[-1])
+    public_text = strip_thought(public_text)
+    matches = list(ACTION_RE.finditer(public_text or ""))
+    m = matches[-1] if matches else None
     if m:
-        ps = m.group(2)
-        price = float(ps.replace(",", "")) if ps else None
-        return {"type": m.group(1).upper(), "price": price, "objects": m.group(3)}
+        return _parse_action_match(m)
     return {"type": "UNKNOWN", "price": None, "objects": None}
 
 
 def strip_thought(text):
-    """Remove Thought block, keep only Talk + Action (for cross-role context)."""
+    """Remove hidden scratchpads, keep only Talk + Action (for cross-role context)."""
+    text = strip_qwen_native_thinking(text or "")
     m = re.search(r'(?:^|\n)\s*Talk\s*:', text, re.IGNORECASE)
     if m:
         return text[m.start():].strip()
-    m = re.search(r'(?:^|\n)\s*Thought\s*:.*?(?=\n\s*Talk\s*:)', text, re.IGNORECASE | re.DOTALL)
+    m = re.search(r'(?:^|\n)\s*Action\s*:', text, re.IGNORECASE)
+    if m and re.search(r'(?:^|\n)\s*Thought\s*:', text[:m.start()], re.IGNORECASE):
+        return text[m.start():].strip()
+    m = re.search(r'(?:^|\n)\s*Thought\s*:.*?(?=\n\s*(?:Talk|Action)\s*:)', text, re.IGNORECASE | re.DOTALL)
     if m:
         return text[m.end():].strip()
+    if re.search(r'(?:^|\n)\s*Thought\s*:', text, re.IGNORECASE):
+        return ""
     return text
 
 
@@ -323,7 +355,9 @@ def generate_single(model, tokenizer, messages, max_new, temp, device):
         eos_token_id=tokenizer.eos_token_id,
     )
     gen_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(gen_tokens, skip_special_tokens=True)
+    # Protocol is Thought/Talk/Action with Qwen native thinking disabled. If a
+    # backend/model still emits <think>, strip it before storing/evaluating.
+    return strip_qwen_native_thinking(tokenizer.decode(gen_tokens, skip_special_tokens=True))
 
 
 # ─── Episode data ────────────────────────────────────────────────────────────
