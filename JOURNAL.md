@@ -1,7 +1,7 @@
 # Anchor Negotiation — Engineering Journal
 
 > Authored by: Anton Künzi
-> Last updated: 2026-04-28 09:15 UTC
+> Last updated: 2026-05-15 20:15 UTC
 > Session with: ZeterMordio
 
 This document is the single source of truth for all design decisions,
@@ -1146,3 +1146,157 @@ The pure 42-iter run `6a0538b5e48bea4538b9c3cf` completed successfully and pushe
 2. `6a05a28a3308d79117b8f560` reran with full format settings (`MAX_TURNS=6`, `MAX_NEW_TOKENS=300`) while keeping tiny batch/group (`BATCH_SIZE=1`, `GROUP_SIZE=2`). It completed successfully and pushed `ZeterMordio/anchor-negotiation-sdpo-smoke-fullfmt`.
 
 Full-format smoke metrics: loss `0.3836`, buyer reward `+0.4573`, deal rate `50.0%`, mean turns `4.0`, first-offer ratio `0.7344`, overshoot `0.0%`, outcomes `{DEAL_SELLER_ACCEPTS: 1, SELLER_QUIT: 1}`, SDPO tokens `523`, mean |SDPO advantage| `0.8184`, demos `2`, peak VRAM `48.5GB`. Trackio alerts printed cleanly with enum levels. The SDPO script is ready for the 8B run, subject to launching with a long enough timeout (`12h`) and A100-large or larger.
+
+### SDPO / SDRO Implementation Details from `train_negotiation_sdpo.py` (2026-05-15)
+
+_Note: the repository currently has `train_negotiation_sdpo.py`; there is no separate `sdro` file. This section documents the SDPO/SDRO implementation we have been referring to in discussion._
+
+#### Objective and training topology
+
+The SDPO script is still a **buyer-only negotiation-RLVR setup**, not SPIRAL self-play:
+
+- The **buyer policy** is trainable full-parameter Qwen CausalLM.
+- The **seller/reference model** is frozen and regulated by the environment.
+- Buyer always starts; only buyer turns get gradient updates.
+- Seller generation remains at paper-style `SELLER_TEMP=0.7`; buyer exploration stays `BUYER_TEMP=1.0`.
+- Economic reward is unchanged from the pure script: `(budget - final_price) / abs(budget - cost)`, clipped to `[-1, 1]`; format/protocol/budget failures are `-1`; no-deal/quit/timeouts are `0`.
+
+Default serious-run config in the script:
+
+| Parameter | Default |
+|-----------|---------|
+| Buyer model | `Qwen/Qwen3-8B` |
+| Seller/reference | same as buyer unless `SELLER_MODEL_NAME` overrides |
+| Iters | `42` |
+| Batch × group | `16 × 8 = 128` episodes/iter |
+| Max turns | `6` |
+| Max new tokens/turn | `300` |
+| LR | `1e-6` |
+| PPO clip epsilon | `0.2` |
+| KL/reference coefficient | `0.01` |
+| SDPO mix | `SDPO_LAMBDA=0.9` → 90% GRPO scalar advantage, 10% SDPO token advantage |
+| Feedback mode | `strict` by default; `oracle` is explicit ablation only |
+| SDPO advantage clip | `±5.0` token logprob gap |
+| Checkpoints | branch every `CHECKPOINT_EVERY=10`, final to `main` |
+
+#### Hindsight feedback / self-teacher signal
+
+For each GRPO group (same product repeated `GROUP_SIZE` times), the script builds feedback per episode with no external teacher:
+
+1. `_format_outcome_feedback(ep)` creates verifier text from the rollout outcome:
+   - format error → “valid Thought/Talk/Action with one Action line” fix;
+   - budget/protocol error → “never offer above budget; only DEAL exact prior SELL” fix;
+   - no deal → “use opening anchor/concessions while keeping seller engaged” fix;
+   - deal → qualitative quality label based on final price vs buyer budget.
+2. `_best_demo_for(ep, group_eps)` optionally attaches a **same-product on-policy demo**:
+   - prefers a sibling rollout with `final_price is not None` and strictly better positive reward;
+   - otherwise uses the episode itself if it reached a positive deal;
+   - transcript is public-only via `_public_transcript()`, which strips hidden Thought before demo insertion.
+3. `build_sdpo_teacher_turn_prompt()` reconstructs the original buyer-turn prompt and appends one extra user message containing the hindsight feedback.
+4. The same buyer model is evaluated under this feedback-conditioned prompt in `torch.no_grad()`; no external model or oracle answer is sampled.
+
+Strict feedback mode intentionally avoids seller-private data. It can mention the buyer budget and outcome quality, but must not include `cost_price`. `oracle` mode adds seller private cost, MI flag, and numeric reward only for controlled ablations.
+
+#### Token-level SDPO advantage construction
+
+For each buyer turn in each episode:
+
+1. Reconstruct the original buyer prompt with `build_buyer_turn_prompt()`.
+2. Compute policy token logprobs on `prompt + actual_completion`.
+3. Compute frozen reference token logprobs on the same sequence.
+4. Build a completion mask by zeroing all prompt tokens.
+5. Build the feedback-conditioned teacher prompt and evaluate the **same completion** under that prompt.
+6. Align student completion logprobs and teacher completion logprobs by token count.
+7. Compute token SDPO values:
+
+```python
+sdpo_values = (teacher_completion_lp - student_completion_lp).clamp(-SDPO_ADV_CLIP, SDPO_ADV_CLIP)
+```
+
+These values are scattered back onto the original completion-token mask. The mixed advantage is:
+
+```python
+adv = SDPO_LAMBDA * grpo_adv + (1.0 - SDPO_LAMBDA) * sdpo_adv
+```
+
+where `grpo_adv` is the normalized group reward advantage and `sdpo_adv` is token-level. With the default `SDPO_LAMBDA=0.9`, SDPO acts as a dense shaping term rather than replacing the scalar economic reward.
+
+#### PPO-style update used after SDPO mixing
+
+The script keeps the stable pure-GRPO clipped surrogate around the mixed advantage:
+
+```python
+log_ratio = (pol_lp - ref_lp).clamp(-5.0, 5.0)
+ratio = torch.exp(log_ratio)
+clipped = torch.clamp(ratio, 1 - EPSILON, 1 + EPSILON)
+surr1 = ratio * adv
+surr2 = clipped * adv
+policy_loss = -torch.min(surr1, surr2)
+if KL_COEF > 0:
+    policy_loss = policy_loss + KL_COEF * log_ratio
+loss = (policy_loss * mask).sum() / (mask.sum() + 1e-8)
+```
+
+Important stability details:
+
+- log-ratio is clamped before exponentiation to avoid `inf` / loss explosions;
+- loss is averaged over buyer completion tokens only;
+- seller turns are never trained;
+- optimizer step happens after the full group/inner epoch, not after every episode;
+- gradient norm is clipped to `1.0`.
+
+#### Privacy protocol and action parsing
+
+The SDPO script now enforces a stricter public/private boundary than the early v10 runs:
+
+- `strip_qwen_native_thinking()` removes native Qwen `<think>...</think>` blocks, including malformed open/close cases.
+- `strip_thought()` removes our explicit `Thought:` scratchpad before a message is shown to the counterparty or inserted in public demos; only `Talk:` + `Action:` should cross roles.
+- `extract_action()` first strips native Qwen thinking, then prefers explicit public `Action:` lines. Fallback parsing runs only after structured Thought is stripped, so actions mentioned only in private reasoning are ignored.
+- `_assert_strip_thought_complete()` crashes if a Thought or native think marker survives stripping.
+- `_assert_no_private_info_leak()` keeps zero-false-positive guards:
+  - buyer prompt must not contain `cost_price`;
+  - seller prompt must not contain `Shopping List`;
+  - seller prompt must not contain exact `budget_limit: $X`.
+
+Design invariant: a role may keep its **own** Thought as assistant history, but the opponent only sees public Talk/Action.
+
+#### Regulated seller environment
+
+Seller regulation remains environment-side, not learned:
+
+- `DEAL` below cost is rejected as `SELLER_CANNOT_ACCEPT_BELOW_COST`.
+- `SELL` below cost is rewritten to `round(cost * 1.05, 2)` via `replace_final_action()`, so future buyer context and reward parsing see the regulated public price.
+- seller format errors, no-price sells, unexpected buyer/seller actions, invalid buyer DEALs, and budget violations all become explicit terminal outcomes for metrics and reward.
+
+#### Batched rollout path
+
+Rollouts are turn-parallel across active episodes:
+
+- all active buyer prompts are generated in batches, then all active seller prompts;
+- finished episodes are masked out of later turns;
+- tokenizer uses left padding only inside generation and restores the previous padding side afterward;
+- generation truncates prompts at `max_length=2048`, samples with `top_p=1.0`, `repetition_penalty=1.1`, and strips native Qwen think blocks before saving history;
+- `enable_thinking=False` is passed to `apply_chat_template()` for both buyer and seller prompts.
+
+This preserves the v8/v10 batched-generation speedup while adding SDPO bookkeeping only during the update phase.
+
+#### 8B memory fixes now in the script
+
+Two important implementation changes make the 8B full-finetune path more realistic on A100-class hardware:
+
+1. **Liger default is conditional.** `USE_LIGER` defaults to off when `MAX_MEMORY_PER_GPU_GIB` is set because Triton/Liger kernels failed when Accelerate placed tensors on CPU/offload (`Pointer argument ... cannot be accessed from Triton`). It still defaults on for normal fully GPU-resident loads.
+2. **CPU-state AdamW is the default.** `OPTIMIZER=adamw_cpu` keeps exact AdamW `exp_avg` / `exp_avg_sq` state on CPU and copies gradients parameter-by-parameter for the update. This preserves full-parameter training semantics while avoiding the ~2×-parameter CUDA optimizer-state spike that caused 8B A100 optimizer-step OOM. `OPTIMIZER=adamw_cuda` remains available for machines with enough VRAM. `ADAMW_FOREACH=0` is default to avoid extra foreach tensor-list allocations.
+
+The script also fails fast if `device_map` leaves any module on CPU/disk via `_assert_no_cpu_offload()`. Full-parameter training plus generation requires all trainable buyer modules on GPU; silent CPU offload is treated as a configuration error, not a fallback.
+
+#### Metrics and monitoring
+
+Per iteration, metrics include:
+
+- loss, mean buyer reward, deal rate, mean price, mean turns;
+- first-offer ratio and budget/price overshoot rate;
+- outcome histogram and role confusions;
+- SDPO token count, mean absolute SDPO advantage, demo count;
+- iteration/rollout/update times and current/peak VRAM.
+
+Trackio logs the same metrics under `TRACKIO_PROJECT=anchor-negotiation-sdpo` and now uses `trackio.AlertLevel.INFO/WARN` enum values. Alerts fire on start, low reward, and format-collapse warning conditions. Final checkpoints include `metrics.json` and a copy of `train_negotiation_sdpo.py` for exact reproducibility.
