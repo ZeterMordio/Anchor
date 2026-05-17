@@ -18,7 +18,7 @@ Default run policy:
 - Use strict feedback by default: no exact seller cost or private floor is placed
   into the teacher prompt. Oracle feedback is an explicit ablation only.
 - Keep the HF Jobs shape analogous to train_negotiation_pure.py: one standalone
-  file, env-var config, Trackio logging, and periodic Hub checkpoints.
+  file, env-var config, W&B logging, and periodic Hub checkpoints.
 """
 
 import gc
@@ -96,8 +96,11 @@ CHECKPOINT_EVERY = int(os.environ.get("CHECKPOINT_EVERY", "10"))
 SEED = int(os.environ.get("SEED", "42"))
 TRAIN_SPLIT_SIZE = int(os.environ.get("TRAIN_SPLIT_SIZE", "802"))
 TEST_SPLIT_SIZE = int(os.environ.get("TEST_SPLIT_SIZE", "128"))
-TRACKIO_SPACE = os.environ.get("TRACKIO_SPACE", "ZeterMordio/anchor-dashboard")
-TRACKIO_PROJECT = os.environ.get("TRACKIO_PROJECT", "anchor-negotiation-sdpo")
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "anchor-negotiation-sdpo")
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "chalk") or None
+WANDB_MODE = os.environ.get("WANDB_MODE", "online")
+WANDB_TAGS = [t.strip() for t in os.environ.get("WANDB_TAGS", "sdpo,negotiation,rlvr").split(",") if t.strip()]
+WANDB_JOB_TYPE = os.environ.get("WANDB_JOB_TYPE", "train")
 RUN_NAME = os.environ.get("RUN_NAME", "")
 PUSH_TRAINING_SCRIPT = os.environ.get("PUSH_TRAINING_SCRIPT", "1") == "1"
 SDPO_LAMBDA = float(os.environ.get("SDPO_LAMBDA", "0.9"))  # 1.0 = pure GRPO, 0.0 = pure SDPO
@@ -113,6 +116,52 @@ ADAMW_FOREACH = os.environ.get("ADAMW_FOREACH", "0") == "1"
 # on CPU to avoid the 8B A100 optimizer.step OOM seen in job 6a05acb... .
 # Set OPTIMIZER=adamw_cuda for a fully CUDA AdamW attempt; keep it only if VRAM is enough.
 OPTIMIZER = os.environ.get("OPTIMIZER", "adamw_cpu").lower()
+# Experimental SDPO/SDRO design metadata for run naming and W&B config. These do
+# not alter the current token-level SDPO objective unless corresponding code is
+# added/enabled in a future ablation.
+DISTILLATION_LEVEL = os.environ.get("DISTILLATION_LEVEL", "token")  # token | topk-logit
+TOP_K_DISTILLATION = int(os.environ.get("TOP_K_DISTILLATION", "0"))
+DISTILLATION_DIVERGENCE = os.environ.get("DISTILLATION_DIVERGENCE", "token-logprob-gap")
+TRUST_REGION_INTERPOLATION = os.environ.get("TRUST_REGION_INTERPOLATION", "0") == "1"
+TEACHER_EMA_DECAY = os.environ.get("TEACHER_EMA_DECAY", "")
+
+
+def _fmt_run_value(value):
+    text = f"{value:g}" if isinstance(value, float) else str(value)
+    return text.replace("e-0", "e-").replace("e+0", "e+").replace(".", "p")
+
+
+def _model_slug(model_name):
+    slug = model_name.split("/")[-1].lower()
+    slug = slug.replace("qwen3", "q3").replace("instruct", "i")
+    slug = slug.replace("-2507", "2507")
+    slug = re.sub(r"[^a-z0-9.]+", "-", slug).strip("-")
+    slug = slug.replace("-i-", "-i")
+    return slug
+
+
+def _distill_slug():
+    if DISTILLATION_LEVEL == "topk-logit":
+        div = DISTILLATION_DIVERGENCE.lower().replace("jensen-shannon", "js").replace("jshannon", "js")
+        div = re.sub(r"[^a-z0-9]+", "", div) or "kl"
+        interp = "tri" if TRUST_REGION_INTERPOLATION else "notri"
+        ema = f"ema{_fmt_run_value(TEACHER_EMA_DECAY)}" if TEACHER_EMA_DECAY else "noema"
+        return f"topk{TOP_K_DISTILLATION}-{div}-{interp}-{ema}"
+    return "tokgap"
+
+
+def default_run_name():
+    return (
+        f"sdpo__{_model_slug(MODEL_NAME)}__l{_fmt_run_value(SDPO_LAMBDA)}__{_distill_slug()}"
+        f"__i{NUM_ITERS}_b{BATCH_SIZE}xg{GROUP_SIZE}"
+        f"__fb{SDPO_FEEDBACK_MODE}_clip{_fmt_run_value(SDPO_ADV_CLIP)}"
+        f"__lr{_fmt_run_value(LR)}_kl{_fmt_run_value(KL_COEF)}__s{SEED}"
+    )
+
+
+def default_wandb_group():
+    return f"sdpo__{_model_slug(MODEL_NAME)}__{_distill_slug()}__fb{SDPO_FEEDBACK_MODE}"
+
 
 random.seed(SEED)
 torch.manual_seed(SEED)
@@ -1218,13 +1267,18 @@ def main():
     print("=" * 70, flush=True)
 
     try:
-        import trackio
+        import wandb
 
-        run_name = RUN_NAME or f"sdpo-{MODEL_NAME.split('/')[-1]}-{NUM_ITERS}it"
-        trackio.init(
-            project=TRACKIO_PROJECT,
+        run_name = RUN_NAME or default_run_name()
+        wandb_run = wandb.init(
+            entity=WANDB_ENTITY,
+            project=WANDB_PROJECT,
             name=run_name,
-            space_id=TRACKIO_SPACE,
+            group=os.environ.get("WANDB_GROUP", default_wandb_group()),
+            job_type=WANDB_JOB_TYPE,
+            mode=WANDB_MODE,
+            tags=WANDB_TAGS,
+            save_code=False,
             config={
                 "method": "negotiation_sdpo_grpo",
                 "buyer_model": MODEL_NAME,
@@ -1244,6 +1298,11 @@ def main():
                 "sdpo_lambda": SDPO_LAMBDA,
                 "sdpo_feedback_mode": SDPO_FEEDBACK_MODE,
                 "sdpo_adv_clip": SDPO_ADV_CLIP,
+                "distillation_level": DISTILLATION_LEVEL,
+                "top_k_distillation": TOP_K_DISTILLATION,
+                "distillation_divergence": DISTILLATION_DIVERGENCE,
+                "trust_region_interpolation": TRUST_REGION_INTERPOLATION,
+                "teacher_ema_decay": TEACHER_EMA_DECAY,
                 "sdpo_max_demo_chars": SDPO_MAX_DEMO_CHARS,
                 "sdpo_max_feedback_chars": SDPO_MAX_FEEDBACK_CHARS,
                 "optimizer": OPTIMIZER,
@@ -1254,12 +1313,13 @@ def main():
                 "dataset_categories": CATEGORIES,
             },
         )
-        TRACKIO_OK = True
-        print(f"[TRACKIO] Dashboard: https://huggingface.co/spaces/{TRACKIO_SPACE}")
+        WANDB_OK = True
+        print(f"[WANDB] Run: {wandb_run.url}")
     except Exception as e:
-        print(f"[TRACKIO] Init failed (non-fatal): {e}")
-        TRACKIO_OK = False
-        trackio = None
+        print(f"[WANDB] Init failed (non-fatal): {e}")
+        WANDB_OK = False
+        wandb = None
+        wandb_run = None
 
     print("\n[1/5] Loading dataset...")
     train_products, _ = load_products(seed=SEED)
@@ -1394,9 +1454,9 @@ def main():
         }
         metrics.append(row)
 
-        if TRACKIO_OK:
+        if WANDB_OK:
             try:
-                trackio.log(
+                wandb.log(
                     {
                         "train/loss": loss,
                         "reward/buyer": iter_metrics["mean_reward"],
@@ -1418,26 +1478,26 @@ def main():
                     step=iteration,
                 )
                 if iteration == 0:
-                    trackio.alert(
+                    wandb.alert(
                         "sdpo_negotiation_started",
                         f"iter=0 reward={iter_metrics['mean_reward']:.4f} deal_rate={iter_metrics['deal_rate']:.3f}; continue 42-iter run if format errors stay low",
-                        level=trackio.AlertLevel.INFO,
+                        level=wandb.AlertLevel.INFO,
                     )
                 if iter_metrics["mean_reward"] < -0.5:
-                    trackio.alert(
+                    wandb.alert(
                         "low_reward_warning",
                         f"reward={iter_metrics['mean_reward']:.4f} at iter={iteration}; if persistent, reduce LR or increase KL anchor",
-                        level=trackio.AlertLevel.WARN,
+                        level=wandb.AlertLevel.WARN,
                     )
                 fmt_errors = iter_metrics["outcomes"].get("BUYER_FORMAT_ERROR", 0)
                 if fmt_errors > 0.25 * n_episodes:
-                    trackio.alert(
+                    wandb.alert(
                         "format_collapse_warning",
                         f"buyer_format_errors={fmt_errors}/{n_episodes} at iter={iteration}; try LR x0.1 or KL x2",
-                        level=trackio.AlertLevel.WARN,
+                        level=wandb.AlertLevel.WARN,
                     )
             except Exception as e:
-                print(f"  [TRACKIO] Log/alert failed (non-fatal): {e}")
+                print(f"  [WANDB] Log/alert failed (non-fatal): {e}")
 
         should_ckpt = (
             CHECKPOINT_EVERY > 0
@@ -1470,13 +1530,13 @@ def main():
     print(f"COMPLETE  Total time: {total:.1f}s ({total/60:.1f} min)")
     print(f"{'=' * 70}")
 
-    if TRACKIO_OK:
+    if WANDB_OK:
         try:
-            trackio.alert("sdpo_negotiation_complete", f"iters={NUM_ITERS}; final_reward={metrics[-1]['mean_reward']:.4f}; final_deal_rate={metrics[-1]['deal_rate']:.3f}", level=trackio.AlertLevel.INFO)
-            trackio.finish()
-            print(f"[TRACKIO] Finished. Dashboard: https://huggingface.co/spaces/{TRACKIO_SPACE}")
+            wandb.alert("sdpo_negotiation_complete", f"iters={NUM_ITERS}; final_reward={metrics[-1]['mean_reward']:.4f}; final_deal_rate={metrics[-1]['deal_rate']:.3f}", level=wandb.AlertLevel.INFO)
+            wandb.finish()
+            print(f"[WANDB] Finished. Run: {wandb_run.url if wandb_run else '(unavailable)'}")
         except Exception as e:
-            print(f"[TRACKIO] Finish failed (non-fatal): {e}")
+            print(f"[WANDB] Finish failed (non-fatal): {e}")
 
 
 if __name__ == "__main__":

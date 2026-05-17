@@ -1300,3 +1300,66 @@ Per iteration, metrics include:
 - iteration/rollout/update times and current/peak VRAM.
 
 Trackio logs the same metrics under `TRACKIO_PROJECT=anchor-negotiation-sdpo` and now uses `trackio.AlertLevel.INFO/WARN` enum values. Alerts fire on start, low reward, and format-collapse warning conditions. Final checkpoints include `metrics.json` and a copy of `train_negotiation_sdpo.py` for exact reproducibility.
+
+---
+
+## 2026-05-16: Monitoring Migration from Trackio to W&B
+
+The training scripts were migrated from Trackio to Weights & Biases after the pure run showed Trackio alert fragility and the next SDPO/SDRO runs need reliable monitoring.
+
+### W&B account discovery
+
+Local `WANDB_API_KEY` is available and authenticated successfully. The API reports:
+
+- logged-in W&B username: `akuenzi`
+- default/team entity: `chalk`
+
+No W&B webpage setup is required before training: W&B auto-creates a project on the first successful run.
+
+### Code changes
+
+Updated:
+
+- `train_negotiation_pure.py`
+- `train_negotiation_sdpo.py`
+- `train_negotiation_dual_role.py`
+- `README.md`
+
+New env vars used by scripts:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WANDB_ENTITY` | `chalk` | W&B namespace/team/account where runs are stored. |
+| `WANDB_PROJECT` | script-specific | Project bucket inside the entity, e.g. `anchor-negotiation-sdpo`. Auto-created if absent. |
+| `WANDB_MODE` | `online` | Use `online` for normal cloud logging, `offline` for local dry runs. |
+| `WANDB_TAGS` | script-specific | Comma-separated tags for filtering runs. |
+| `WANDB_GROUP` | generated | Groups related runs/ablations. |
+| `WANDB_JOB_TYPE` | `train` | W&B job type. |
+| `RUN_NAME` | generated | Human-readable run name; leave unset for standard naming. |
+
+HF Jobs launch commands must now use dependency `wandb` and pass `--secrets WANDB_API_KEY` in addition to `--secrets HF_TOKEN`.
+
+### Run naming standard
+
+Use short, scan-friendly names for the most important axes and rely on `wandb.config` for the full parameter record.
+
+Default schemas:
+
+| Script | Default run name |
+|---|---|
+| Pure | `pure__<model>__i<iters>_b<batch>xg<group>__lr<lr>_kl<kl>__s<seed>` |
+| SDPO/SDRO | `sdpo__<model>__l<lambda>__<distill>__i<iters>_b<batch>xg<group>__fb<mode>_clip<clip>__lr<lr>_kl<kl>__s<seed>` |
+| Dual-role | `dual__<model>__i<iters>_b<batch>xg<group>__dr<ratio>_rae<decay>_<ref>_<advnorm>__lr<lr>_kl<kl>` |
+
+For current SDPO, `<distill>=tokgap` because the script uses token-level teacher-student logprob gaps. Future logit-level SDRO variants should encode the top-k/divergence/trust-region/EMA family compactly, e.g. `topk64-js-tri-ema0p99`.
+
+Title should include method, model, SDPO lambda, distillation family, iters, batch×group, feedback mode, clip, LR, KL, seed. Full `wandb.config` remains the source of truth for max turns/tokens, temperatures, optimizer, Liger, memory caps, exact divergence, EMA/trust-region flags, Hub repo, hardware, etc.
+
+### Validation
+
+Local W&B smoke test succeeded and logged a metric + alert:
+
+- project: `chalk/anchor-negotiation-setup-smoke`
+- run: https://wandb.ai/chalk/anchor-negotiation-setup-smoke/runs/x5suqkt7
+
+All patched scripts compile with `python3 -m py_compile`.
