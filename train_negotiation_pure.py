@@ -23,7 +23,7 @@ Kept from the newer SPIRAL script where non-conflicting:
 - Group-level advantage normalization for continuous negotiation rewards.
 - Small KL/reference anchor by default for dense 4B format stability (env-overridable).
 - Liger kernel optional integration.
-- Trackio metrics + alerts.
+- W&B metrics + alerts.
 - Periodic HF Hub branch checkpoints.
 
 Explicitly removed from SPIRAL:
@@ -101,10 +101,39 @@ CHECKPOINT_EVERY = int(os.environ.get("CHECKPOINT_EVERY", "10"))
 SEED = int(os.environ.get("SEED", "42"))
 TRAIN_SPLIT_SIZE = int(os.environ.get("TRAIN_SPLIT_SIZE", "802"))
 TEST_SPLIT_SIZE = int(os.environ.get("TEST_SPLIT_SIZE", "128"))
-TRACKIO_SPACE = os.environ.get("TRACKIO_SPACE", "ZeterMordio/anchor-dashboard")
-TRACKIO_PROJECT = os.environ.get("TRACKIO_PROJECT", "anchor-negotiation-pure")
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "anchor-negotiation-pure")
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "chalk") or None
+WANDB_MODE = os.environ.get("WANDB_MODE", "online")
+WANDB_TAGS = [t.strip() for t in os.environ.get("WANDB_TAGS", "pure,negotiation,rlvr").split(",") if t.strip()]
+WANDB_JOB_TYPE = os.environ.get("WANDB_JOB_TYPE", "train")
 RUN_NAME = os.environ.get("RUN_NAME", "")
 PUSH_TRAINING_SCRIPT = os.environ.get("PUSH_TRAINING_SCRIPT", "1") == "1"
+
+
+def _fmt_run_value(value):
+    text = f"{value:g}" if isinstance(value, float) else str(value)
+    return text.replace("e-0", "e-").replace("e+0", "e+").replace(".", "p")
+
+
+def _model_slug(model_name):
+    slug = model_name.split("/")[-1].lower()
+    slug = slug.replace("qwen3", "q3").replace("instruct", "i")
+    slug = slug.replace("-2507", "2507")
+    slug = re.sub(r"[^a-z0-9.]+", "-", slug).strip("-")
+    slug = slug.replace("-i-", "-i")
+    return slug
+
+
+def default_run_name():
+    return (
+        f"pure__{_model_slug(MODEL_NAME)}__i{NUM_ITERS}_b{BATCH_SIZE}xg{GROUP_SIZE}"
+        f"__lr{_fmt_run_value(LR)}_kl{_fmt_run_value(KL_COEF)}__s{SEED}"
+    )
+
+
+def default_wandb_group():
+    return f"pure__{_model_slug(MODEL_NAME)}__b{BATCH_SIZE}xg{GROUP_SIZE}"
+
 
 random.seed(SEED)
 torch.manual_seed(SEED)
@@ -883,13 +912,18 @@ def main():
     print("=" * 70, flush=True)
 
     try:
-        import trackio
+        import wandb
 
-        run_name = RUN_NAME or f"pure-{MODEL_NAME.split('/')[-1]}-{NUM_ITERS}it"
-        trackio.init(
-            project=TRACKIO_PROJECT,
+        run_name = RUN_NAME or default_run_name()
+        wandb_run = wandb.init(
+            entity=WANDB_ENTITY,
+            project=WANDB_PROJECT,
             name=run_name,
-            space_id=TRACKIO_SPACE,
+            group=os.environ.get("WANDB_GROUP", default_wandb_group()),
+            job_type=WANDB_JOB_TYPE,
+            mode=WANDB_MODE,
+            tags=WANDB_TAGS,
+            save_code=False,
             config={
                 "method": "pure_negotiation_rlvr",
                 "buyer_model": MODEL_NAME,
@@ -910,12 +944,13 @@ def main():
                 "dataset_categories": CATEGORIES,
             },
         )
-        TRACKIO_OK = True
-        print(f"[TRACKIO] Dashboard: https://huggingface.co/spaces/{TRACKIO_SPACE}")
+        WANDB_OK = True
+        print(f"[WANDB] Run: {wandb_run.url}")
     except Exception as e:
-        print(f"[TRACKIO] Init failed (non-fatal): {e}")
-        TRACKIO_OK = False
-        trackio = None
+        print(f"[WANDB] Init failed (non-fatal): {e}")
+        WANDB_OK = False
+        wandb = None
+        wandb_run = None
 
     print("\n[1/5] Loading dataset...")
     train_products, _ = load_products(seed=SEED)
@@ -1027,9 +1062,9 @@ def main():
         }
         metrics.append(row)
 
-        if TRACKIO_OK:
+        if WANDB_OK:
             try:
-                trackio.log(
+                wandb.log(
                     {
                         "train/loss": loss,
                         "reward/buyer": iter_metrics["mean_reward"],
@@ -1048,26 +1083,26 @@ def main():
                     step=iteration,
                 )
                 if iteration == 0:
-                    trackio.alert(
+                    wandb.alert(
                         "pure_negotiation_started",
                         f"iter=0 reward={iter_metrics['mean_reward']:.4f} deal_rate={iter_metrics['deal_rate']:.3f}; continue 42-iter run if format errors stay low",
-                        level=trackio.AlertLevel.INFO,
+                        level=wandb.AlertLevel.INFO,
                     )
                 if iter_metrics["mean_reward"] < -0.5:
-                    trackio.alert(
+                    wandb.alert(
                         "low_reward_warning",
                         f"reward={iter_metrics['mean_reward']:.4f} at iter={iteration}; if persistent, reduce LR or increase KL anchor",
-                        level=trackio.AlertLevel.WARN,
+                        level=wandb.AlertLevel.WARN,
                     )
                 fmt_errors = iter_metrics["outcomes"].get("BUYER_FORMAT_ERROR", 0)
                 if fmt_errors > 0.25 * n_episodes:
-                    trackio.alert(
+                    wandb.alert(
                         "format_collapse_warning",
                         f"buyer_format_errors={fmt_errors}/{n_episodes} at iter={iteration}; try LR x0.1 or KL x2",
-                        level=trackio.AlertLevel.WARN,
+                        level=wandb.AlertLevel.WARN,
                     )
             except Exception as e:
-                print(f"  [TRACKIO] Log/alert failed (non-fatal): {e}")
+                print(f"  [WANDB] Log/alert failed (non-fatal): {e}")
 
         should_ckpt = (
             CHECKPOINT_EVERY > 0
@@ -1100,13 +1135,13 @@ def main():
     print(f"COMPLETE  Total time: {total:.1f}s ({total/60:.1f} min)")
     print(f"{'=' * 70}")
 
-    if TRACKIO_OK:
+    if WANDB_OK:
         try:
-            trackio.alert("pure_negotiation_complete", f"iters={NUM_ITERS}; final_reward={metrics[-1]['mean_reward']:.4f}; final_deal_rate={metrics[-1]['deal_rate']:.3f}", level=trackio.AlertLevel.INFO)
-            trackio.finish()
-            print(f"[TRACKIO] Finished. Dashboard: https://huggingface.co/spaces/{TRACKIO_SPACE}")
+            wandb.alert("pure_negotiation_complete", f"iters={NUM_ITERS}; final_reward={metrics[-1]['mean_reward']:.4f}; final_deal_rate={metrics[-1]['deal_rate']:.3f}", level=wandb.AlertLevel.INFO)
+            wandb.finish()
+            print(f"[WANDB] Finished. Run: {wandb_run.url if wandb_run else '(unavailable)'}")
         except Exception as e:
-            print(f"[TRACKIO] Finish failed (non-fatal): {e}")
+            print(f"[WANDB] Finish failed (non-fatal): {e}")
 
 
 if __name__ == "__main__":

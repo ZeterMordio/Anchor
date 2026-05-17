@@ -14,7 +14,7 @@ Replication and extension of ["Instructing LLMs to Negotiate using Reinforcement
 | `eval_negotiation.py` | Evaluation script for trained checkpoints against a frozen seller under the paper-style protocol. |
 | `JOURNAL.md` | Engineering log: papers, bugs, runs, hyperparameters, job IDs, and rationale. |
 
-`train_negotiation_clean.py` was the old pure buyer-only prototype and has been deleted. It predated Thought stripping, batched generation, Trackio, checkpoint branches, and later memory/stability fixes.
+`train_negotiation_clean.py` was the old pure buyer-only prototype and has been deleted. It predated Thought stripping, batched generation, monitoring, checkpoint branches, and later memory/stability fixes.
 
 ## Pure Negotiation-RLVR setup
 
@@ -35,7 +35,7 @@ Non-conflicting improvements retained from the SPIRAL/RLVR script:
 - Clamped log-ratio for GRPO stability.
 - Group-level advantage normalization.
 - Optional Liger kernels.
-- Trackio logging + alerts.
+- W&B logging + alerts.
 - Periodic HF Hub branch checkpoints.
 
 Explicitly removed from the SPIRAL setup:
@@ -76,7 +76,7 @@ python3 -m py_compile train_negotiation_pure.py train_negotiation_sdpo.py train_
 
 `train_negotiation_sdpo.py` is the intended first self-distillation experiment. It keeps the pure buyer-only environment but uses hindsight verifier feedback and same-product on-policy rollout demos to compute dense SDPO token advantages. Defaults are conservative: `SDPO_LAMBDA=0.9` keeps 90% GRPO scalar advantage and 10% SDPO token advantage; `SDPO_FEEDBACK_MODE=strict` avoids exact seller-cost leakage.
 
-Smoke validation completed on A100 with Qwen3-4B-Instruct-2507 and full format settings (`MAX_TURNS=6`, `MAX_NEW_TOKENS=300`): job [`6a05a28a3308d79117b8f560`](https://huggingface.co/jobs/ZeterMordio/6a05a28a3308d79117b8f560), model repo [`ZeterMordio/anchor-negotiation-sdpo-smoke-fullfmt`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-smoke-fullfmt). It completed 1 iteration, pushed metrics/model, and confirmed Trackio alerts after switching from string alert levels to `trackio.AlertLevel.*`.
+Smoke validation completed on A100 with Qwen3-4B-Instruct-2507 and full format settings (`MAX_TURNS=6`, `MAX_NEW_TOKENS=300`): job [`6a05a28a3308d79117b8f560`](https://huggingface.co/jobs/ZeterMordio/6a05a28a3308d79117b8f560), model repo [`ZeterMordio/anchor-negotiation-sdpo-smoke-fullfmt`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-smoke-fullfmt). It completed 1 iteration and pushed metrics/model. Monitoring has since been migrated from Trackio to W&B.
 
 ```bash
 hf jobs uv run \
@@ -86,9 +86,10 @@ hf jobs uv run \
   --with transformers \
   --with accelerate \
   --with huggingface_hub \
-  --with trackio \
+  --with wandb \
   --with liger-kernel \
   --secrets HF_TOKEN \
+  --secrets WANDB_API_KEY \
   --env MODEL_NAME=Qwen/Qwen3-8B \
   --env SELLER_MODEL_NAME=Qwen/Qwen3-8B \
   --env NUM_ITERS=42 \
@@ -107,13 +108,39 @@ hf jobs uv run \
   --env GEN_BATCH_LIMIT=128 \
   --env GRADIENT_CHECKPOINTING=1 \
   --env HUB_MODEL_ID=ZeterMordio/anchor-negotiation-sdpo \
-  --env TRACKIO_SPACE=ZeterMordio/anchor-dashboard \
-  --env TRACKIO_PROJECT=anchor-negotiation-sdpo \
-  --env RUN_NAME=sdpo-qwen3-8b-42it \
+  --env WANDB_ENTITY=chalk \
+  --env WANDB_PROJECT=anchor-negotiation-sdpo \
   --env PYTHONUNBUFFERED=1 \
   --detach \
   train_negotiation_sdpo.py
 ```
+
+## W&B monitoring
+
+The scripts now use [Weights & Biases](https://wandb.ai/) instead of Trackio.
+
+- `WANDB_ENTITY` is the W&B account or team namespace that owns the run. For the available API key, the default entity is `chalk`.
+- `WANDB_PROJECT` is the project bucket/group inside that entity. Projects are created automatically on first run; no web-page setup is required.
+- `RUN_NAME` is the human-readable run name. Leave unset for the standardized auto-name; set it only for one-off manual labels.
+- `WANDB_GROUP` groups related reruns/ablations. Leave unset for the standardized auto-group.
+- `WANDB_MODE=online` logs to the W&B web app; use `WANDB_MODE=offline` for local dry runs.
+- HF Jobs must receive `--secrets WANDB_API_KEY` in addition to `--secrets HF_TOKEN`.
+
+Best practice for this repo: keep run names short enough to scan, but put full detail in `wandb.config`.
+
+Run-name schema:
+
+| Script | Default name shape |
+|---|---|
+| Pure | `pure__<model>__i<iters>_b<batch>xg<group>__lr<lr>_kl<kl>__s<seed>` |
+| SDPO/SDRO | `sdpo__<model>__l<lambda>__<distill>__i<iters>_b<batch>xg<group>__fb<mode>_clip<clip>__lr<lr>_kl<kl>__s<seed>` |
+| Dual-role | `dual__<model>__i<iters>_b<batch>xg<group>__dr<ratio>_rae<decay>_<ref>_<advnorm>__lr<lr>_kl<kl>` |
+
+For SDPO/SDRO, `<distill>` is currently `tokgap`. Future logit-level variants are named like `topk64-js-tri-ema0p99`.
+
+Put in the title: method, model, lambda, distillation family, iters, batch×group, feedback mode, clip, LR, KL, seed. Put everything else in W&B config/tags: max turns/tokens, temps, optimizer, CPU/CUDA AdamW, Liger, memory caps, demo length, exact divergence, EMA/trust-region flags, Hub repo, git commit, hardware, etc.
+
+Example run URLs will look like `https://wandb.ai/chalk/anchor-negotiation-sdpo/runs/<run-id>`.
 
 ## HF Jobs launch command (do not run unless ready)
 
@@ -127,9 +154,10 @@ hf jobs uv run \
   --with transformers \
   --with accelerate \
   --with huggingface_hub \
-  --with trackio \
+  --with wandb \
   --with liger-kernel \
   --secrets HF_TOKEN \
+  --secrets WANDB_API_KEY \
   --env MODEL_NAME=Qwen/Qwen3-4B-Instruct-2507 \
   --env SELLER_MODEL_NAME=Qwen/Qwen3-4B-Instruct-2507 \
   --env NUM_ITERS=42 \
@@ -145,9 +173,8 @@ hf jobs uv run \
   --env GEN_BATCH_LIMIT=128 \
   --env GRADIENT_CHECKPOINTING=1 \
   --env HUB_MODEL_ID=ZeterMordio/anchor-negotiation-pure \
-  --env TRACKIO_SPACE=ZeterMordio/anchor-dashboard \
-  --env TRACKIO_PROJECT=anchor-negotiation-pure \
-  --env RUN_NAME=pure-qwen3-4b-42it \
+  --env WANDB_ENTITY=chalk \
+  --env WANDB_PROJECT=anchor-negotiation-pure \
   --env PYTHONUNBUFFERED=1 \
   --detach \
   train_negotiation_pure.py

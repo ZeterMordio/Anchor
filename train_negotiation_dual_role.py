@@ -105,7 +105,11 @@ HUB_MODEL_ID = os.environ.get("HUB_MODEL_ID", "")
 GRADIENT_CHECKPOINTING = os.environ.get("GRADIENT_CHECKPOINTING", "1") == "1"
 RAE_DECAY = float(os.environ.get("RAE_DECAY", "0.95"))  # EMA decay for baselines
 DUAL_ROLE_RATIO = float(os.environ.get("DUAL_ROLE_RATIO", "0.5"))  # Fraction seller training
-TRACKIO_SPACE = os.environ.get("TRACKIO_SPACE", "ZeterMordio/anchor-dashboard")
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "anchor-negotiation")
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "chalk") or None
+WANDB_MODE = os.environ.get("WANDB_MODE", "online")
+WANDB_TAGS = [t.strip() for t in os.environ.get("WANDB_TAGS", "dual-role,negotiation,rlvr,spiral").split(",") if t.strip()]
+WANDB_JOB_TYPE = os.environ.get("WANDB_JOB_TYPE", "train")
 RUN_NAME = os.environ.get("RUN_NAME", "")
 # Maximum number of episodes to generate in a single batched call.
 # Limits peak VRAM during generation. 128 is fine for 4B on A100.
@@ -114,6 +118,36 @@ NUM_INNER_EPOCHS = int(os.environ.get("NUM_INNER_EPOCHS", "1"))  # 1 for long NL
 NORMALIZE_ADVANTAGES = os.environ.get("NORMALIZE_ADVANTAGES", "1") == "1"  # Group norm on top of RAE
 USE_REF_MODEL = os.environ.get("USE_REF_MODEL", "1") == "1"  # Set 0 to skip ref model (saves 8GB, disables KL+IS ratio)
 CHECKPOINT_EVERY = int(os.environ.get("CHECKPOINT_EVERY", "10"))  # Save checkpoint every N iters (0 = disabled)
+
+
+def _fmt_run_value(value):
+    text = f"{value:g}" if isinstance(value, float) else str(value)
+    return text.replace("e-0", "e-").replace("e+0", "e+").replace(".", "p")
+
+
+def _model_slug(model_name):
+    slug = model_name.split("/")[-1].lower()
+    slug = slug.replace("qwen3", "q3").replace("instruct", "i")
+    slug = slug.replace("-2507", "2507")
+    slug = re.sub(r"[^a-z0-9.]+", "-", slug).strip("-")
+    slug = slug.replace("-i-", "-i")
+    return slug
+
+
+def default_run_name():
+    ref = "ref" if USE_REF_MODEL else "noref"
+    norm = "norm" if NORMALIZE_ADVANTAGES else "rawadv"
+    return (
+        f"dual__{_model_slug(MODEL_NAME)}__i{NUM_ITERS}_b{BATCH_SIZE}xg{GROUP_SIZE}"
+        f"__dr{_fmt_run_value(DUAL_ROLE_RATIO)}_rae{_fmt_run_value(RAE_DECAY)}_{ref}_{norm}"
+        f"__lr{_fmt_run_value(LR)}_kl{_fmt_run_value(KL_COEF)}"
+    )
+
+
+def default_wandb_group():
+    ref = "ref" if USE_REF_MODEL else "noref"
+    return f"dual__{_model_slug(MODEL_NAME)}__dr{_fmt_run_value(DUAL_ROLE_RATIO)}_{ref}"
+
 
 # ─── CUDA check ──────────────────────────────────────────────────────────────────
 def check_cuda():
@@ -928,14 +962,19 @@ def main():
     print(f"[CONFIG] CheckpointEvery={CHECKPOINT_EVERY}")
     print("=" * 60, flush=True)
     
-    # 0. Trackio monitoring
+    # 0. W&B monitoring
     try:
-        import trackio
-        run_name = RUN_NAME or f"v10-{MODEL_NAME.split('/')[-1]}-{NUM_ITERS}it"
-        trackio.init(
-            project="anchor-negotiation",
+        import wandb
+        run_name = RUN_NAME or default_run_name()
+        wandb_run = wandb.init(
+            entity=WANDB_ENTITY,
+            project=WANDB_PROJECT,
             name=run_name,
-            space_id=TRACKIO_SPACE,
+            group=os.environ.get("WANDB_GROUP", default_wandb_group()),
+            job_type=WANDB_JOB_TYPE,
+            mode=WANDB_MODE,
+            tags=WANDB_TAGS,
+            save_code=False,
             config={
                 "model": MODEL_NAME, "num_iters": NUM_ITERS,
                 "batch_size": BATCH_SIZE, "group_size": GROUP_SIZE,
@@ -944,18 +983,20 @@ def main():
                 "buyer_temp": BUYER_TEMP, "seller_temp": SELLER_TEMP,
                 "grad_checkpoint": GRADIENT_CHECKPOINTING,
                 "rae_decay": RAE_DECAY, "dual_role_ratio": DUAL_ROLE_RATIO,
-                "ref_model": "frozen (KL + IS ratio)",
+                "ref_model": "frozen (KL + IS ratio)" if USE_REF_MODEL else "disabled",
                 "batched_gen": True,
                 "inner_epochs": NUM_INNER_EPOCHS,
                 "normalize_advantages": NORMALIZE_ADVANTAGES,
                 "liger_kernel": USE_LIGER,
             },
         )
-        TRACKIO_OK = True
-        print(f"[TRACKIO] Dashboard: https://huggingface.co/spaces/{TRACKIO_SPACE}")
+        WANDB_OK = True
+        print(f"[WANDB] Run: {wandb_run.url}")
     except Exception as e:
-        print(f"[TRACKIO] Init failed (non-fatal): {e}")
-        TRACKIO_OK = False
+        print(f"[WANDB] Init failed (non-fatal): {e}")
+        WANDB_OK = False
+        wandb = None
+        wandb_run = None
     
     # 1. Dataset
     print("\n[1/5] Loading dataset...")
@@ -1097,10 +1138,10 @@ def main():
         print(f"  VRAM: {current_vram:.1f}GB current, {peak_vram:.1f}GB peak", flush=True)
         torch.cuda.reset_peak_memory_stats()  # reset so peak is per-iteration
         
-        # ── Trackio logging ──
-        if TRACKIO_OK:
+        # ── W&B logging ──
+        if WANDB_OK:
             try:
-                trackio.log({
+                wandb.log({
                     "train/loss": loss,
                     "reward/buyer": mean_br,
                     "reward/seller": mean_sr,
@@ -1116,8 +1157,20 @@ def main():
                     "perf/vram_peak_gb": peak_vram,
                     "sanity/role_confusions": role_confusions,
                 }, step=iteration)
+                if iteration == 0:
+                    wandb.alert(
+                        "dual_role_negotiation_started",
+                        f"iter=0 buyer_reward={mean_br:.4f} seller_reward={mean_sr:.4f} deal_rate={deal_rate:.3f}",
+                        level=wandb.AlertLevel.INFO,
+                    )
+                if role_confusions > 0:
+                    wandb.alert(
+                        "role_confusion_warning",
+                        f"role_confusions={role_confusions} at iter={iteration}; inspect prompts/action parser",
+                        level=wandb.AlertLevel.WARN,
+                    )
             except Exception as e:
-                print(f"  [TRACKIO] Log failed (non-fatal): {e}")
+                print(f"  [WANDB] Log/alert failed (non-fatal): {e}")
         
         metrics.append({
             "iteration": iteration,
@@ -1209,13 +1262,14 @@ def main():
     print(f"Final RAE: {rae.state_dict()}")
     print(f"{'=' * 60}")
     
-    # Finish trackio
-    if TRACKIO_OK:
+    # Finish W&B
+    if WANDB_OK:
         try:
-            trackio.finish()
-            print(f"[TRACKIO] Run finished. Dashboard: https://huggingface.co/spaces/{TRACKIO_SPACE}")
+            wandb.alert("dual_role_negotiation_complete", f"iters={NUM_ITERS}; final_buyer_reward={metrics[-1]['mean_buyer_reward']:.4f}; final_deal_rate={metrics[-1]['deal_rate']:.3f}", level=wandb.AlertLevel.INFO)
+            wandb.finish()
+            print(f"[WANDB] Run finished: {wandb_run.url if wandb_run else '(unavailable)'}")
         except Exception as e:
-            print(f"[TRACKIO] Finish failed (non-fatal): {e}")
+            print(f"[WANDB] Finish failed (non-fatal): {e}")
 
 
 if __name__ == "__main__":
