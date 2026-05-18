@@ -75,6 +75,8 @@ BUYER_TEMP   = float(os.environ.get("BUYER_TEMP", "1.0"))   # paper: 1.0
 SELLER_TEMP  = float(os.environ.get("SELLER_TEMP", "0.7"))  # paper: 0.7
 MAX_NEW      = int(os.environ.get("MAX_NEW", "4000"))  # paper eval: 4000 (not 300 like training)
 SEED         = int(os.environ.get("SEED", "42"))
+TRAIN_SPLIT_SIZE = int(os.environ.get("TRAIN_SPLIT_SIZE", "802"))
+TEST_SPLIT_SIZE  = int(os.environ.get("TEST_SPLIT_SIZE", "128"))
 OUT          = os.environ.get("OUT", "eval_results.json")
 HUB_MODEL_ID = os.environ.get("HUB_MODEL_ID", "")  # optional: push results to model repo
 USE_LIGER    = os.environ.get("USE_LIGER", "1") == "1"
@@ -99,11 +101,12 @@ CATEGORIES = [
     "automotive", "baby-products", "beauty", "books", "electronics",
     "health-personal-care", "home-kitchen", "industrial-scientific",
     "movies-tv", "music", "other", "patio-lawn-garden", "pet-supplies",
-    "software", "sports-outdoors", "tools-home-improvement",
+    "software", "sports-outdoors", "tools-home-improvement", "toys-games",
+    "video-games",
 ]
 
 def parse_price(s):
-    return float(s.replace("$", "").replace(",", "").strip())
+    return float(str(s).replace("$", "").replace(",", "").strip())
 
 def load_products(seed=42):
     import urllib.request
@@ -126,6 +129,10 @@ def load_products(seed=42):
                     "codename": f"{cat}_{idx}",
                     "title": it.get("title", "")[:120],
                     "description": it.get("description", "")[:200],
+                    "features": it.get("features", "")[:300],
+                    "current_price": parse_price(it.get("current_price", lp)),
+                    "average_price": parse_price(it.get("average_price", lp)),
+                    "highest_price": parse_price(it.get("highest_price", lp)),
                     "category": cat,
                     "list_price": lp,
                     "cost": cost,
@@ -136,8 +143,12 @@ def load_products(seed=42):
                 continue
     random.seed(seed)
     random.shuffle(all_items)
-    split = int(len(all_items) * 0.86)
-    train, test = all_items[:split], all_items[split:]
+    if len(all_items) >= TRAIN_SPLIT_SIZE + TEST_SPLIT_SIZE:
+        train = all_items[:TRAIN_SPLIT_SIZE]
+        test = all_items[TRAIN_SPLIT_SIZE : TRAIN_SPLIT_SIZE + TEST_SPLIT_SIZE]
+    else:
+        split = int(len(all_items) * 0.8623655913978494)  # 802/930, training-script parity
+        train, test = all_items[:split], all_items[split:]
     mi = sum(1 for p in test if p["mi"])
     print(f"[DATA] Total={len(all_items)} train={len(train)} test={len(test)} test_MI={mi} test_CI={len(test)-mi}")
     return train, test
@@ -195,13 +206,17 @@ def build_buyer_prompt(product):
         f"- codename: {product['codename']}\n"
         f"  title: {product['title']}\n"
         f"  description: {product['description']}\n"
+        f"  features: {product.get('features', '')}\n"
         f"  category: {product['category']}\n"
-        f"  list_price: ${product['list_price']:.2f}"
+        f"  list_price: ${product['list_price']:.2f}\n"
+        f"  current_price: ${product.get('current_price', product['list_price']):.2f}\n"
+        f"  average_price: ${product.get('average_price', product['list_price']):.2f}\n"
+        f"  highest_price: ${product.get('highest_price', product['list_price']):.2f}"
     )
     need = (
         f"Shopping List\n"
         f"- codename: {product['codename']}\n"
-        f"  title: {product['title']}\n"
+        f"  quantity: 1\n"
         f"  budget_limit: ${product['budget']:.2f}"
     )
     user = (
@@ -220,8 +235,12 @@ def build_seller_prompt(product):
         f"- codename: {product['codename']}\n"
         f"  title: {product['title']}\n"
         f"  description: {product['description']}\n"
+        f"  features: {product.get('features', '')}\n"
         f"  category: {product['category']}\n"
         f"  list_price: ${product['list_price']:.2f}\n"
+        f"  current_price: ${product.get('current_price', product['list_price']):.2f}\n"
+        f"  average_price: ${product.get('average_price', product['list_price']):.2f}\n"
+        f"  highest_price: ${product.get('highest_price', product['list_price']):.2f}\n"
         f"  cost_price (private): ${product['cost']:.2f}"
     )
     user = (
@@ -278,6 +297,28 @@ def extract_action(text):
     return {"type": "UNKNOWN", "price": None, "objects": None}
 
 
+def replace_final_action(text, action_type, price, product):
+    """Replace the final public structured action after environment regulation."""
+    replacement = f"[{action_type}] ${price:.2f} (1x {product['codename']})"
+    text = strip_qwen_native_thinking(text or "")
+    line_matches = list(ACTION_LINE_RE.finditer(text))
+    if line_matches:
+        m = line_matches[-1]
+        old_match = list(ACTION_RE.finditer(m.group(0)))[-1]
+        start = m.start() + old_match.start()
+        end = m.start() + old_match.end()
+        return text[:start] + replacement + text[end:]
+    visible = strip_thought(text)
+    matches = list(ACTION_RE.finditer(visible))
+    if not matches:
+        return text.rstrip() + f"\nAction: {replacement}"
+    old = matches[-1].group(0)
+    idx = text.rfind(old)
+    if idx < 0:
+        return text.rstrip() + f"\nAction: {replacement}"
+    return text[:idx] + replacement + text[idx + len(old) :]
+
+
 def strip_thought(text):
     """Remove hidden scratchpads, keep only Talk + Action (for cross-role context)."""
     text = strip_qwen_native_thinking(text or "")
@@ -324,6 +365,8 @@ def regulate_seller(seller_action, buyer_price, product):
 # ─── Reward (identical to training) ──────────────────────────────────────────
 def compute_buyer_reward(final_price, budget, cost, outcome):
     if "FORMAT_ERROR" in outcome or "UNEXPECTED" in outcome:
+        return -1.0
+    if outcome in {"BUYER_BUDGET_VIOLATION", "BUYER_DEAL_INVALID_SELLER_OFFER", "BUYER_DEAL_PRICE_MISMATCH"}:
         return -1.0
     if final_price is None:
         return 0.0
@@ -420,7 +463,13 @@ def run_eval_episode(buyer_model, seller_model, buyer_tok, seller_tok, product, 
                 ep.outcome = "BUYER_DEAL_NO_SELLER_OFFER"
                 break
             last_s_act = extract_action(ep.seller_texts[-1])
-            ep.final_price = last_s_act.get("price")
+            if last_s_act["type"] != "SELL" or last_s_act.get("price") is None:
+                ep.outcome = "BUYER_DEAL_INVALID_SELLER_OFFER"
+                break
+            if b_act.get("price") is not None and abs(b_act["price"] - last_s_act["price"]) > 0.01:
+                ep.outcome = "BUYER_DEAL_PRICE_MISMATCH"
+                break
+            ep.final_price = last_s_act["price"]
             ep.outcome = "DEAL_BUYER_ACCEPTS"
             break
         elif b_act["type"] == "BUY":
@@ -442,13 +491,18 @@ def run_eval_episode(buyer_model, seller_model, buyer_tok, seller_tok, product, 
         s_act = extract_action(s_text)
         ep.seller_texts.append(s_text)
         
+        # Regulate seller before storing cross-role context, matching training.
+        r_price, done, reason = regulate_seller(s_act, last_buyer_price, product)
+        if reason == "SELL" and r_price is not None and s_act.get("price") != r_price:
+            s_text = replace_final_action(s_text, "SELL", r_price, product)
+            s_act = extract_action(s_text)
+            ep.seller_texts[-1] = s_text
+
         # Add seller's full text to seller's own history
         seller_msgs.append({"role": "assistant", "content": s_text})
         # Add seller's STRIPPED text to buyer's context
         buyer_msgs.append({"role": "user", "content": strip_thought(s_text)})
         
-        # Regulate seller
-        r_price, done, reason = regulate_seller(s_act, last_buyer_price, product)
         if done:
             if "DEAL" in reason:
                 ep.final_price = r_price
@@ -545,6 +599,7 @@ def main():
     print(f"Seller: {SELLER_PATH}")
     print(f"Test:   {N_TEST} products × {N_ROLL} rollouts = {N_TEST * N_ROLL} episodes")
     print(f"Config: max_turns={MAX_TURNS} buyer_temp={BUYER_TEMP} seller_temp={SELLER_TEMP} max_new={MAX_NEW}")
+    print(f"Split:  train={TRAIN_SPLIT_SIZE} test={TEST_SPLIT_SIZE} categories={len(CATEGORIES)}")
     print(f"Seed:   {SEED}")
     print(f"Output: {OUT}")
     print(f"{'=' * 70}\n")

@@ -72,11 +72,15 @@ The 42-iteration pure run has completed and pushed to [`ZeterMordio/anchor-negot
 python3 -m py_compile train_negotiation_pure.py train_negotiation_sdpo.py train_negotiation_dual_role.py eval_negotiation.py
 ```
 
+`eval_negotiation.py` uses the same 18-category AmazonHistoryPrice loader and the same 802/128 seed split as the training scripts. Override `TRAIN_SPLIT_SIZE` / `TEST_SPLIT_SIZE` only for controlled split-parity experiments.
+
 ## SDPO+GRPO 8B run
 
 `train_negotiation_sdpo.py` is the intended first self-distillation experiment. It keeps the pure buyer-only environment but uses hindsight verifier feedback and same-product on-policy rollout demos to compute dense SDPO token advantages. Defaults are conservative: `SDPO_LAMBDA=0.9` keeps 90% GRPO scalar advantage and 10% SDPO token advantage; `SDPO_FEEDBACK_MODE=strict` avoids exact seller-cost leakage.
 
 Smoke validation completed on A100 with Qwen3-4B-Instruct-2507 and full format settings (`MAX_TURNS=6`, `MAX_NEW_TOKENS=300`): job [`6a05a28a3308d79117b8f560`](https://huggingface.co/jobs/ZeterMordio/6a05a28a3308d79117b8f560), model repo [`ZeterMordio/anchor-negotiation-sdpo-smoke-fullfmt`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-smoke-fullfmt). It completed 1 iteration and pushed metrics/model. Monitoring has since been migrated from Trackio to W&B.
+
+The SDPO update path is optimized for the 8B run: buyer turns are flattened into pre-tokenized microbatch examples, teacher/student completion masks are aligned row-wise, and CPU-state AdamW steps once per production-shape iteration by default (`UPDATE_MICROBATCH_SIZE=4`, `OPTIM_STEP_EVERY_GROUPS=16`). W&B logs per-phase update timers under `perf/update_*_s` plus `perf/update_examples`, `perf/optimizer_steps`, and `train/grad_norm_last`. A short GPU smoke completed at [`hf job 6a0a5fd2a5e509f1a8413e2b`](https://huggingface.co/jobs/ZeterMordio/6a0a5fd2a5e509f1a8413e2b), W&B run [`fnscexas`](https://wandb.ai/chalk/anchor-negotiation-sdpo/runs/fnscexas), and model/metrics repo [`ZeterMordio/anchor-negotiation-sdpo-perf-smoke`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-perf-smoke).
 
 ```bash
 hf jobs uv run \
@@ -106,6 +110,10 @@ hf jobs uv run \
   --env SELLER_TEMP=0.7 \
   --env CHECKPOINT_EVERY=10 \
   --env GEN_BATCH_LIMIT=128 \
+  --env UPDATE_MICROBATCH_SIZE=4 \
+  --env OPTIM_STEP_EVERY_GROUPS=16 \
+  --env UPDATE_PAD_TO_MULTIPLE_OF=8 \
+  --env UPDATE_MAX_LENGTH=2048 \
   --env GRADIENT_CHECKPOINTING=1 \
   --env HUB_MODEL_ID=ZeterMordio/anchor-negotiation-sdpo \
   --env WANDB_ENTITY=chalk \

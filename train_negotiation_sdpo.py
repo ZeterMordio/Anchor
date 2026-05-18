@@ -116,6 +116,14 @@ ADAMW_FOREACH = os.environ.get("ADAMW_FOREACH", "0") == "1"
 # on CPU to avoid the 8B A100 optimizer.step OOM seen in job 6a05acb... .
 # Set OPTIMIZER=adamw_cuda for a fully CUDA AdamW attempt; keep it only if VRAM is enough.
 OPTIMIZER = os.environ.get("OPTIMIZER", "adamw_cpu").lower()
+# Update-path performance controls. The old implementation processed one buyer
+# turn at a time and stepped CPU AdamW once per GRPO group. These defaults batch
+# buyer turns into microbatches and step once per 16 groups (= once per 16-product
+# production-shape iteration) while preserving full-parameter training.
+UPDATE_MICROBATCH_SIZE = int(os.environ.get("UPDATE_MICROBATCH_SIZE", "4"))
+OPTIM_STEP_EVERY_GROUPS = int(os.environ.get("OPTIM_STEP_EVERY_GROUPS", "16"))
+UPDATE_PAD_TO_MULTIPLE_OF = int(os.environ.get("UPDATE_PAD_TO_MULTIPLE_OF", "8"))
+UPDATE_MAX_LENGTH = int(os.environ.get("UPDATE_MAX_LENGTH", "2048"))
 # Experimental SDPO/SDRO design metadata for run naming and W&B config. These do
 # not alter the current token-level SDPO objective unless corresponding code is
 # added/enabled in a future ablation.
@@ -822,12 +830,33 @@ def run_episodes_batched(buyer_model, seller_model, tokenizer, products_expanded
 # ─── Log-probs and SDPO+GRPO buyer update ────────────────────────────────────
 def _token_logprobs(model, input_ids, attention_mask):
     """Per-token log-probs using gather + logsumexp, avoiding full softmax tensor."""
-    out = model(input_ids=input_ids, attention_mask=attention_mask)
+    out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     logits = out.logits[:, :-1, :]
     target = input_ids[:, 1:].unsqueeze(-1)
     target_logit = torch.gather(logits, 2, target).squeeze(-1)
     log_z = torch.logsumexp(logits, dim=-1)
     return target_logit - log_z
+
+
+def _sync_cuda():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _timer_start():
+    _sync_cuda()
+    return time.perf_counter()
+
+
+def _timer_add(timers, key, start):
+    _sync_cuda()
+    timers[key] = timers.get(key, 0.0) + (time.perf_counter() - start)
+
+
+def _chunked(seq, size):
+    size = max(int(size), 1)
+    for start in range(0, len(seq), size):
+        yield seq[start : start + size]
 
 
 def _norm_advantages(t):
@@ -984,23 +1013,6 @@ def build_sdpo_teacher_turn_prompt(ep, turn_idx, feedback):
     return prompt_msgs
 
 
-def _completion_logprobs(logprobs, mask):
-    keep = mask.bool()
-    if logprobs.shape != mask.shape:
-        raise ValueError(f"logprobs/mask shape mismatch: {tuple(logprobs.shape)} vs {tuple(mask.shape)}")
-    return logprobs[keep]
-
-
-def _scatter_completion_values(template, mask, values):
-    out = torch.zeros_like(template)
-    keep = mask.bool()
-    idx = keep.nonzero(as_tuple=False)
-    n = min(idx.shape[0], values.numel())
-    if n:
-        out[idx[:n, 0], idx[:n, 1]] = values[:n]
-    return out, n
-
-
 def _cpu_adamw_step(params, state, lr=LR, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.0):
     """Exact AdamW step with optimizer state kept on CPU.
 
@@ -1040,16 +1052,164 @@ def _cpu_adamw_step(params, state, lr=LR, beta1=0.9, beta2=0.95, eps=1e-8, weigh
 
 
 def _optimizer_step(buyer_model, optimizer, cpu_adamw_state):
-    torch.nn.utils.clip_grad_norm_(buyer_model.parameters(), 1.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(buyer_model.parameters(), 1.0)
     if OPTIMIZER == "adamw_cpu":
         _cpu_adamw_step([p for p in buyer_model.parameters() if p.requires_grad], cpu_adamw_state)
     else:
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+    return float(grad_norm.detach().cpu().item() if torch.is_tensor(grad_norm) else grad_norm)
+
+
+def _encode_prompt_completion(tokenizer, prompt_text, completion_text):
+    """Pre-tokenize prompt and completion once and keep completion-mask metadata.
+
+    Prompt and completion are tokenized separately, then concatenated. That avoids
+    BPE boundary drift from tokenizing ``prompt`` and ``prompt + completion`` in
+    separate calls while still matching the causal-LM shifted-logprob objective.
+    If the pair exceeds UPDATE_MAX_LENGTH, left-truncate the prompt first so at
+    least the generated completion remains trainable.
+    """
+    prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+    completion_ids = tokenizer(completion_text or "", add_special_tokens=False)["input_ids"]
+    if not completion_ids:
+        completion_ids = [tokenizer.eos_token_id]
+
+    max_len = max(int(UPDATE_MAX_LENGTH), 2)
+    if len(completion_ids) >= max_len:
+        completion_ids = completion_ids[: max_len - 1]
+        prompt_ids = prompt_ids[-1:]
+    else:
+        prompt_budget = max_len - len(completion_ids)
+        if len(prompt_ids) > prompt_budget:
+            prompt_ids = prompt_ids[-prompt_budget:]
+
+    input_ids = prompt_ids + completion_ids
+    if len(input_ids) < 2:
+        input_ids = [tokenizer.eos_token_id] + input_ids
+    prompt_len = min(len(prompt_ids), len(input_ids) - 1)
+    completion_shift_start = max(prompt_len - 1, 0)
+    completion_shift_end = max(len(input_ids) - 1, completion_shift_start)
+    return {
+        "input_ids": input_ids,
+        "prompt_len": prompt_len,
+        "completion_shift_start": completion_shift_start,
+        "completion_shift_end": completion_shift_end,
+    }
+
+
+def _pad_encoded_batch(encoded_items, tokenizer, device):
+    if not encoded_items:
+        raise ValueError("Cannot collate an empty update microbatch")
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    max_len = max(len(item["input_ids"]) for item in encoded_items)
+    if UPDATE_PAD_TO_MULTIPLE_OF > 1:
+        rem = max_len % UPDATE_PAD_TO_MULTIPLE_OF
+        if rem:
+            max_len += UPDATE_PAD_TO_MULTIPLE_OF - rem
+    input_rows, attn_rows, mask_rows = [], [], []
+    for item in encoded_items:
+        ids = item["input_ids"]
+        seq_len = len(ids)
+        pad_len = max_len - seq_len
+        input_rows.append(ids + [pad_id] * pad_len)
+        attn_rows.append([1] * seq_len + [0] * pad_len)
+        # Mask shape matches shifted log-probs: [seq_len - 1]. Completion tokens
+        # occupy the precomputed shifted interval, clamped to the unpadded length.
+        shifted_len = max(max_len - 1, 0)
+        mask = [0] * shifted_len
+        start = max(min(item.get("completion_shift_start", item["prompt_len"] - 1), shifted_len), 0)
+        end = max(min(item.get("completion_shift_end", seq_len - 1), shifted_len), start)
+        for j in range(start, end):
+            mask[j] = 1
+        mask_rows.append(mask)
+    return {
+        "input_ids": torch.tensor(input_rows, dtype=torch.long, device=device),
+        "attention_mask": torch.tensor(attn_rows, dtype=torch.long, device=device),
+        "completion_mask": torch.tensor(mask_rows, dtype=torch.float32, device=device),
+    }
+
+
+def _build_group_update_examples(tokenizer, group_eps, advantages, timers):
+    """Flatten a GRPO group into buyer-turn update examples and pre-tokenize."""
+    start = _timer_start()
+    examples = []
+    sdpo_demo_count = 0
+    for i, ep in enumerate(group_eps):
+        feedback, has_demo = build_sdpo_feedback(ep, group_eps)
+        sdpo_demo_count += int(has_demo)
+        for turn_idx, (role, text) in enumerate(ep.turns):
+            if role != "buyer":
+                continue
+            prompt_msgs = build_buyer_turn_prompt(ep, turn_idx)
+            prompt_text = tokenizer.apply_chat_template(
+                prompt_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+            _assert_no_private_info_leak(prompt_text, ep.product, "buyer")
+
+            teacher_prompt_msgs = build_sdpo_teacher_turn_prompt(ep, turn_idx, feedback)
+            teacher_prompt_text = tokenizer.apply_chat_template(
+                teacher_prompt_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+            _assert_no_private_info_leak(teacher_prompt_text, ep.product, "buyer")
+
+            student_enc = _encode_prompt_completion(tokenizer, prompt_text, text)
+            teacher_enc = _encode_prompt_completion(tokenizer, teacher_prompt_text, text)
+            if len(student_enc["input_ids"]) < 2 or len(teacher_enc["input_ids"]) < 2:
+                continue
+            examples.append(
+                {
+                    "student": student_enc,
+                    "teacher": teacher_enc,
+                    "grpo_adv": float(advantages[i].detach().cpu().item()),
+                }
+            )
+    _timer_add(timers, "update_pretokenize_s", start)
+    return examples, sdpo_demo_count
+
+
+def _maybe_optimizer_step(buyer_model, optimizer, cpu_adamw_state, timers, force=False):
+    start = _timer_start()
+    grad_present = any(p.grad is not None for p in buyer_model.parameters() if p.requires_grad)
+    _timer_add(timers, "update_grad_check_s", start)
+    if not grad_present:
+        return False, 0.0
+    start = _timer_start()
+    grad_norm = _optimizer_step(buyer_model, optimizer, cpu_adamw_state)
+    _timer_add(timers, "update_optimizer_s", start)
+    return True, grad_norm
+
+
+def _rowwise_sdpo_adv(pol_lp, teacher_lp, student_mask, teacher_mask):
+    """Align teacher/student completion log-prob gaps independently per row."""
+    sdpo_adv = torch.zeros_like(pol_lp)
+    total_tokens = 0
+    abs_adv = 0.0
+    for row in range(pol_lp.shape[0]):
+        student_idx = student_mask[row].bool().nonzero(as_tuple=False).flatten()
+        teacher_idx = teacher_mask[row].bool().nonzero(as_tuple=False).flatten()
+        n_align = min(student_idx.numel(), teacher_idx.numel())
+        if not n_align:
+            continue
+        s_idx = student_idx[:n_align]
+        t_idx = teacher_idx[:n_align]
+        sdpo_values = (teacher_lp[row, t_idx] - pol_lp.detach()[row, s_idx]).clamp(-SDPO_ADV_CLIP, SDPO_ADV_CLIP)
+        sdpo_adv[row, s_idx] = sdpo_values.to(sdpo_adv.dtype)
+        total_tokens += int(n_align)
+        abs_adv += float(sdpo_values.abs().sum().item())
+    return sdpo_adv, total_tokens, abs_adv
 
 
 def sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, device, cpu_adamw_state=None):
-    """Buyer-only GRPO update augmented with strict feedback-conditioned SDPO."""
+    """Buyer-only GRPO update augmented with strict feedback-conditioned SDPO.
+
+    Performance notes:
+    - Buyer turns are flattened to pre-tokenized update examples per GRPO group.
+    - Forward/backward runs over UPDATE_MICROBATCH_SIZE examples rather than one
+      buyer turn at a time, improving A100 occupancy.
+    - CPU AdamW steps every OPTIM_STEP_EVERY_GROUPS groups by default. Losses are
+      scaled by the active accumulation window to preserve update magnitude.
+    """
     buyer_model.train()
     cpu_adamw_state = {} if cpu_adamw_state is None else cpu_adamw_state
     G = GROUP_SIZE
@@ -1059,100 +1219,112 @@ def sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, dev
     sdpo_tokens = 0
     sdpo_abs_adv = 0.0
     sdpo_demo_count = 0
+    optimizer_steps = 0
+    grad_norm_last = 0.0
+    timers: Dict[str, float] = {
+        "update_pretokenize_s": 0.0,
+        "update_collate_s": 0.0,
+        "update_policy_forward_s": 0.0,
+        "update_ref_forward_s": 0.0,
+        "update_teacher_forward_s": 0.0,
+        "update_loss_backward_s": 0.0,
+        "update_optimizer_s": 0.0,
+        "update_grad_check_s": 0.0,
+    }
+
+    optim_every = max(1, OPTIM_STEP_EVERY_GROUPS)
+    accum_groups = 0
+    loss_count = 0
 
     for g in range(num_groups):
         group_eps = episodes[g * G : (g + 1) * G]
         rewards = torch.tensor([ep.reward for ep in group_eps], dtype=torch.float32, device=device)
         advantages = _norm_advantages(rewards - rewards.mean())
-        feedbacks = []
-        for ep in group_eps:
-            feedback, has_demo = build_sdpo_feedback(ep, group_eps)
-            feedbacks.append(feedback)
-            sdpo_demo_count += int(has_demo)
+        group_examples, demo_count = _build_group_update_examples(tokenizer, group_eps, advantages, timers)
+        sdpo_demo_count += demo_count
+        if not group_examples:
+            continue
 
+        group_turn_count = len(group_examples)
+        window_start_group = (g // optim_every) * optim_every
+        loss_scale_groups = max(1, min(optim_every, num_groups - window_start_group))
         for _inner in range(NUM_INNER_EPOCHS):
-            for i, ep in enumerate(group_eps):
-                for turn_idx, (role, text) in enumerate(ep.turns):
-                    if role != "buyer":
-                        continue
+            for mb_examples in _chunked(group_examples, UPDATE_MICROBATCH_SIZE):
+                start = _timer_start()
+                student_batch = _pad_encoded_batch([ex["student"] for ex in mb_examples], tokenizer, device)
+                teacher_batch = _pad_encoded_batch([ex["teacher"] for ex in mb_examples], tokenizer, device)
+                grpo_adv = torch.tensor([ex["grpo_adv"] for ex in mb_examples], dtype=torch.float32, device=device)
+                _timer_add(timers, "update_collate_s", start)
 
-                    prompt_msgs = build_buyer_turn_prompt(ep, turn_idx)
-                    prompt_text = tokenizer.apply_chat_template(
-                        prompt_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+                start = _timer_start()
+                pol_lp = _token_logprobs(buyer_model, student_batch["input_ids"], student_batch["attention_mask"])
+                _timer_add(timers, "update_policy_forward_s", start)
+
+                start = _timer_start()
+                with torch.no_grad():
+                    ref_lp = _token_logprobs(ref_model, student_batch["input_ids"], student_batch["attention_mask"])
+                _timer_add(timers, "update_ref_forward_s", start)
+
+                start = _timer_start()
+                with torch.no_grad():
+                    teacher_lp = _token_logprobs(
+                        buyer_model, teacher_batch["input_ids"], teacher_batch["attention_mask"]
                     )
-                    _assert_no_private_info_leak(prompt_text, ep.product, "buyer")
-                    full_text = prompt_text + text
+                _timer_add(timers, "update_teacher_forward_s", start)
 
-                    prompt_ids = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=2048)[
-                        "input_ids"
-                    ]
-                    prompt_len = prompt_ids.shape[1]
-                    full_enc = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=2048).to(device)
-                    ids = full_enc["input_ids"]
-                    attn = full_enc["attention_mask"]
+                student_mask = student_batch["completion_mask"]
+                teacher_mask = teacher_batch["completion_mask"]
+                sdpo_adv, n_align, mb_abs_adv = _rowwise_sdpo_adv(pol_lp, teacher_lp, student_mask, teacher_mask)
+                sdpo_abs_adv += mb_abs_adv
+                sdpo_tokens += n_align
 
-                    pol_lp = _token_logprobs(buyer_model, ids, attn)
-                    with torch.no_grad():
-                        ref_lp = _token_logprobs(ref_model, ids, attn)
+                adv = SDPO_LAMBDA * grpo_adv.view(-1, 1) + (1.0 - SDPO_LAMBDA) * sdpo_adv
+                log_ratio = (pol_lp - ref_lp).clamp(-5.0, 5.0)
+                ratio = torch.exp(log_ratio)
+                clipped = torch.clamp(ratio, 1 - EPSILON, 1 + EPSILON)
+                policy_loss = -torch.min(ratio * adv, clipped * adv)
+                if KL_COEF > 0:
+                    policy_loss = policy_loss + KL_COEF * log_ratio
 
-                    mask = attn[:, 1:].clone()
-                    mask[:, : prompt_len - 1] = 0
+                token_counts = student_mask.sum(dim=1).clamp_min(1.0)
+                row_losses = (policy_loss * student_mask).sum(dim=1) / token_counts
+                # Preserve the old per-turn averaged objective: each buyer turn
+                # contributes one mean-over-completion loss, and microbatching only
+                # changes how those turn losses are grouped into forward/backward calls.
+                unscaled_loss = row_losses.sum()
+                loss = unscaled_loss / loss_scale_groups
 
-                    teacher_prompt_msgs = build_sdpo_teacher_turn_prompt(ep, turn_idx, feedbacks[i])
-                    teacher_prompt_text = tokenizer.apply_chat_template(
-                        teacher_prompt_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
-                    )
-                    _assert_no_private_info_leak(teacher_prompt_text, ep.product, "buyer")
-                    teacher_full_text = teacher_prompt_text + text
-                    teacher_prompt_ids = tokenizer(
-                        teacher_prompt_text, return_tensors="pt", truncation=True, max_length=2048
-                    )["input_ids"]
-                    teacher_prompt_len = teacher_prompt_ids.shape[1]
-                    teacher_enc = tokenizer(
-                        teacher_full_text, return_tensors="pt", truncation=True, max_length=2048
-                    ).to(device)
-                    teacher_mask = teacher_enc["attention_mask"][:, 1:].clone()
-                    teacher_mask[:, : teacher_prompt_len - 1] = 0
-                    with torch.no_grad():
-                        teacher_lp = _token_logprobs(
-                            buyer_model, teacher_enc["input_ids"], teacher_enc["attention_mask"]
-                        )
-                        student_completion_lp = _completion_logprobs(pol_lp.detach(), mask)
-                        teacher_completion_lp = _completion_logprobs(teacher_lp, teacher_mask)
-                        n_align = min(student_completion_lp.numel(), teacher_completion_lp.numel())
-                        if n_align:
-                            sdpo_values = (
-                                teacher_completion_lp[:n_align] - student_completion_lp[:n_align]
-                            ).clamp(-SDPO_ADV_CLIP, SDPO_ADV_CLIP)
-                            sdpo_abs_adv += float(sdpo_values.abs().sum().item())
-                            sdpo_tokens += int(n_align)
-                        else:
-                            sdpo_values = torch.empty(0, dtype=pol_lp.dtype, device=device)
-                    sdpo_adv, _ = _scatter_completion_values(pol_lp.detach(), mask, sdpo_values)
+                start = _timer_start()
+                loss.backward()
+                _timer_add(timers, "update_loss_backward_s", start)
 
-                    grpo_adv = advantages[i]
-                    adv = SDPO_LAMBDA * grpo_adv + (1.0 - SDPO_LAMBDA) * sdpo_adv
-                    log_ratio = (pol_lp - ref_lp).clamp(-5.0, 5.0)
-                    ratio = torch.exp(log_ratio)
-                    clipped = torch.clamp(ratio, 1 - EPSILON, 1 + EPSILON)
-                    surr1 = ratio * adv
-                    surr2 = clipped * adv
-                    policy_loss = -torch.min(surr1, surr2)
-                    if KL_COEF > 0:
-                        policy_loss = policy_loss + KL_COEF * log_ratio
+                total_loss += float(row_losses.detach().sum().item())
+                loss_count += int(row_losses.numel())
 
-                    loss = (policy_loss * mask).sum() / (mask.sum() + 1e-8)
-                    loss.backward()
-                    total_loss += loss.item()
-                    turn_count += 1
+        turn_count += group_turn_count
+        accum_groups += 1
 
-            _optimizer_step(buyer_model, optimizer, cpu_adamw_state)
+        if accum_groups >= optim_every:
+            stepped, grad_norm_last = _maybe_optimizer_step(buyer_model, optimizer, cpu_adamw_state, timers)
+            if stepped:
+                optimizer_steps += 1
+            accum_groups = 0
+
+    if accum_groups > 0:
+        # If NUM_ITERS/BATCH_SIZE creates a remainder, take the final accumulated step.
+        stepped, grad_norm_last = _maybe_optimizer_step(buyer_model, optimizer, cpu_adamw_state, timers, force=True)
+        if stepped:
+            optimizer_steps += 1
 
     return {
-        "loss": total_loss / max(turn_count, 1),
+        "loss": total_loss / max(loss_count, 1),
         "sdpo_tokens": sdpo_tokens,
         "sdpo_mean_abs_adv": sdpo_abs_adv / max(sdpo_tokens, 1),
         "sdpo_demo_count": sdpo_demo_count,
+        "update_examples": turn_count,
+        "optimizer_steps": optimizer_steps,
+        "grad_norm_last": grad_norm_last,
+        **timers,
     }
 
 
@@ -1263,6 +1435,11 @@ def main():
         f"[CONFIG] SDPO_Lambda={SDPO_LAMBDA} FeedbackMode={SDPO_FEEDBACK_MODE} "
         f"AdvClip={SDPO_ADV_CLIP} MaxFeedbackChars={SDPO_MAX_FEEDBACK_CHARS} AdamWForeach={ADAMW_FOREACH}"
     )
+    print(
+        f"[CONFIG] UpdateMicrobatch={UPDATE_MICROBATCH_SIZE} "
+        f"OptimStepEveryGroups={OPTIM_STEP_EVERY_GROUPS} "
+        f"UpdatePadMultiple={UPDATE_PAD_TO_MULTIPLE_OF} UpdateMaxLength={UPDATE_MAX_LENGTH}"
+    )
     print(f"[CONFIG] CheckpointEvery={CHECKPOINT_EVERY} Hub={HUB_MODEL_ID or '(disabled)'}")
     print("=" * 70, flush=True)
 
@@ -1307,6 +1484,10 @@ def main():
                 "sdpo_max_feedback_chars": SDPO_MAX_FEEDBACK_CHARS,
                 "optimizer": OPTIMIZER,
                 "adamw_foreach": ADAMW_FOREACH,
+                "update_microbatch_size": UPDATE_MICROBATCH_SIZE,
+                "optim_step_every_groups": OPTIM_STEP_EVERY_GROUPS,
+                "update_pad_to_multiple_of": UPDATE_PAD_TO_MULTIPLE_OF,
+                "update_max_length": UPDATE_MAX_LENGTH,
                 "model_device_map": MODEL_DEVICE_MAP,
                 "max_memory_per_gpu_gib": MAX_MEMORY_PER_GPU_GIB,
                 "liger_kernel": USE_LIGER,
@@ -1433,7 +1614,22 @@ def main():
             f"demos={update_stats['sdpo_demo_count']}"
         )
         print(f"  FirstOfferRatio={iter_metrics['first_offer_ratio']} Overshoot={iter_metrics['price_overshoot_rate']:.1%}")
+        print(
+            f"  Update: examples={update_stats['update_examples']} "
+            f"optimizer_steps={update_stats['optimizer_steps']} grad_norm={update_stats['grad_norm_last']:.4f}"
+        )
         print(f"  Time={elapsed:.0f}s (rollout={rollout_time:.0f}s update={update_time:.0f}s)")
+        print(
+            "  Update timers: "
+            f"pretokenize={update_stats['update_pretokenize_s']:.1f}s "
+            f"collate={update_stats['update_collate_s']:.1f}s "
+            f"policy_fwd={update_stats['update_policy_forward_s']:.1f}s "
+            f"ref_fwd={update_stats['update_ref_forward_s']:.1f}s "
+            f"teacher_fwd={update_stats['update_teacher_forward_s']:.1f}s "
+            f"backward={update_stats['update_loss_backward_s']:.1f}s "
+            f"optimizer={update_stats['update_optimizer_s']:.1f}s "
+            f"grad_check={update_stats['update_grad_check_s']:.1f}s"
+        )
         print(f"  Outcomes: {dict(list(iter_metrics['outcomes'].items())[:6])}")
         if iter_metrics["role_confusions"]:
             print(f"  ⚠️ ROLE CONFUSIONS: {iter_metrics['role_confusions']}")
@@ -1446,9 +1642,20 @@ def main():
             "sdpo_tokens": update_stats["sdpo_tokens"],
             "sdpo_mean_abs_adv": update_stats["sdpo_mean_abs_adv"],
             "sdpo_demo_count": update_stats["sdpo_demo_count"],
+            "update_examples": update_stats["update_examples"],
+            "optimizer_steps": update_stats["optimizer_steps"],
+            "grad_norm_last": update_stats["grad_norm_last"],
             "time": elapsed,
             "rollout_time": rollout_time,
             "update_time": update_time,
+            "update_pretokenize_s": update_stats["update_pretokenize_s"],
+            "update_collate_s": update_stats["update_collate_s"],
+            "update_policy_forward_s": update_stats["update_policy_forward_s"],
+            "update_ref_forward_s": update_stats["update_ref_forward_s"],
+            "update_teacher_forward_s": update_stats["update_teacher_forward_s"],
+            "update_loss_backward_s": update_stats["update_loss_backward_s"],
+            "update_optimizer_s": update_stats["update_optimizer_s"],
+            "update_grad_check_s": update_stats["update_grad_check_s"],
             "vram_current_gb": current_vram,
             "vram_peak_gb": peak_vram,
         }
@@ -1471,6 +1678,17 @@ def main():
                         "perf/iter_time_s": elapsed,
                         "perf/rollout_time_s": rollout_time,
                         "perf/update_time_s": update_time,
+                        "perf/update_pretokenize_s": update_stats["update_pretokenize_s"],
+                        "perf/update_collate_s": update_stats["update_collate_s"],
+                        "perf/update_policy_forward_s": update_stats["update_policy_forward_s"],
+                        "perf/update_ref_forward_s": update_stats["update_ref_forward_s"],
+                        "perf/update_teacher_forward_s": update_stats["update_teacher_forward_s"],
+                        "perf/update_loss_backward_s": update_stats["update_loss_backward_s"],
+                        "perf/update_optimizer_s": update_stats["update_optimizer_s"],
+                        "perf/update_grad_check_s": update_stats["update_grad_check_s"],
+                        "perf/update_examples": update_stats["update_examples"],
+                        "perf/optimizer_steps": update_stats["optimizer_steps"],
+                        "train/grad_norm_last": update_stats["grad_norm_last"],
                         "perf/vram_gb": current_vram,
                         "perf/vram_peak_gb": peak_vram,
                         "sanity/role_confusions": iter_metrics["role_confusions"],
