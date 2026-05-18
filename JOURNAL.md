@@ -1171,7 +1171,10 @@ Default serious-run config in the script:
 | Batch × group | `16 × 8 = 128` episodes/iter |
 | Max turns | `6` |
 | Max new tokens/turn | `300` |
-| LR | `1e-6` |
+| LR | `2e-6` with `WARMUP_STEPS=10` linear warmup |
+| Weight decay | `0.01` AdamW |
+| Gradient clip | `GRAD_CLIP_NORM=1.0` |
+| Rollout/update context | `ROLLOUT_MAX_LENGTH=3072`, `UPDATE_MAX_LENGTH=3072` |
 | PPO clip epsilon | `0.2` config retained, unused in the ref-free on-policy update |
 | KL/reference coefficient | `0.0`; no reference-policy model or KL term |
 | SDPO mix | `SDPO_LAMBDA=0.9` → 90% GRPO scalar advantage, 10% SDPO token advantage |
@@ -1269,7 +1272,7 @@ Rollouts are turn-parallel across active episodes:
 - all active buyer prompts are generated in batches, then all active seller prompts;
 - finished episodes are masked out of later turns;
 - tokenizer uses left padding only inside generation and restores the previous padding side afterward;
-- generation truncates prompts at `max_length=2048`, samples with `top_p=1.0`, `repetition_penalty=1.1`, and strips native Qwen think blocks before saving history;
+- generation truncates prompts at `ROLLOUT_MAX_LENGTH=3072`, samples with `top_p=1.0`, `repetition_penalty=1.1`, and strips native Qwen think blocks before saving history;
 - `enable_thinking=False` is passed to `apply_chat_template()` for both buyer and seller prompts.
 
 This preserves the v8/v10 batched-generation speedup while adding SDPO bookkeeping only during the update phase.
@@ -1369,7 +1372,7 @@ Implemented the planned SDPO update-path speedups for `train_negotiation_sdpo.py
 - Added update controls:
   - `UPDATE_MICROBATCH_SIZE=4` default: batches flattened buyer-turn examples during the update forward/backward path.
   - `OPTIM_STEP_EVERY_GROUPS=16` default: accumulates across the 16 GRPO groups in the production `BATCH_SIZE=16, GROUP_SIZE=8` iteration and performs one CPU AdamW step per iteration.
-  - `UPDATE_PAD_TO_MULTIPLE_OF=8` and `UPDATE_MAX_LENGTH=2048` for efficient update collation.
+  - `UPDATE_PAD_TO_MULTIPLE_OF=8` and `UPDATE_MAX_LENGTH=3072` for efficient update collation with less prompt truncation.
 - Flattened each GRPO group into pre-tokenized buyer-turn examples:
   - original buyer prompt + sampled completion;
   - hindsight-feedback teacher prompt + same sampled completion;
@@ -1456,7 +1459,7 @@ This makes the update closer to both paper defaults:
 - Negotiation RLVR Table 5: `KL penalty = 0`.
 - SDPO: self-teacher = current policy conditioned on feedback; no external/frozen reference teacher is required.
 
-Loss values are no longer numerically comparable to the previous fixed-reference clipped-ratio loss. Reward, deal rate, overshoot, format errors, gradient norm, and W&B phase timers are the primary metrics to watch.
+Loss values are no longer numerically comparable to the previous fixed-reference clipped-ratio loss. Reward, deal rate, overshoot, format errors, gradient norm, active learning rate, and W&B phase timers are the primary metrics to watch.
 
 ### Ref-free smoke validation
 
@@ -1465,3 +1468,16 @@ Loss values are no longer numerically comparable to the previous fixed-reference
 - Smoke model/metrics: [`ZeterMordio/anchor-negotiation-sdpo-ref-free-smoke`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-ref-free-smoke)
 - Config: `Qwen/Qwen3-0.6B`, `NUM_ITERS=1`, `BATCH_SIZE=1`, `GROUP_SIZE=2`, `MAX_TURNS=1`, `MAX_NEW_TOKENS=32`, `KL_COEF=0.0`, `UPDATE_MICROBATCH_SIZE=4`, `OPTIM_STEP_EVERY_GROUPS=16`, `UPDATE_MAX_LENGTH=512`, `OPTIMIZER=adamw_cpu`.
 - Result: completed in 24.0s and pushed the final checkpoint. Logs confirm `RefFree=True`, no reference-policy model load, `ref_fwd=0.0s(ref-free)`, `objective/ref_free=1`, `objective/reference_model_used=0`, and one CPU AdamW optimizer step. The tiny truncating rollout produced buyer format errors as expected for smoke-only settings, but the update path, metrics logging, W&B sync, and Hub push succeeded.
+
+---
+
+## 2026-05-18: SDPO Serious-Run Optimizer Defaults
+
+Updated the SDPO defaults for the next serious Qwen3-8B ref-free run:
+
+- `LR=2e-6`: still near the repo's proven-stable dense-Qwen `1e-6`, but slightly less timid now that the update is batched, ref-free, gradient-clipped, and warmed up. Kept far below the negotiation paper's `3e-5`, which previously collapsed dense Qwen in this repo.
+- `WARMUP_STEPS=10`: with one CPU AdamW step per production-shaped iteration, this warms over roughly the first quarter of a 42-iteration run.
+- `WEIGHT_DECAY=0.01`: standard mild AdamW decay for full-parameter tuning, now applied in both CPU-state AdamW and CUDA AdamW paths.
+- `GRAD_CLIP_NORM=1.0`: made the existing hardcoded clip configurable and logged.
+- `ROLLOUT_MAX_LENGTH=3072`, `UPDATE_MAX_LENGTH=3072`: modestly reduces prompt truncation for 6-turn, 300-token negotiations while avoiding the memory hit of jumping straight to 4096.
+- W&B / metrics now include `train/optimizer_global_step`, active optimizer LR as `train/lr`, and `lr_last`, useful during warmup.

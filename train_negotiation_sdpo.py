@@ -78,7 +78,12 @@ NUM_ITERS = int(os.environ.get("NUM_ITERS", "42"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 GROUP_SIZE = int(os.environ.get("GROUP_SIZE", "8"))
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "6"))
-LR = float(os.environ.get("LR", "1e-6"))
+# Dense Qwen RLVR collapsed at 3e-5 in this repo; 2e-6 is a modest step up
+# from the proven-stable 1e-6 default, cushioned by warmup, clipping, and wd.
+LR = float(os.environ.get("LR", "2e-6"))
+WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.01"))
+WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", "10"))
+GRAD_CLIP_NORM = float(os.environ.get("GRAD_CLIP_NORM", "1.0"))
 EPSILON = float(os.environ.get("EPSILON", "0.2"))
 # True ref-free/on-policy SDPO+GRPO: no frozen reference-policy forward is
 # used in the update. Keep the env var for run metadata/backward-compatible
@@ -126,7 +131,8 @@ OPTIMIZER = os.environ.get("OPTIMIZER", "adamw_cpu").lower()
 UPDATE_MICROBATCH_SIZE = int(os.environ.get("UPDATE_MICROBATCH_SIZE", "4"))
 OPTIM_STEP_EVERY_GROUPS = int(os.environ.get("OPTIM_STEP_EVERY_GROUPS", "16"))
 UPDATE_PAD_TO_MULTIPLE_OF = int(os.environ.get("UPDATE_PAD_TO_MULTIPLE_OF", "8"))
-UPDATE_MAX_LENGTH = int(os.environ.get("UPDATE_MAX_LENGTH", "2048"))
+ROLLOUT_MAX_LENGTH = int(os.environ.get("ROLLOUT_MAX_LENGTH", "3072"))
+UPDATE_MAX_LENGTH = int(os.environ.get("UPDATE_MAX_LENGTH", "3072"))
 # Experimental SDPO/SDRO design metadata for run naming and W&B config. These do
 # not alter the current token-level SDPO objective unless corresponding code is
 # added/enabled in a future ablation.
@@ -646,7 +652,7 @@ def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device)
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=2048,
+            max_length=ROLLOUT_MAX_LENGTH,
         ).to(device)
         tokenizer.padding_side = orig_side
 
@@ -1016,7 +1022,18 @@ def build_sdpo_teacher_turn_prompt(ep, turn_idx, feedback):
     return prompt_msgs
 
 
-def _cpu_adamw_step(params, state, lr=LR, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.0):
+def _current_lr(step_idx):
+    """Linear warmup only; no decay for the short 42-step RLVR run.
+
+    ``step_idx`` is the zero-based optimizer-step index. With WARMUP_STEPS=10,
+    the first step uses 10% of LR and the 10th step reaches the configured LR.
+    """
+    if WARMUP_STEPS <= 0:
+        return LR
+    return LR * min(1.0, float(step_idx + 1) / float(WARMUP_STEPS))
+
+
+def _cpu_adamw_step(params, state, lr, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=WEIGHT_DECAY):
     """Exact AdamW step with optimizer state kept on CPU.
 
     This preserves full fine-tuning and AdamW semantics while removing ~2x
@@ -1046,22 +1063,27 @@ def _cpu_adamw_step(params, state, lr=LR, beta1=0.9, beta2=0.95, eps=1e-8, weigh
             bias_correction2 = 1.0 - beta2 ** st["step"]
             denom = (exp_avg_sq.sqrt() / (bias_correction2 ** 0.5)).add_(eps)
             update = exp_avg / bias_correction1 / denom
-            if weight_decay:
-                update.add_(p.detach().to(device="cpu", dtype=torch.float32), alpha=weight_decay)
             update = update.to(device=p.device, dtype=p.dtype)
+            if weight_decay:
+                # Decoupled AdamW decay: p <- p * (1 - lr * wd), independent of
+                # the adaptive gradient update. This mirrors torch.optim.AdamW.
+                p.add_(p, alpha=-lr * weight_decay)
             p.add_(update, alpha=-lr)
             p.grad = None
             del grad, update
 
 
-def _optimizer_step(buyer_model, optimizer, cpu_adamw_state):
-    grad_norm = torch.nn.utils.clip_grad_norm_(buyer_model.parameters(), 1.0)
+def _optimizer_step(buyer_model, optimizer, cpu_adamw_state, step_idx):
+    grad_norm = torch.nn.utils.clip_grad_norm_(buyer_model.parameters(), GRAD_CLIP_NORM)
+    step_lr = _current_lr(step_idx)
     if OPTIMIZER == "adamw_cpu":
-        _cpu_adamw_step([p for p in buyer_model.parameters() if p.requires_grad], cpu_adamw_state)
+        _cpu_adamw_step([p for p in buyer_model.parameters() if p.requires_grad], cpu_adamw_state, lr=step_lr)
     else:
+        for group in optimizer.param_groups:
+            group["lr"] = step_lr
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-    return float(grad_norm.detach().cpu().item() if torch.is_tensor(grad_norm) else grad_norm)
+    return float(grad_norm.detach().cpu().item() if torch.is_tensor(grad_norm) else grad_norm), step_lr
 
 
 def _encode_prompt_completion(tokenizer, prompt_text, completion_text):
@@ -1171,16 +1193,16 @@ def _build_group_update_examples(tokenizer, group_eps, advantages, timers):
     return examples, sdpo_demo_count
 
 
-def _maybe_optimizer_step(buyer_model, optimizer, cpu_adamw_state, timers, force=False):
+def _maybe_optimizer_step(buyer_model, optimizer, cpu_adamw_state, timers, step_idx, force=False):
     start = _timer_start()
     grad_present = any(p.grad is not None for p in buyer_model.parameters() if p.requires_grad)
     _timer_add(timers, "update_grad_check_s", start)
     if not grad_present:
-        return False, 0.0
+        return False, 0.0, _current_lr(step_idx)
     start = _timer_start()
-    grad_norm = _optimizer_step(buyer_model, optimizer, cpu_adamw_state)
+    grad_norm, step_lr = _optimizer_step(buyer_model, optimizer, cpu_adamw_state, step_idx)
     _timer_add(timers, "update_optimizer_s", start)
-    return True, grad_norm
+    return True, grad_norm, step_lr
 
 
 def _rowwise_sdpo_adv(pol_lp, teacher_lp, student_mask, teacher_mask):
@@ -1203,7 +1225,9 @@ def _rowwise_sdpo_adv(pol_lp, teacher_lp, student_mask, teacher_mask):
     return sdpo_adv, total_tokens, abs_adv
 
 
-def sdpo_grpo_update(buyer_model, tokenizer, episodes, optimizer, device, cpu_adamw_state=None):
+def sdpo_grpo_update(
+    buyer_model, tokenizer, episodes, optimizer, device, cpu_adamw_state=None, optimizer_step_start=0
+):
     """Buyer-only ref-free/on-policy GRPO update plus feedback-conditioned SDPO.
 
     Performance notes:
@@ -1230,6 +1254,8 @@ def sdpo_grpo_update(buyer_model, tokenizer, episodes, optimizer, device, cpu_ad
     sdpo_demo_count = 0
     optimizer_steps = 0
     grad_norm_last = 0.0
+    global_step = int(optimizer_step_start)
+    lr_last = _current_lr(global_step)
     timers: Dict[str, float] = {
         "update_pretokenize_s": 0.0,
         "update_collate_s": 0.0,
@@ -1305,16 +1331,22 @@ def sdpo_grpo_update(buyer_model, tokenizer, episodes, optimizer, device, cpu_ad
         accum_groups += 1
 
         if accum_groups >= optim_every:
-            stepped, grad_norm_last = _maybe_optimizer_step(buyer_model, optimizer, cpu_adamw_state, timers)
+            stepped, grad_norm_last, lr_last = _maybe_optimizer_step(
+                buyer_model, optimizer, cpu_adamw_state, timers, global_step
+            )
             if stepped:
                 optimizer_steps += 1
+                global_step += 1
             accum_groups = 0
 
     if accum_groups > 0:
         # If NUM_ITERS/BATCH_SIZE creates a remainder, take the final accumulated step.
-        stepped, grad_norm_last = _maybe_optimizer_step(buyer_model, optimizer, cpu_adamw_state, timers, force=True)
+        stepped, grad_norm_last, lr_last = _maybe_optimizer_step(
+            buyer_model, optimizer, cpu_adamw_state, timers, global_step, force=True
+        )
         if stepped:
             optimizer_steps += 1
+            global_step += 1
 
     return {
         "loss": total_loss / max(loss_count, 1),
@@ -1323,7 +1355,9 @@ def sdpo_grpo_update(buyer_model, tokenizer, episodes, optimizer, device, cpu_ad
         "sdpo_demo_count": sdpo_demo_count,
         "update_examples": turn_count,
         "optimizer_steps": optimizer_steps,
+        "optimizer_global_step": global_step,
         "grad_norm_last": grad_norm_last,
+        "lr_last": lr_last,
         **timers,
     }
 
@@ -1426,9 +1460,10 @@ def main():
     print("[CONFIG] Negotiation SDPO+GRPO buyer-only training")
     print(f"[CONFIG] BuyerModel={MODEL_NAME} SellerModel={SELLER_MODEL_NAME}")
     print(f"[CONFIG] Iters={NUM_ITERS} Batch={BATCH_SIZE} Group={GROUP_SIZE} Episodes/iter={BATCH_SIZE*GROUP_SIZE}")
-    print(f"[CONFIG] Turns={MAX_TURNS} LR={LR} RefFree=True KL={KL_COEF} Eps={EPSILON} (unused ref-free)")
+    print(f"[CONFIG] Turns={MAX_TURNS} LR={LR} WarmupSteps={WARMUP_STEPS} WD={WEIGHT_DECAY} GradClip={GRAD_CLIP_NORM}")
+    print(f"[CONFIG] RefFree=True KL={KL_COEF} Eps={EPSILON} (unused ref-free)")
     print(f"[CONFIG] BuyerTemp={BUYER_TEMP} SellerTemp={SELLER_TEMP} MaxNew={MAX_NEW_TOKENS}")
-    print(f"[CONFIG] GradCheckpoint={GRADIENT_CHECKPOINTING} GenBatchLimit={GEN_BATCH_LIMIT}")
+    print(f"[CONFIG] GradCheckpoint={GRADIENT_CHECKPOINTING} GenBatchLimit={GEN_BATCH_LIMIT} RolloutMaxLength={ROLLOUT_MAX_LENGTH}")
     print(f"[CONFIG] DeviceMap={MODEL_DEVICE_MAP} MaxMemoryPerGPUGiB={MAX_MEMORY_PER_GPU_GIB or '(unset)'}")
     print(f"[CONFIG] InnerEpochs={NUM_INNER_EPOCHS} NormAdvantages={NORMALIZE_ADVANTAGES}")
     print(
@@ -1465,6 +1500,9 @@ def main():
                 "group_size": GROUP_SIZE,
                 "max_turns": MAX_TURNS,
                 "lr": LR,
+                "weight_decay": WEIGHT_DECAY,
+                "warmup_steps": WARMUP_STEPS,
+                "grad_clip_norm": GRAD_CLIP_NORM,
                 "epsilon": EPSILON,
                 "kl_coef": KL_COEF,
                 "ref_free_objective": True,
@@ -1489,6 +1527,7 @@ def main():
                 "update_microbatch_size": UPDATE_MICROBATCH_SIZE,
                 "optim_step_every_groups": OPTIM_STEP_EVERY_GROUPS,
                 "update_pad_to_multiple_of": UPDATE_PAD_TO_MULTIPLE_OF,
+                "rollout_max_length": ROLLOUT_MAX_LENGTH,
                 "update_max_length": UPDATE_MAX_LENGTH,
                 "model_device_map": MODEL_DEVICE_MAP,
                 "max_memory_per_gpu_gib": MAX_MEMORY_PER_GPU_GIB,
@@ -1538,7 +1577,8 @@ def main():
     print(f"  [OK] VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
 
     print(
-        f"\n[5/5] Optimizer (AdamW, lr={LR}, betas=(0.9,0.95), wd=0.0, "
+        f"\n[5/5] Optimizer (AdamW, lr={LR}, warmup_steps={WARMUP_STEPS}, "
+        f"betas=(0.9,0.95), wd={WEIGHT_DECAY}, grad_clip={GRAD_CLIP_NORM}, "
         f"optimizer={OPTIMIZER}, foreach={ADAMW_FOREACH})..."
     )
     if OPTIMIZER == "adamw_cpu":
@@ -1550,7 +1590,7 @@ def main():
             buyer_model.parameters(),
             lr=LR,
             betas=(0.9, 0.95),
-            weight_decay=0.0,
+            weight_decay=WEIGHT_DECAY,
             foreach=ADAMW_FOREACH,
         )
         cpu_adamw_state = None
@@ -1561,6 +1601,7 @@ def main():
 
     print(f"\n{'=' * 70}\nNEGOTIATION SDPO+GRPO TRAINING\n{'=' * 70}")
     metrics = []
+    optimizer_global_step = 0
     t0 = time.time()
 
     for iteration in range(NUM_ITERS):
@@ -1584,7 +1625,10 @@ def main():
 
         buyer_model.train()
         print("  SDPO+GRPO update on buyer turns only...")
-        update_stats = sdpo_grpo_update(buyer_model, tokenizer, episodes, optimizer, dev, cpu_adamw_state)
+        update_stats = sdpo_grpo_update(
+            buyer_model, tokenizer, episodes, optimizer, dev, cpu_adamw_state, optimizer_global_step
+        )
+        optimizer_global_step = update_stats["optimizer_global_step"]
         loss = update_stats["loss"]
         torch.cuda.empty_cache()
         gc.collect()
@@ -1609,7 +1653,8 @@ def main():
         print(f"  FirstOfferRatio={iter_metrics['first_offer_ratio']} Overshoot={iter_metrics['price_overshoot_rate']:.1%}")
         print(
             f"  Update: examples={update_stats['update_examples']} "
-            f"optimizer_steps={update_stats['optimizer_steps']} grad_norm={update_stats['grad_norm_last']:.4f}"
+            f"optimizer_steps={update_stats['optimizer_steps']} lr={update_stats['lr_last']:.2e} "
+            f"grad_norm={update_stats['grad_norm_last']:.4f}"
         )
         print(f"  Time={elapsed:.0f}s (rollout={rollout_time:.0f}s update={update_time:.0f}s)")
         print(
@@ -1637,6 +1682,8 @@ def main():
             "sdpo_demo_count": update_stats["sdpo_demo_count"],
             "update_examples": update_stats["update_examples"],
             "optimizer_steps": update_stats["optimizer_steps"],
+            "optimizer_global_step": update_stats["optimizer_global_step"],
+            "lr_last": update_stats["lr_last"],
             "grad_norm_last": update_stats["grad_norm_last"],
             "time": elapsed,
             "rollout_time": rollout_time,
@@ -1684,6 +1731,8 @@ def main():
                         "perf/update_grad_check_s": update_stats["update_grad_check_s"],
                         "perf/update_examples": update_stats["update_examples"],
                         "perf/optimizer_steps": update_stats["optimizer_steps"],
+                        "train/optimizer_global_step": update_stats["optimizer_global_step"],
+                        "train/lr": update_stats["lr_last"],
                         "train/grad_norm_last": update_stats["grad_norm_last"],
                         "perf/vram_gb": current_vram,
                         "perf/vram_peak_gb": peak_vram,
