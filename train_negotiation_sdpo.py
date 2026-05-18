@@ -6,7 +6,7 @@ It keeps the negotiation paper's buyer-only RLVR setup but augments the buyer
 update with Self-Distillation Policy Optimization (SDPO):
 
 - Trainable buyer policy.
-- Frozen regulated seller / reference model as the environment counterparty.
+- Frozen regulated seller model as the environment counterparty; no reference-policy model.
 - Buyer always starts; only buyer turns receive updates.
 - Verifiable reward remains the paper's economic-surplus scalar.
 - SDPO adds feedback-conditioned self-teacher log-probs for dense token credit.
@@ -80,7 +80,10 @@ GROUP_SIZE = int(os.environ.get("GROUP_SIZE", "8"))
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "6"))
 LR = float(os.environ.get("LR", "1e-6"))
 EPSILON = float(os.environ.get("EPSILON", "0.2"))
-KL_COEF = float(os.environ.get("KL_COEF", "0.01"))
+# True ref-free/on-policy SDPO+GRPO: no frozen reference-policy forward is
+# used in the update. Keep the env var for run metadata/backward-compatible
+# launch commands, but default to the paper-aligned no-KL setting.
+KL_COEF = float(os.environ.get("KL_COEF", "0.0"))
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "300"))
 BUYER_TEMP = float(os.environ.get("BUYER_TEMP", "1.0"))
 SELLER_TEMP = float(os.environ.get("SELLER_TEMP", "0.7"))  # paper Table 5
@@ -1200,8 +1203,8 @@ def _rowwise_sdpo_adv(pol_lp, teacher_lp, student_mask, teacher_mask):
     return sdpo_adv, total_tokens, abs_adv
 
 
-def sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, device, cpu_adamw_state=None):
-    """Buyer-only GRPO update augmented with strict feedback-conditioned SDPO.
+def sdpo_grpo_update(buyer_model, tokenizer, episodes, optimizer, device, cpu_adamw_state=None):
+    """Buyer-only ref-free/on-policy GRPO update plus feedback-conditioned SDPO.
 
     Performance notes:
     - Buyer turns are flattened to pre-tokenized update examples per GRPO group.
@@ -1209,6 +1212,12 @@ def sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, dev
       buyer turn at a time, improving A100 occupancy.
     - CPU AdamW steps every OPTIM_STEP_EVERY_GROUPS groups by default. Losses are
       scaled by the active accumulation window to preserve update magnitude.
+
+    Objective note:
+    - This is true ref-free/on-policy training: no frozen reference-policy model,
+      no reference forward, and no KL penalty. The loss is the sampled-token policy
+      gradient ``-A * log πθ(token)`` over buyer completion tokens. The SDPO
+      self-teacher is still the current buyer model under hindsight feedback.
     """
     buyer_model.train()
     cpu_adamw_state = {} if cpu_adamw_state is None else cpu_adamw_state
@@ -1225,6 +1234,7 @@ def sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, dev
         "update_pretokenize_s": 0.0,
         "update_collate_s": 0.0,
         "update_policy_forward_s": 0.0,
+        # Retained as a zero-valued schema-compatible metric for old dashboards.
         "update_ref_forward_s": 0.0,
         "update_teacher_forward_s": 0.0,
         "update_loss_backward_s": 0.0,
@@ -1262,11 +1272,6 @@ def sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, dev
 
                 start = _timer_start()
                 with torch.no_grad():
-                    ref_lp = _token_logprobs(ref_model, student_batch["input_ids"], student_batch["attention_mask"])
-                _timer_add(timers, "update_ref_forward_s", start)
-
-                start = _timer_start()
-                with torch.no_grad():
                     teacher_lp = _token_logprobs(
                         buyer_model, teacher_batch["input_ids"], teacher_batch["attention_mask"]
                     )
@@ -1278,13 +1283,8 @@ def sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, dev
                 sdpo_abs_adv += mb_abs_adv
                 sdpo_tokens += n_align
 
-                adv = SDPO_LAMBDA * grpo_adv.view(-1, 1) + (1.0 - SDPO_LAMBDA) * sdpo_adv
-                log_ratio = (pol_lp - ref_lp).clamp(-5.0, 5.0)
-                ratio = torch.exp(log_ratio)
-                clipped = torch.clamp(ratio, 1 - EPSILON, 1 + EPSILON)
-                policy_loss = -torch.min(ratio * adv, clipped * adv)
-                if KL_COEF > 0:
-                    policy_loss = policy_loss + KL_COEF * log_ratio
+                adv = (SDPO_LAMBDA * grpo_adv.view(-1, 1) + (1.0 - SDPO_LAMBDA) * sdpo_adv).detach()
+                policy_loss = -adv * pol_lp
 
                 token_counts = student_mask.sum(dim=1).clamp_min(1.0)
                 row_losses = (policy_loss * student_mask).sum(dim=1) / token_counts
@@ -1426,7 +1426,7 @@ def main():
     print("[CONFIG] Negotiation SDPO+GRPO buyer-only training")
     print(f"[CONFIG] BuyerModel={MODEL_NAME} SellerModel={SELLER_MODEL_NAME}")
     print(f"[CONFIG] Iters={NUM_ITERS} Batch={BATCH_SIZE} Group={GROUP_SIZE} Episodes/iter={BATCH_SIZE*GROUP_SIZE}")
-    print(f"[CONFIG] Turns={MAX_TURNS} LR={LR} Eps={EPSILON} KL={KL_COEF}")
+    print(f"[CONFIG] Turns={MAX_TURNS} LR={LR} RefFree=True KL={KL_COEF} Eps={EPSILON} (unused ref-free)")
     print(f"[CONFIG] BuyerTemp={BUYER_TEMP} SellerTemp={SELLER_TEMP} MaxNew={MAX_NEW_TOKENS}")
     print(f"[CONFIG] GradCheckpoint={GRADIENT_CHECKPOINTING} GenBatchLimit={GEN_BATCH_LIMIT}")
     print(f"[CONFIG] DeviceMap={MODEL_DEVICE_MAP} MaxMemoryPerGPUGiB={MAX_MEMORY_PER_GPU_GIB or '(unset)'}")
@@ -1457,7 +1457,7 @@ def main():
             tags=WANDB_TAGS,
             save_code=False,
             config={
-                "method": "negotiation_sdpo_grpo",
+                "method": "negotiation_sdpo_grpo_ref_free",
                 "buyer_model": MODEL_NAME,
                 "seller_model": SELLER_MODEL_NAME,
                 "num_iters": NUM_ITERS,
@@ -1467,6 +1467,8 @@ def main():
                 "lr": LR,
                 "epsilon": EPSILON,
                 "kl_coef": KL_COEF,
+                "ref_free_objective": True,
+                "reference_model_used": False,
                 "max_new_tokens": MAX_NEW_TOKENS,
                 "buyer_temp": BUYER_TEMP,
                 "seller_temp": SELLER_TEMP,
@@ -1524,7 +1526,7 @@ def main():
     dev = _model_input_device(buyer_model)
     print(f"  [OK] InputDevice={dev} FirstParamDevice={_first_model_device(buyer_model)} VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
 
-    print("\n[4/5] Loading frozen seller/reference model...")
+    print("\n[4/5] Loading frozen seller/environment model (no reference-policy model)...")
     seller_model = AutoModelForCausalLM.from_pretrained(
         SELLER_MODEL_NAME,
         **_model_load_kwargs(),
@@ -1533,15 +1535,6 @@ def main():
     seller_model.eval()
     for p in seller_model.parameters():
         p.requires_grad = False
-    ref_model = seller_model if SELLER_MODEL_NAME == MODEL_NAME else AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **_model_load_kwargs(),
-    )
-    if ref_model is not seller_model:
-        _assert_no_cpu_offload(ref_model, "ref_model")
-        ref_model.eval()
-        for p in ref_model.parameters():
-            p.requires_grad = False
     print(f"  [OK] VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
 
     print(
@@ -1591,7 +1584,7 @@ def main():
 
         buyer_model.train()
         print("  SDPO+GRPO update on buyer turns only...")
-        update_stats = sdpo_grpo_update(buyer_model, ref_model, tokenizer, episodes, optimizer, dev, cpu_adamw_state)
+        update_stats = sdpo_grpo_update(buyer_model, tokenizer, episodes, optimizer, dev, cpu_adamw_state)
         loss = update_stats["loss"]
         torch.cuda.empty_cache()
         gc.collect()
@@ -1624,7 +1617,7 @@ def main():
             f"pretokenize={update_stats['update_pretokenize_s']:.1f}s "
             f"collate={update_stats['update_collate_s']:.1f}s "
             f"policy_fwd={update_stats['update_policy_forward_s']:.1f}s "
-            f"ref_fwd={update_stats['update_ref_forward_s']:.1f}s "
+            f"ref_fwd={update_stats['update_ref_forward_s']:.1f}s(ref-free) "
             f"teacher_fwd={update_stats['update_teacher_forward_s']:.1f}s "
             f"backward={update_stats['update_loss_backward_s']:.1f}s "
             f"optimizer={update_stats['update_optimizer_s']:.1f}s "
@@ -1678,6 +1671,9 @@ def main():
                         "perf/iter_time_s": elapsed,
                         "perf/rollout_time_s": rollout_time,
                         "perf/update_time_s": update_time,
+                        "objective/ref_free": 1,
+                        "objective/reference_model_used": 0,
+                        "objective/kl_coef": KL_COEF,
                         "perf/update_pretokenize_s": update_stats["update_pretokenize_s"],
                         "perf/update_collate_s": update_stats["update_collate_s"],
                         "perf/update_policy_forward_s": update_stats["update_policy_forward_s"],
@@ -1704,14 +1700,14 @@ def main():
                 if iter_metrics["mean_reward"] < -0.5:
                     wandb.alert(
                         "low_reward_warning",
-                        f"reward={iter_metrics['mean_reward']:.4f} at iter={iteration}; if persistent, reduce LR or increase KL anchor",
+                        f"reward={iter_metrics['mean_reward']:.4f} at iter={iteration}; if persistent, reduce LR or lower SDPO weight",
                         level=wandb.AlertLevel.WARN,
                     )
                 fmt_errors = iter_metrics["outcomes"].get("BUYER_FORMAT_ERROR", 0)
                 if fmt_errors > 0.25 * n_episodes:
                     wandb.alert(
                         "format_collapse_warning",
-                        f"buyer_format_errors={fmt_errors}/{n_episodes} at iter={iteration}; try LR x0.1 or KL x2",
+                        f"buyer_format_errors={fmt_errors}/{n_episodes} at iter={iteration}; try LR x0.1 or SDPO_LAMBDA closer to 1.0",
                         level=wandb.AlertLevel.WARN,
                     )
             except Exception as e:

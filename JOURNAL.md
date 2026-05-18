@@ -1156,7 +1156,7 @@ _Note: the repository currently has `train_negotiation_sdpo.py`; there is no sep
 The SDPO script is still a **buyer-only negotiation-RLVR setup**, not SPIRAL self-play:
 
 - The **buyer policy** is trainable full-parameter Qwen CausalLM.
-- The **seller/reference model** is frozen and regulated by the environment.
+- The **seller/environment model** is frozen and regulated by the environment; the current script is ref-free and does not load a separate reference-policy model.
 - Buyer always starts; only buyer turns get gradient updates.
 - Seller generation remains at paper-style `SELLER_TEMP=0.7`; buyer exploration stays `BUYER_TEMP=1.0`.
 - Economic reward is unchanged from the pure script: `(budget - final_price) / abs(budget - cost)`, clipped to `[-1, 1]`; format/protocol/budget failures are `-1`; no-deal/quit/timeouts are `0`.
@@ -1166,14 +1166,14 @@ Default serious-run config in the script:
 | Parameter | Default |
 |-----------|---------|
 | Buyer model | `Qwen/Qwen3-8B` |
-| Seller/reference | same as buyer unless `SELLER_MODEL_NAME` overrides |
+| Seller/environment | same as buyer unless `SELLER_MODEL_NAME` overrides; no reference-policy model |
 | Iters | `42` |
 | Batch × group | `16 × 8 = 128` episodes/iter |
 | Max turns | `6` |
 | Max new tokens/turn | `300` |
 | LR | `1e-6` |
-| PPO clip epsilon | `0.2` |
-| KL/reference coefficient | `0.01` |
+| PPO clip epsilon | `0.2` config retained, unused in the ref-free on-policy update |
+| KL/reference coefficient | `0.0`; no reference-policy model or KL term |
 | SDPO mix | `SDPO_LAMBDA=0.9` → 90% GRPO scalar advantage, 10% SDPO token advantage |
 | Feedback mode | `strict` by default; `oracle` is explicit ablation only |
 | SDPO advantage clip | `±5.0` token logprob gap |
@@ -1203,11 +1203,10 @@ For each buyer turn in each episode:
 
 1. Reconstruct the original buyer prompt with `build_buyer_turn_prompt()`.
 2. Compute policy token logprobs on `prompt + actual_completion`.
-3. Compute frozen reference token logprobs on the same sequence.
-4. Build a completion mask by zeroing all prompt tokens.
-5. Build the feedback-conditioned teacher prompt and evaluate the **same completion** under that prompt.
-6. Align student completion logprobs and teacher completion logprobs by token count.
-7. Compute token SDPO values:
+3. Build a completion mask by zeroing all prompt tokens.
+4. Build the feedback-conditioned teacher prompt and evaluate the **same completion** under that prompt.
+5. Align student completion logprobs and teacher completion logprobs row-wise by token count.
+6. Compute token SDPO values:
 
 ```python
 sdpo_values = (teacher_completion_lp - student_completion_lp).clamp(-SDPO_ADV_CLIP, SDPO_ADV_CLIP)
@@ -1221,28 +1220,23 @@ adv = SDPO_LAMBDA * grpo_adv + (1.0 - SDPO_LAMBDA) * sdpo_adv
 
 where `grpo_adv` is the normalized group reward advantage and `sdpo_adv` is token-level. With the default `SDPO_LAMBDA=0.9`, SDPO acts as a dense shaping term rather than replacing the scalar economic reward.
 
-#### PPO-style update used after SDPO mixing
+#### Ref-free on-policy update used after SDPO mixing
 
-The script keeps the stable pure-GRPO clipped surrogate around the mixed advantage:
+The current script uses true ref-free/on-policy sampled-token policy gradient around the mixed advantage:
 
 ```python
-log_ratio = (pol_lp - ref_lp).clamp(-5.0, 5.0)
-ratio = torch.exp(log_ratio)
-clipped = torch.clamp(ratio, 1 - EPSILON, 1 + EPSILON)
-surr1 = ratio * adv
-surr2 = clipped * adv
-policy_loss = -torch.min(surr1, surr2)
-if KL_COEF > 0:
-    policy_loss = policy_loss + KL_COEF * log_ratio
-loss = (policy_loss * mask).sum() / (mask.sum() + 1e-8)
+adv = (SDPO_LAMBDA * grpo_adv + (1.0 - SDPO_LAMBDA) * sdpo_adv).detach()
+policy_loss = -adv * pol_lp
+loss = mean_over_buyer_completion_tokens(policy_loss)
 ```
 
 Important stability details:
 
-- log-ratio is clamped before exponentiation to avoid `inf` / loss explosions;
+- no frozen reference-policy model is loaded or evaluated during update;
+- `KL_COEF` defaults to `0.0` and no KL/reference term is applied;
 - loss is averaged over buyer completion tokens only;
 - seller turns are never trained;
-- optimizer step happens after the full group/inner epoch, not after every episode;
+- optimizer step is accumulated according to `OPTIM_STEP_EVERY_GROUPS`, defaulting to once per production-shape iteration;
 - gradient norm is clipped to `1.0`.
 
 #### Privacy protocol and action parsing
@@ -1382,14 +1376,14 @@ Implemented the planned SDPO update-path speedups for `train_negotiation_sdpo.py
   - scalar normalized GRPO advantage.
 - Tokenized prompt and completion separately, then concatenated IDs to avoid prompt/completion BPE-boundary drift from separate `prompt` vs `prompt+completion` tokenization calls.
 - Left-truncated prompt tokens on overlength update examples so generated completion tokens remain trainable under `UPDATE_MAX_LENGTH`.
-- Batched update microbatches through policy, reference, and feedback-conditioned teacher forwards instead of processing one buyer turn at a time.
+- Batched update microbatches through policy, reference, and feedback-conditioned teacher forwards instead of processing one buyer turn at a time. This was superseded by the later ref-free update below, which removes the reference forward.
 - Fixed SDPO token-gap alignment to be row-wise per microbatch example; the earlier flattened mask alignment could misalign later rows when teacher/student completion token counts differed.
 - Kept CPU-state AdamW exact full-parameter semantics but moved stepping cadence from once per GRPO group to once per `OPTIM_STEP_EVERY_GROUPS` groups; gradients are scaled by the accumulation window and cleared after the CPU optimizer update.
 - Added CUDA-synchronized phase timers and logs:
   - `perf/update_pretokenize_s`
   - `perf/update_collate_s`
   - `perf/update_policy_forward_s`
-  - `perf/update_ref_forward_s`
+  - `perf/update_ref_forward_s` (schema compatibility; zero for ref-free runs)
   - `perf/update_teacher_forward_s`
   - `perf/update_loss_backward_s`
   - `perf/update_optimizer_s`
@@ -1418,3 +1412,56 @@ A short GPU HF smoke also completed successfully:
 - Smoke model/metrics: [`ZeterMordio/anchor-negotiation-sdpo-perf-smoke`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-perf-smoke)
 - Config: `Qwen/Qwen3-0.6B`, `NUM_ITERS=1`, `BATCH_SIZE=1`, `GROUP_SIZE=2`, `MAX_TURNS=1`, `MAX_NEW_TOKENS=32`, `UPDATE_MICROBATCH_SIZE=4`, `OPTIM_STEP_EVERY_GROUPS=16`, `UPDATE_MAX_LENGTH=512`, `OPTIMIZER=adamw_cpu`.
 - Result: completed in 24.4s, pushed final checkpoint, logged W&B `perf/update_*` timers, and metrics showed `update_examples=2`, `optimizer_steps=1`, `sdpo_tokens=64`, peak VRAM `4.2GB`.
+
+---
+
+## 2026-05-18: True Ref-Free / On-Policy SDPO+GRPO Update
+
+Implemented the requested removal of the frozen reference-policy model from `train_negotiation_sdpo.py`.
+
+### Rationale
+
+The previous SDPO script used the frozen seller copy as a PPO-style reference policy during update:
+
+```python
+ref_lp = logprob(ref_model, prompt + completion)
+log_ratio = pol_lp - ref_lp
+policy_loss = clipped_ratio_loss(log_ratio, advantage) + KL_COEF * log_ratio
+```
+
+That anchor was a conservative engineering carryover from earlier dense-model stability work, not part of core SDPO. The negotiation RLVR paper uses `KL penalty = 0`, and SDPO's self-teacher is the current model under feedback, not a frozen reference model.
+
+### Changes
+
+- `KL_COEF` now defaults to `0.0`.
+- Removed reference-policy model loading. The script still loads the frozen regulated seller/environment model for rollouts, but there is no separate `ref_model` and no reuse of the seller as a reference policy.
+- Changed `sdpo_grpo_update(...)` to accept only `buyer_model, tokenizer, episodes, optimizer, device, cpu_adamw_state`.
+- Removed the no-grad reference forward from the update microbatch.
+- Replaced fixed-reference PPO-style ratio loss with true on-policy sampled-token policy-gradient loss:
+
+```python
+adv = (SDPO_LAMBDA * grpo_adv + (1.0 - SDPO_LAMBDA) * sdpo_adv).detach()
+policy_loss = -adv * pol_lp
+row_loss = mean_over_buyer_completion_tokens(policy_loss)
+```
+
+- Kept the SDPO self-teacher forward: the current buyer model is still evaluated under hindsight feedback in `torch.no_grad()` to produce token-level SDPO advantages.
+- Kept `perf/update_ref_forward_s` as a zero-valued compatibility metric for existing W&B dashboards, and added `objective/ref_free=1`, `objective/reference_model_used=0`, and `objective/kl_coef` to W&B logs.
+- Updated W&B warning text so it no longer recommends increasing a KL anchor; ref-free recovery suggestions are now LR reduction or moving `SDPO_LAMBDA` closer to `1.0`.
+
+### Notes
+
+This makes the update closer to both paper defaults:
+
+- Negotiation RLVR Table 5: `KL penalty = 0`.
+- SDPO: self-teacher = current policy conditioned on feedback; no external/frozen reference teacher is required.
+
+Loss values are no longer numerically comparable to the previous fixed-reference clipped-ratio loss. Reward, deal rate, overshoot, format errors, gradient norm, and W&B phase timers are the primary metrics to watch.
+
+### Ref-free smoke validation
+
+- Job: [`6a0a6998e7940de6ee6cdfa3`](https://huggingface.co/jobs/ZeterMordio/6a0a6998e7940de6ee6cdfa3)
+- W&B: [`chalk/anchor-negotiation-sdpo/itnu5od5`](https://wandb.ai/chalk/anchor-negotiation-sdpo/runs/itnu5od5)
+- Smoke model/metrics: [`ZeterMordio/anchor-negotiation-sdpo-ref-free-smoke`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-ref-free-smoke)
+- Config: `Qwen/Qwen3-0.6B`, `NUM_ITERS=1`, `BATCH_SIZE=1`, `GROUP_SIZE=2`, `MAX_TURNS=1`, `MAX_NEW_TOKENS=32`, `KL_COEF=0.0`, `UPDATE_MICROBATCH_SIZE=4`, `OPTIM_STEP_EVERY_GROUPS=16`, `UPDATE_MAX_LENGTH=512`, `OPTIMIZER=adamw_cpu`.
+- Result: completed in 24.0s and pushed the final checkpoint. Logs confirm `RefFree=True`, no reference-policy model load, `ref_fwd=0.0s(ref-free)`, `objective/ref_free=1`, `objective/reference_model_used=0`, and one CPU AdamW optimizer step. The tiny truncating rollout produced buyer format errors as expected for smoke-only settings, but the update path, metrics logging, W&B sync, and Hub push succeeded.
