@@ -76,11 +76,11 @@ python3 -m py_compile train_negotiation_pure.py train_negotiation_sdpo.py train_
 
 ## SDPO+GRPO 8B run
 
-`train_negotiation_sdpo.py` is the intended first self-distillation experiment. It keeps the pure buyer-only environment but uses hindsight verifier feedback and same-product on-policy rollout demos to compute dense SDPO token advantages. Defaults are conservative: `SDPO_LAMBDA=0.9` keeps 90% GRPO scalar advantage and 10% SDPO token advantage; `SDPO_FEEDBACK_MODE=strict` avoids exact seller-cost leakage.
+`train_negotiation_sdpo.py` is the intended first self-distillation experiment. It keeps the pure buyer-only environment but uses hindsight verifier feedback and same-product on-policy rollout demos to compute dense SDPO token advantages. Current real-run defaults are deliberately bolder than the initial canaries: `SDPO_LAMBDA=0.5` gives equal weight to the GRPO scalar reward and SDPO token shaping; `SDPO_FEEDBACK_MODE=strict` avoids exact seller-cost leakage.
 
 Earlier smoke validation completed on A100 with Qwen3-4B-Instruct-2507 and full format settings (`MAX_TURNS=6`, `MAX_NEW_TOKENS=300`): job [`6a05a28a3308d79117b8f560`](https://huggingface.co/jobs/ZeterMordio/6a05a28a3308d79117b8f560), model repo [`ZeterMordio/anchor-negotiation-sdpo-smoke-fullfmt`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-smoke-fullfmt). It completed 1 iteration and pushed metrics/model.
 
-The SDPO update path is optimized for the 8B run: buyer turns are flattened into pre-tokenized microbatch examples, teacher/student completion masks are aligned row-wise, and CPU-state AdamW steps once per production-shape iteration by default (`UPDATE_MICROBATCH_SIZE=4`, `OPTIM_STEP_EVERY_GROUPS=16`). It is now a true ref-free/on-policy objective (`KL_COEF=0.0` by default): the update does not load a frozen reference-policy model or run a reference forward; it uses sampled-token policy-gradient loss `-A * logπ` over buyer completion tokens, while the SDPO self-teacher remains the current buyer model under hindsight feedback. Current serious-run optimizer defaults are deliberately conservative for dense Qwen full fine-tuning: `LR=2e-6` with `WARMUP_STEPS=10`, `WEIGHT_DECAY=0.01`, `GRAD_CLIP_NORM=1.0`, and `ROLLOUT_MAX_LENGTH=UPDATE_MAX_LENGTH=3072`. W&B logs per-phase update timers under `perf/update_*_s` plus `perf/update_examples`, `perf/optimizer_steps`, `train/optimizer_global_step`, `train/lr`, and `train/grad_norm_last`; `perf/update_ref_forward_s` is retained as a zero-valued compatibility metric. The ref-free smoke completed at [`hf job 6a0a6998e7940de6ee6cdfa3`](https://huggingface.co/jobs/ZeterMordio/6a0a6998e7940de6ee6cdfa3), W&B run [`itnu5od5`](https://wandb.ai/chalk/anchor-negotiation-sdpo/runs/itnu5od5), and model/metrics repo [`ZeterMordio/anchor-negotiation-sdpo-ref-free-smoke`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-ref-free-smoke). The previous pre-ref-free GPU smoke completed at [`hf job 6a0a5fd2a5e509f1a8413e2b`](https://huggingface.co/jobs/ZeterMordio/6a0a5fd2a5e509f1a8413e2b), W&B run [`fnscexas`](https://wandb.ai/chalk/anchor-negotiation-sdpo/runs/fnscexas), and model/metrics repo [`ZeterMordio/anchor-negotiation-sdpo-perf-smoke`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-perf-smoke).
+The SDPO update path is optimized for the 8B run: buyer turns are flattened into pre-tokenized microbatch examples, teacher/student completion masks are aligned row-wise, and CPU-state AdamW steps once per production-shape iteration by default (`UPDATE_MICROBATCH_SIZE=4`, `OPTIM_STEP_EVERY_GROUPS=16`). It is now a true ref-free/on-policy objective (`KL_COEF=0.0` by default): the update does not load a frozen reference-policy model or run a reference forward; it uses sampled-token policy-gradient loss `-A * logπ` over buyer completion tokens, while the SDPO self-teacher remains the current buyer model under hindsight feedback. Current serious-run optimizer defaults are `NUM_ITERS=60`, `LR=5e-6` with `WARMUP_STEPS=10`, `WEIGHT_DECAY=0.01`, `GRAD_CLIP_NORM=1.0`, and `ROLLOUT_MAX_LENGTH=UPDATE_MAX_LENGTH=3072`. W&B logs per-phase update timers under `perf/update_*_s` plus `perf/update_examples`, `perf/optimizer_steps`, `train/optimizer_global_step`, `train/lr`, and `train/grad_norm_last`; `perf/update_ref_forward_s` is retained as a zero-valued compatibility metric. The ref-free smoke completed at [`hf job 6a0a6998e7940de6ee6cdfa3`](https://huggingface.co/jobs/ZeterMordio/6a0a6998e7940de6ee6cdfa3), W&B run [`itnu5od5`](https://wandb.ai/chalk/anchor-negotiation-sdpo/runs/itnu5od5), and model/metrics repo [`ZeterMordio/anchor-negotiation-sdpo-ref-free-smoke`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-ref-free-smoke). The previous pre-ref-free GPU smoke completed at [`hf job 6a0a5fd2a5e509f1a8413e2b`](https://huggingface.co/jobs/ZeterMordio/6a0a5fd2a5e509f1a8413e2b), W&B run [`fnscexas`](https://wandb.ai/chalk/anchor-negotiation-sdpo/runs/fnscexas), and model/metrics repo [`ZeterMordio/anchor-negotiation-sdpo-perf-smoke`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-perf-smoke).
 
 ```bash
 hf jobs uv run \
@@ -96,17 +96,17 @@ hf jobs uv run \
   --secrets WANDB_API_KEY \
   --env MODEL_NAME=Qwen/Qwen3-8B \
   --env SELLER_MODEL_NAME=Qwen/Qwen3-8B \
-  --env NUM_ITERS=42 \
+  --env NUM_ITERS=60 \
   --env BATCH_SIZE=16 \
   --env GROUP_SIZE=8 \
   --env MAX_TURNS=6 \
   --env MAX_NEW_TOKENS=300 \
-  --env LR=2e-6 \
+  --env LR=5e-6 \
   --env WEIGHT_DECAY=0.01 \
   --env WARMUP_STEPS=10 \
   --env GRAD_CLIP_NORM=1.0 \
   --env KL_COEF=0.0 \
-  --env SDPO_LAMBDA=0.9 \
+  --env SDPO_LAMBDA=0.5 \
   --env SDPO_FEEDBACK_MODE=strict \
   --env SDPO_ADV_CLIP=5.0 \
   --env BUYER_TEMP=1.0 \

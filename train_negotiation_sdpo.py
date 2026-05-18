@@ -14,7 +14,7 @@ update with Self-Distillation Policy Optimization (SDPO):
 Default run policy:
 - Use Qwen/Qwen3-8B, not 4B. SDPO depends on retrospective in-context learning,
   and the self-distillation paper shows this improves with model scale.
-- Keep a conservative hybrid: A_total = 0.9 * A_GRPO + 0.1 * A_SDPO.
+- Use a balanced hybrid for the next real run: A_total = 0.5 * A_GRPO + 0.5 * A_SDPO.
 - Use strict feedback by default: no exact seller cost or private floor is placed
   into the teacher prompt. Oracle feedback is an explicit ablation only.
 - Keep the HF Jobs shape analogous to train_negotiation_pure.py: one standalone
@@ -74,13 +74,13 @@ if USE_LIGER:
 # smoke tests or the paper's exact 30B-A3B model.
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-8B")
 SELLER_MODEL_NAME = os.environ.get("SELLER_MODEL_NAME", MODEL_NAME)
-NUM_ITERS = int(os.environ.get("NUM_ITERS", "42"))
+NUM_ITERS = int(os.environ.get("NUM_ITERS", "60"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 GROUP_SIZE = int(os.environ.get("GROUP_SIZE", "8"))
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "6"))
-# Dense Qwen RLVR collapsed at 3e-5 in this repo; 2e-6 is a modest step up
-# from the proven-stable 1e-6 default, cushioned by warmup, clipping, and wd.
-LR = float(os.environ.get("LR", "2e-6"))
+# Dense Qwen RLVR collapsed at 3e-5 in this repo; 5e-6 is the intentionally
+# bolder real-run default, cushioned by warmup, clipping, and weight decay.
+LR = float(os.environ.get("LR", "5e-6"))
 WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.01"))
 WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", "10"))
 GRAD_CLIP_NORM = float(os.environ.get("GRAD_CLIP_NORM", "1.0"))
@@ -111,7 +111,7 @@ WANDB_TAGS = [t.strip() for t in os.environ.get("WANDB_TAGS", "sdpo,negotiation,
 WANDB_JOB_TYPE = os.environ.get("WANDB_JOB_TYPE", "train")
 RUN_NAME = os.environ.get("RUN_NAME", "")
 PUSH_TRAINING_SCRIPT = os.environ.get("PUSH_TRAINING_SCRIPT", "1") == "1"
-SDPO_LAMBDA = float(os.environ.get("SDPO_LAMBDA", "0.9"))  # 1.0 = pure GRPO, 0.0 = pure SDPO
+SDPO_LAMBDA = float(os.environ.get("SDPO_LAMBDA", "0.5"))  # 1.0 = pure GRPO, 0.0 = pure SDPO
 SDPO_FEEDBACK_MODE = os.environ.get("SDPO_FEEDBACK_MODE", "strict").lower()
 SDPO_ADV_CLIP = float(os.environ.get("SDPO_ADV_CLIP", "5.0"))
 SDPO_MAX_DEMO_CHARS = int(os.environ.get("SDPO_MAX_DEMO_CHARS", "1400"))

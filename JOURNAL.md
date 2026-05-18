@@ -1124,7 +1124,7 @@ The script forks the pure buyer-only environment from `train_negotiation_pure.py
 ### Design Decisions
 
 - `MODEL_NAME=Qwen/Qwen3-8B`: chosen over 4B because the SDPO paper's scaling study shows self-teacher retrospection improves with model scale. Use 4B only for cheap smoke tests.
-- `SDPO_LAMBDA=0.9`: conservative hybrid. The 8B self-teacher should help, but the GRPO scalar reward remains the stable anchor for the first expensive run.
+- `SDPO_LAMBDA=0.5`: balanced hybrid for the coming real runs; GRPO scalar reward and SDPO token shaping contribute equally.
 - `SDPO_FEEDBACK_MODE=strict`: default teacher feedback does not include exact seller cost/private floor. Oracle feedback is supported only as an explicit ablation.
 - `SDPO_ADV_CLIP=5.0`: clips teacher-student token logprob gaps before mixing into the PPO-style surrogate, preventing a bad feedback prompt from dominating the update.
 - Token-level SDPO first, not top-K logit SDPO: cheaper, easier to audit, and enough to prove signal before adding full logit-level memory complexity.
@@ -1134,7 +1134,7 @@ The script forks the pure buyer-only environment from `train_negotiation_pure.py
 
 ### Expected First Run
 
-Use A100-large, 12h timeout, exact `torch==2.6.0`, `NUM_ITERS=42`, `BATCH_SIZE=16`, `GROUP_SIZE=8`, and `GEN_BATCH_LIMIT=128`. Run a tiny smoke job first with `NUM_ITERS=1`, `BATCH_SIZE=1`, `GROUP_SIZE=2`, `MODEL_NAME=Qwen/Qwen3-4B-Instruct-2507`, `SELLER_MODEL_NAME=Qwen/Qwen3-4B-Instruct-2507`, `CHECKPOINT_EVERY=0`, and a smoke Hub repo before the 8B run.
+Use A100-large, 12h timeout, exact `torch==2.6.0`, `NUM_ITERS=60`, `BATCH_SIZE=16`, `GROUP_SIZE=8`, and `GEN_BATCH_LIMIT=128`. Run a tiny smoke job first with `NUM_ITERS=1`, `BATCH_SIZE=1`, `GROUP_SIZE=2`, `MODEL_NAME=Qwen/Qwen3-4B-Instruct-2507`, `SELLER_MODEL_NAME=Qwen/Qwen3-4B-Instruct-2507`, `CHECKPOINT_EVERY=0`, and a smoke Hub repo before the 8B run.
 
 ### 2026-05-14 Resume Note
 
@@ -1167,17 +1167,17 @@ Default serious-run config in the script:
 |-----------|---------|
 | Buyer model | `Qwen/Qwen3-8B` |
 | Seller/environment | same as buyer unless `SELLER_MODEL_NAME` overrides; no reference-policy model |
-| Iters | `42` |
+| Iters | `60` |
 | Batch × group | `16 × 8 = 128` episodes/iter |
 | Max turns | `6` |
 | Max new tokens/turn | `300` |
-| LR | `2e-6` with `WARMUP_STEPS=10` linear warmup |
+| LR | `5e-6` with `WARMUP_STEPS=10` linear warmup |
 | Weight decay | `0.01` AdamW |
 | Gradient clip | `GRAD_CLIP_NORM=1.0` |
 | Rollout/update context | `ROLLOUT_MAX_LENGTH=3072`, `UPDATE_MAX_LENGTH=3072` |
 | PPO clip epsilon | `0.2` config retained, unused in the ref-free on-policy update |
 | KL/reference coefficient | `0.0`; no reference-policy model or KL term |
-| SDPO mix | `SDPO_LAMBDA=0.9` → 90% GRPO scalar advantage, 10% SDPO token advantage |
+| SDPO mix | `SDPO_LAMBDA=0.5` → 50% GRPO scalar advantage, 50% SDPO token advantage |
 | Feedback mode | `strict` by default; `oracle` is explicit ablation only |
 | SDPO advantage clip | `±5.0` token logprob gap |
 | Checkpoints | branch every `CHECKPOINT_EVERY=10`, final to `main` |
@@ -1221,7 +1221,7 @@ These values are scattered back onto the original completion-token mask. The mix
 adv = SDPO_LAMBDA * grpo_adv + (1.0 - SDPO_LAMBDA) * sdpo_adv
 ```
 
-where `grpo_adv` is the normalized group reward advantage and `sdpo_adv` is token-level. With the default `SDPO_LAMBDA=0.9`, SDPO acts as a dense shaping term rather than replacing the scalar economic reward.
+where `grpo_adv` is the normalized group reward advantage and `sdpo_adv` is token-level. With the default `SDPO_LAMBDA=0.5`, SDPO acts as an equal-weight dense shaping term while retaining the scalar economic reward.
 
 #### Ref-free on-policy update used after SDPO mixing
 
@@ -1475,8 +1475,10 @@ Loss values are no longer numerically comparable to the previous fixed-reference
 
 Updated the SDPO defaults for the next serious Qwen3-8B ref-free run:
 
-- `LR=2e-6`: still near the repo's proven-stable dense-Qwen `1e-6`, but slightly less timid now that the update is batched, ref-free, gradient-clipped, and warmed up. Kept far below the negotiation paper's `3e-5`, which previously collapsed dense Qwen in this repo.
-- `WARMUP_STEPS=10`: with one CPU AdamW step per production-shaped iteration, this warms over roughly the first quarter of a 42-iteration run.
+- `LR=5e-6`: bolder coming-real-run default requested after the ref-free and optimizer-stability changes; still below the negotiation paper's `3e-5`, which previously collapsed dense Qwen in this repo.
+- `SDPO_LAMBDA=0.5`: balanced GRPO/SDPO mixture for the coming real runs.
+- `NUM_ITERS=60`: longer run to match prior extended-run planning and give the stronger SDPO signal time to matter.
+- `WARMUP_STEPS=10`: with one CPU AdamW step per production-shaped iteration, this warms over roughly the first sixth of a 60-iteration run.
 - `WEIGHT_DECAY=0.01`: standard mild AdamW decay for full-parameter tuning, now applied in both CPU-state AdamW and CUDA AdamW paths.
 - `GRAD_CLIP_NORM=1.0`: made the existing hardcoded clip configurable and logged.
 - `ROLLOUT_MAX_LENGTH=3072`, `UPDATE_MAX_LENGTH=3072`: modestly reduces prompt truncation for 6-turn, 300-token negotiations while avoiding the memory hit of jumping straight to 4096.
