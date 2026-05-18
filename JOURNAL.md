@@ -1363,3 +1363,58 @@ Local W&B smoke test succeeded and logged a metric + alert:
 - run: https://wandb.ai/chalk/anchor-negotiation-setup-smoke/runs/x5suqkt7
 
 All patched scripts compile with `python3 -m py_compile`.
+
+---
+
+## 2026-05-18: SDPO 8B Update-Path Performance Implementation
+
+Implemented the planned SDPO update-path speedups for `train_negotiation_sdpo.py` without changing the buyer-only SDPO+GRPO objective or model/dataset scope.
+
+### Changes
+
+- Added update controls:
+  - `UPDATE_MICROBATCH_SIZE=4` default: batches flattened buyer-turn examples during the update forward/backward path.
+  - `OPTIM_STEP_EVERY_GROUPS=16` default: accumulates across the 16 GRPO groups in the production `BATCH_SIZE=16, GROUP_SIZE=8` iteration and performs one CPU AdamW step per iteration.
+  - `UPDATE_PAD_TO_MULTIPLE_OF=8` and `UPDATE_MAX_LENGTH=2048` for efficient update collation.
+- Flattened each GRPO group into pre-tokenized buyer-turn examples:
+  - original buyer prompt + sampled completion;
+  - hindsight-feedback teacher prompt + same sampled completion;
+  - scalar normalized GRPO advantage.
+- Tokenized prompt and completion separately, then concatenated IDs to avoid prompt/completion BPE-boundary drift from separate `prompt` vs `prompt+completion` tokenization calls.
+- Left-truncated prompt tokens on overlength update examples so generated completion tokens remain trainable under `UPDATE_MAX_LENGTH`.
+- Batched update microbatches through policy, reference, and feedback-conditioned teacher forwards instead of processing one buyer turn at a time.
+- Fixed SDPO token-gap alignment to be row-wise per microbatch example; the earlier flattened mask alignment could misalign later rows when teacher/student completion token counts differed.
+- Kept CPU-state AdamW exact full-parameter semantics but moved stepping cadence from once per GRPO group to once per `OPTIM_STEP_EVERY_GROUPS` groups; gradients are scaled by the accumulation window and cleared after the CPU optimizer update.
+- Added CUDA-synchronized phase timers and logs:
+  - `perf/update_pretokenize_s`
+  - `perf/update_collate_s`
+  - `perf/update_policy_forward_s`
+  - `perf/update_ref_forward_s`
+  - `perf/update_teacher_forward_s`
+  - `perf/update_loss_backward_s`
+  - `perf/update_optimizer_s`
+  - `perf/update_grad_check_s`
+  - plus `perf/update_examples`, `perf/optimizer_steps`, and `train/grad_norm_last`.
+
+### Documentation / eval parity
+
+- Updated `README.md` SDPO launch command with the new update env vars and W&B timer notes.
+- Updated `eval_negotiation.py` to match the current training dataset loader: all 18 categories, `features/current_price/average_price/highest_price`, and the exact 802/128 seeded split.
+- Tightened eval parity with training for buyer DEAL validation, budget/protocol reward penalties, and regulated seller below-cost SELL rewrites before cross-role context insertion.
+
+### Validation
+
+Local syntax and helper/update-path validation passed:
+
+```bash
+python3 -m py_compile train_negotiation_sdpo.py eval_negotiation.py
+uv run --with torch --with transformers --no-project python <tiny SDPO CPU update smoke>
+```
+
+A short GPU HF smoke also completed successfully:
+
+- Job: [`6a0a5fd2a5e509f1a8413e2b`](https://huggingface.co/jobs/ZeterMordio/6a0a5fd2a5e509f1a8413e2b)
+- W&B: [`chalk/anchor-negotiation-sdpo/fnscexas`](https://wandb.ai/chalk/anchor-negotiation-sdpo/runs/fnscexas)
+- Smoke model/metrics: [`ZeterMordio/anchor-negotiation-sdpo-perf-smoke`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-perf-smoke)
+- Config: `Qwen/Qwen3-0.6B`, `NUM_ITERS=1`, `BATCH_SIZE=1`, `GROUP_SIZE=2`, `MAX_TURNS=1`, `MAX_NEW_TOKENS=32`, `UPDATE_MICROBATCH_SIZE=4`, `OPTIM_STEP_EVERY_GROUPS=16`, `UPDATE_MAX_LENGTH=512`, `OPTIMIZER=adamw_cpu`.
+- Result: completed in 24.4s, pushed final checkpoint, logged W&B `perf/update_*` timers, and metrics showed `update_examples=2`, `optimizer_steps=1`, `sdpo_tokens=64`, peak VRAM `4.2GB`.
