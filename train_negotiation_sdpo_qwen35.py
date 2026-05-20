@@ -351,8 +351,16 @@ def _qwen35_text_canary(model, processor_or_tokenizer, tokenizer, device, label)
             enable_thinking=False,
         )
         inputs = tokenizer(prompt, return_tensors="pt")
-    if not isinstance(inputs, dict):
+    if hasattr(inputs, "items"):
+        inputs = dict(inputs.items())
+    elif not isinstance(inputs, dict):
         inputs = {"input_ids": inputs}
+    else:
+        inputs = dict(inputs)
+    if "input_ids" in inputs and not torch.is_tensor(inputs["input_ids"]):
+        inputs["input_ids"] = torch.as_tensor(inputs["input_ids"])
+    if "attention_mask" in inputs and not torch.is_tensor(inputs["attention_mask"]):
+        inputs["attention_mask"] = torch.as_tensor(inputs["attention_mask"])
     if "attention_mask" not in inputs:
         inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
     if any(k.startswith("pixel") or "image" in k or "video" in k for k in inputs):
