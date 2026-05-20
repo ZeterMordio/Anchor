@@ -15,8 +15,8 @@ Default run policy:
 - Use Qwen/Qwen3.5-9B by default. Qwen3.5 is a newer multimodal
   ImageTextToText/ForConditionalGeneration family, so this script keeps text-only
   wrappers around processor/model calls and runs a startup canary by default.
-- Start GRPO-heavy and quickly hand off to SDPO shaping: by default
-  A_total decays from 0.9 * A_GRPO + 0.1 * A_SDPO to a balanced 0.5/0.5 mix by iter 10.
+- Start GRPO-heavy and gradually hand off to SDPO shaping: by default
+  A_total decays from 0.9 * A_GRPO + 0.1 * A_SDPO to a balanced 0.5/0.5 mix by iter 20.
 - Use strict feedback by default: no exact seller cost or private floor is placed
   into the teacher prompt. Oracle feedback is an explicit ablation only.
 - Keep the HF Jobs shape analogous to train_negotiation_pure.py: one standalone
@@ -126,9 +126,9 @@ PUSH_TRAINING_SCRIPT = os.environ.get("PUSH_TRAINING_SCRIPT", "1") == "1"
 QWEN35_TEXT_CANARY = os.environ.get("QWEN35_TEXT_CANARY", "1") == "1"
 SDPO_LAMBDA = float(os.environ.get("SDPO_LAMBDA", "0.9"))  # 1.0 = pure GRPO, 0.0 = pure SDPO
 # For Qwen3.5 runs, start GRPO-heavy while the self-teacher is noisy, then
-# aggressively hand off to SDPO shaping. Default: 0.9 -> 0.5 by iter 10.
+# gradually hand off to SDPO shaping. Default: 0.9 -> 0.5 by iter 20.
 SDPO_LAMBDA_FINAL = float(os.environ.get("SDPO_LAMBDA_FINAL", "0.5"))
-SDPO_LAMBDA_DECAY_ITERS = int(os.environ.get("SDPO_LAMBDA_DECAY_ITERS", "10"))
+SDPO_LAMBDA_DECAY_ITERS = int(os.environ.get("SDPO_LAMBDA_DECAY_ITERS", "20"))
 SDPO_FEEDBACK_MODE = os.environ.get("SDPO_FEEDBACK_MODE", "strict").lower()
 SDPO_ADV_CLIP = float(os.environ.get("SDPO_ADV_CLIP", "5.0"))
 SDPO_MAX_DEMO_CHARS = int(os.environ.get("SDPO_MAX_DEMO_CHARS", "1400"))
@@ -158,6 +158,15 @@ TOP_K_DISTILLATION = int(os.environ.get("TOP_K_DISTILLATION", "0"))
 DISTILLATION_DIVERGENCE = os.environ.get("DISTILLATION_DIVERGENCE", "token-logprob-gap")
 TRUST_REGION_INTERPOLATION = os.environ.get("TRUST_REGION_INTERPOLATION", "0") == "1"
 TEACHER_EMA_DECAY = os.environ.get("TEACHER_EMA_DECAY", "")
+FORMAT_WARN_THRESHOLD = int(os.environ.get("FORMAT_WARN_THRESHOLD", "5"))
+FORMAT_STOP_THRESHOLD = int(os.environ.get("FORMAT_STOP_THRESHOLD", "10"))
+FORMAT_STOP_PATIENCE = int(os.environ.get("FORMAT_STOP_PATIENCE", "2"))
+BUDGET_WARN_THRESHOLD = int(os.environ.get("BUDGET_WARN_THRESHOLD", "32"))
+BUDGET_STOP_THRESHOLD = int(os.environ.get("BUDGET_STOP_THRESHOLD", "40"))
+BUDGET_STOP_PATIENCE = int(os.environ.get("BUDGET_STOP_PATIENCE", "2"))
+REWARD_STOP_THRESHOLD = float(os.environ.get("REWARD_STOP_THRESHOLD", "-0.25"))
+REWARD_STOP_PATIENCE = int(os.environ.get("REWARD_STOP_PATIENCE", "2"))
+EARLY_STOP_SAVE_CHECKPOINT = os.environ.get("EARLY_STOP_SAVE_CHECKPOINT", "1") == "1"
 
 
 def _fmt_run_value(value):
@@ -203,6 +212,58 @@ def active_sdpo_lambda(iteration):
         return SDPO_LAMBDA_FINAL
     frac = min(max(float(iteration) / float(SDPO_LAMBDA_DECAY_ITERS), 0.0), 1.0)
     return SDPO_LAMBDA + frac * (SDPO_LAMBDA_FINAL - SDPO_LAMBDA)
+
+
+def _consecutive_count(history, predicate):
+    count = 0
+    for row in reversed(history):
+        if predicate(row):
+            count += 1
+        else:
+            break
+    return count
+
+
+def evaluate_early_stop(metrics, n_episodes):
+    """Return (should_stop, reasons) from recent rollout health metrics."""
+    if not metrics:
+        return False, []
+    latest = metrics[-1]
+    outcomes = latest.get("outcomes", {})
+    format_errors = outcomes.get("BUYER_FORMAT_ERROR", 0)
+    budget_violations = outcomes.get("BUYER_BUDGET_VIOLATION", 0)
+    mean_reward = latest.get("mean_reward", 0.0)
+    reasons = []
+
+    format_bad = _consecutive_count(
+        metrics,
+        lambda row: row.get("outcomes", {}).get("BUYER_FORMAT_ERROR", 0) >= FORMAT_STOP_THRESHOLD,
+    )
+    budget_bad = _consecutive_count(
+        metrics,
+        lambda row: row.get("outcomes", {}).get("BUYER_BUDGET_VIOLATION", 0) >= BUDGET_STOP_THRESHOLD,
+    )
+    reward_bad = _consecutive_count(
+        metrics,
+        lambda row: row.get("mean_reward", 0.0) <= REWARD_STOP_THRESHOLD,
+    )
+
+    if FORMAT_STOP_PATIENCE > 0 and format_bad >= FORMAT_STOP_PATIENCE:
+        reasons.append(
+            f"format_errors={format_errors}/{n_episodes} for {format_bad} consecutive iters "
+            f"(threshold={FORMAT_STOP_THRESHOLD}; next run: lower LR or slow SDPO handoff)"
+        )
+    if BUDGET_STOP_PATIENCE > 0 and budget_bad >= BUDGET_STOP_PATIENCE:
+        reasons.append(
+            f"budget_violations={budget_violations}/{n_episodes} for {budget_bad} consecutive iters "
+            f"(threshold={BUDGET_STOP_THRESHOLD}; next run: strengthen budget prompt or lower LR)"
+        )
+    if REWARD_STOP_PATIENCE > 0 and reward_bad >= REWARD_STOP_PATIENCE:
+        reasons.append(
+            f"mean_reward={mean_reward:.4f} for {reward_bad} consecutive iters "
+            f"(threshold={REWARD_STOP_THRESHOLD}; next run: lower LR or inspect product mix)"
+        )
+    return bool(reasons), reasons
 
 
 random.seed(SEED)
@@ -503,8 +564,10 @@ BUYER_SYSTEM = """You are a buyer looking forward to buying things on your Shopp
 You have access to the seller's Inventory List and you can bargain about the prices.
 Your task is to bargain with the seller and reach a deal with the price as low as possible in limited turns.
 You can only buy things on the Shopping List in the limited quantity. Use the codename of the product, instead of the title.
-You can only buy things that cost less than your budget, otherwise, you should quit negotiating.
+You can only buy things that cost less than your budget. Never offer above your private budget. Never accept or DEAL above your private budget; if no legal deal is possible, choose [QUIT].
 Again, try to make deal with a price as low as possible. That is, your goal is to spend as little money as possible, not just reaching your budget.
+
+Protocol compliance is mandatory. Every reply must contain exactly one Thought line, exactly one Talk line, and exactly one Action line. The final Action line must be parseable and must use one of the allowed action tags exactly.
 
 Your Reply should include 3 parts: Thought, Talk, and Action.
 Thought: your inner strategic thinking of this bargaining session;
@@ -515,7 +578,8 @@ Action: one of the limited actions that define the real intention of your Talk. 
 3. '[DEAL] $M (N codename_1)' if you finally accept on a former offer proposed by the seller. $M (N codename_1) is an exact copy of seller's previous offer. You should not use this action to propose a new price. This action will immediately end the conversation and close the deal.
 4. '[QUIT]' if you believe that a mutually acceptable deal cannot be reached in limited turns. This action will immediately end the conversation.
 You shouldn't choose action '[DEAL] $M' before seller's action '[SELL] $M'. Your first action should be '[BUY] $M (N codename_1)' or '[REJECT]'.
-'[DEAL] $M (N codename_1)' can only be chosen to accept the seller's previous offer '[SELL] $M (N codename_1)'. Otherwise, you always choose from '[BUY]', '[REJECT]' and '[QUIT]'.
+'[DEAL] $M (N codename_1)' can only be chosen to accept the seller's previous offer '[SELL] $M (N codename_1)' and only if $M is within your budget. Otherwise, you always choose from '[BUY]', '[REJECT]' and '[QUIT]'.
+Do not output any extra text before Thought or after the Action line. Do not output multiple Action lines.
 
 Your reply should STRICTLY follow this format (not following the format will directly lead to failure), for example:
 Thought: I'm a buyer and I want to bargain. The listing price of codename "apple_1" is $15, which is too expensive, so I try to buy an apple for $10.
@@ -1730,6 +1794,12 @@ def main():
         f"OptimStepEveryGroups={OPTIM_STEP_EVERY_GROUPS} "
         f"UpdatePadMultiple={UPDATE_PAD_TO_MULTIPLE_OF} UpdateMaxLength={UPDATE_MAX_LENGTH}"
     )
+    print(
+        f"[CONFIG] EarlyStop format>={FORMAT_STOP_THRESHOLD}x{FORMAT_STOP_PATIENCE} "
+        f"budget>={BUDGET_STOP_THRESHOLD}x{BUDGET_STOP_PATIENCE} "
+        f"reward<={REWARD_STOP_THRESHOLD}x{REWARD_STOP_PATIENCE} "
+        f"save={EARLY_STOP_SAVE_CHECKPOINT}"
+    )
     print(f"[CONFIG] CheckpointEvery={CHECKPOINT_EVERY} Hub={HUB_MODEL_ID or '(disabled)'}")
     print("=" * 70, flush=True)
 
@@ -1779,6 +1849,15 @@ def main():
                 "teacher_ema_decay": TEACHER_EMA_DECAY,
                 "sdpo_max_demo_chars": SDPO_MAX_DEMO_CHARS,
                 "sdpo_max_feedback_chars": SDPO_MAX_FEEDBACK_CHARS,
+                "format_warn_threshold": FORMAT_WARN_THRESHOLD,
+                "format_stop_threshold": FORMAT_STOP_THRESHOLD,
+                "format_stop_patience": FORMAT_STOP_PATIENCE,
+                "budget_warn_threshold": BUDGET_WARN_THRESHOLD,
+                "budget_stop_threshold": BUDGET_STOP_THRESHOLD,
+                "budget_stop_patience": BUDGET_STOP_PATIENCE,
+                "reward_stop_threshold": REWARD_STOP_THRESHOLD,
+                "reward_stop_patience": REWARD_STOP_PATIENCE,
+                "early_stop_save_checkpoint": EARLY_STOP_SAVE_CHECKPOINT,
                 "optimizer": OPTIMIZER,
                 "adamw_foreach": ADAMW_FOREACH,
                 "update_microbatch_size": UPDATE_MICROBATCH_SIZE,
@@ -1832,7 +1911,10 @@ def main():
     seller_model.eval()
     for p in seller_model.parameters():
         p.requires_grad = False
-    print(f"  [OK] VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
+    seller_trainable_params = sum(p.numel() for p in seller_model.parameters() if p.requires_grad)
+    if seller_trainable_params != 0:
+        raise RuntimeError(f"seller_model unexpectedly has {seller_trainable_params:,} trainable params")
+    print(f"  [OK] Frozen seller trainable_params={seller_trainable_params:,} VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
 
     print(
         f"\n[5/5] Optimizer (AdamW, lr={LR}, warmup_steps={WARMUP_STEPS}, "
@@ -1915,6 +1997,8 @@ def main():
         gc.collect()
 
         iter_metrics = compute_iter_metrics(episodes)
+        fmt_errors = iter_metrics["outcomes"].get("BUYER_FORMAT_ERROR", 0)
+        budget_violations = iter_metrics["outcomes"].get("BUYER_BUDGET_VIOLATION", 0)
         elapsed = time.time() - t_iter
         update_time = elapsed - rollout_time
         current_vram, current_vram_per_gpu = _memory_allocated_all_gpus_gb()
@@ -1967,6 +2051,16 @@ def main():
             f"grad_check={update_stats['update_grad_check_s']:.1f}s"
         )
         print(f"  Outcomes: {dict(list(iter_metrics['outcomes'].items())[:6])}")
+        if fmt_errors >= FORMAT_WARN_THRESHOLD:
+            print(
+                f"  ⚠️ BUYER FORMAT ERRORS: {fmt_errors}/{n_episodes} "
+                f"(stop if >= {FORMAT_STOP_THRESHOLD} for {FORMAT_STOP_PATIENCE} consecutive iters)"
+            )
+        if budget_violations >= BUDGET_WARN_THRESHOLD:
+            print(
+                f"  ⚠️ BUYER BUDGET VIOLATIONS: {budget_violations}/{n_episodes} "
+                f"(stop if >= {BUDGET_STOP_THRESHOLD} for {BUDGET_STOP_PATIENCE} consecutive iters)"
+            )
         if iter_metrics["role_confusions"]:
             print(f"  ⚠️ ROLE CONFUSIONS: {iter_metrics['role_confusions']}")
         print(
@@ -2102,15 +2196,50 @@ def main():
                         f"reward={iter_metrics['mean_reward']:.4f} at iter={iteration}; if persistent, reduce LR or lower SDPO weight",
                         level=wandb.AlertLevel.WARN,
                     )
-                fmt_errors = iter_metrics["outcomes"].get("BUYER_FORMAT_ERROR", 0)
-                if fmt_errors > 0.25 * n_episodes:
+                if fmt_errors >= FORMAT_WARN_THRESHOLD:
                     wandb.alert(
-                        "format_collapse_warning",
-                        f"buyer_format_errors={fmt_errors}/{n_episodes} at iter={iteration}; try LR x0.1 or SDPO_LAMBDA closer to 1.0",
+                        "format_error_warning",
+                        f"buyer_format_errors={fmt_errors}/{n_episodes} at iter={iteration}; if repeated, stop and reduce LR or slow SDPO handoff",
                         level=wandb.AlertLevel.WARN,
+                    )
+                if fmt_errors >= FORMAT_STOP_THRESHOLD:
+                    wandb.alert(
+                        "format_collapse_error",
+                        f"buyer_format_errors={fmt_errors}/{n_episodes} at iter={iteration}; early-stop threshold hit, checkpoint will be saved before exit if patience is met",
+                        level=wandb.AlertLevel.ERROR,
+                    )
+                if budget_violations >= BUDGET_WARN_THRESHOLD:
+                    wandb.alert(
+                        "budget_violation_warning",
+                        f"buyer_budget_violations={budget_violations}/{n_episodes} at iter={iteration}; if repeated, strengthen budget prompt or reduce LR",
+                        level=wandb.AlertLevel.WARN,
+                    )
+                if budget_violations >= BUDGET_STOP_THRESHOLD:
+                    wandb.alert(
+                        "budget_violation_error",
+                        f"buyer_budget_violations={budget_violations}/{n_episodes} at iter={iteration}; early-stop threshold hit, checkpoint will be saved before exit if patience is met",
+                        level=wandb.AlertLevel.ERROR,
                     )
             except Exception as e:
                 print(f"  [WANDB] Log/alert failed (non-fatal): {e}")
+
+        should_stop, stop_reasons = evaluate_early_stop(metrics, n_episodes)
+        if should_stop:
+            reason_text = "; ".join(stop_reasons)
+            print(f"  [EARLY STOP] {reason_text}", flush=True)
+            if WANDB_OK:
+                try:
+                    wandb.alert(
+                        "sdpo_early_stop",
+                        f"iter={iteration}; {reason_text}; recommended next run: lower LR and/or slow SDPO handoff",
+                        level=wandb.AlertLevel.ERROR,
+                    )
+                except Exception as e:
+                    print(f"  [WANDB] Early-stop alert failed (non-fatal): {e}")
+            if EARLY_STOP_SAVE_CHECKPOINT and HUB_MODEL_ID:
+                print(f"  [CHECKPOINT] Saving early-stop iter {iteration+1}...")
+                save_and_push_checkpoint(buyer_model, tokenizer, metrics, iteration, final=False, processor=buyer_processor)
+            break
 
         should_ckpt = (
             CHECKPOINT_EVERY > 0
