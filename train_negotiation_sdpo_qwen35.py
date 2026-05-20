@@ -124,9 +124,14 @@ PUSH_TRAINING_SCRIPT = os.environ.get("PUSH_TRAINING_SCRIPT", "1") == "1"
 QWEN35_TEXT_CANARY = os.environ.get("QWEN35_TEXT_CANARY", "1") == "1"
 SDPO_LAMBDA = float(os.environ.get("SDPO_LAMBDA", "0.9"))  # 1.0 = pure GRPO, 0.0 = pure SDPO
 # For Qwen3.5 runs, start GRPO-heavy while the self-teacher is noisy, then
-# aggressively hand off to SDPO shaping. Default: 0.9 -> 0.5 by iter 10.
+# aggressively hand off to SDPO shaping. Explicit comma/space-separated
+# SDPO_LAMBDA_SCHEDULE wins over the linear fallback and repeats its final value.
 SDPO_LAMBDA_FINAL = float(os.environ.get("SDPO_LAMBDA_FINAL", "0.5"))
 SDPO_LAMBDA_DECAY_ITERS = int(os.environ.get("SDPO_LAMBDA_DECAY_ITERS", "10"))
+SDPO_LAMBDA_SCHEDULE_RAW = os.environ.get("SDPO_LAMBDA_SCHEDULE", "").strip()
+SDPO_LAMBDA_SCHEDULE = [
+    float(part) for part in re.split(r"[,\s]+", SDPO_LAMBDA_SCHEDULE_RAW) if part
+]
 SDPO_FEEDBACK_MODE = os.environ.get("SDPO_FEEDBACK_MODE", "strict").lower()
 SDPO_ADV_CLIP = float(os.environ.get("SDPO_ADV_CLIP", "5.0"))
 SDPO_MAX_DEMO_CHARS = int(os.environ.get("SDPO_MAX_DEMO_CHARS", "1400"))
@@ -197,6 +202,8 @@ def default_wandb_group():
 
 def active_sdpo_lambda(iteration):
     """GRPO-heavy -> SDPO-balanced schedule for Qwen3.5 experiments."""
+    if SDPO_LAMBDA_SCHEDULE:
+        return SDPO_LAMBDA_SCHEDULE[min(iteration, len(SDPO_LAMBDA_SCHEDULE) - 1)]
     if SDPO_LAMBDA_DECAY_ITERS <= 0:
         return SDPO_LAMBDA_FINAL
     frac = min(max(float(iteration) / float(SDPO_LAMBDA_DECAY_ITERS), 0.0), 1.0)
@@ -1647,7 +1654,8 @@ def main():
     print(f"[CONFIG] InnerEpochs={NUM_INNER_EPOCHS} NormAdvantages={NORMALIZE_ADVANTAGES}")
     print(
         f"[CONFIG] SDPO_LambdaStart={SDPO_LAMBDA} Final={SDPO_LAMBDA_FINAL} "
-        f"DecayIters={SDPO_LAMBDA_DECAY_ITERS} FeedbackMode={SDPO_FEEDBACK_MODE} "
+        f"DecayIters={SDPO_LAMBDA_DECAY_ITERS} Schedule={SDPO_LAMBDA_SCHEDULE or '(linear)'} "
+        f"FeedbackMode={SDPO_FEEDBACK_MODE} "
         f"AdvClip={SDPO_ADV_CLIP} MaxFeedbackChars={SDPO_MAX_FEEDBACK_CHARS} AdamWForeach={ADAMW_FOREACH}"
     )
     print(
@@ -1695,6 +1703,7 @@ def main():
                 "sdpo_lambda": SDPO_LAMBDA,
                 "sdpo_lambda_final": SDPO_LAMBDA_FINAL,
                 "sdpo_lambda_decay_iters": SDPO_LAMBDA_DECAY_ITERS,
+                "sdpo_lambda_schedule": SDPO_LAMBDA_SCHEDULE,
                 "sdpo_feedback_mode": SDPO_FEEDBACK_MODE,
                 "sdpo_adv_clip": SDPO_ADV_CLIP,
                 "distillation_level": DISTILLATION_LEVEL,
