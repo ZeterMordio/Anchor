@@ -1,0 +1,1991 @@
+"""
+Negotiation SDPO+GRPO training for bilateral price negotiation.
+
+This script is a separate experimental sibling of train_negotiation_pure.py.
+It keeps the negotiation paper's buyer-only RLVR setup but augments the buyer
+update with Self-Distillation Policy Optimization (SDPO):
+
+- Trainable buyer policy.
+- Frozen regulated seller model as the environment counterparty; no reference-policy model.
+- Buyer always starts; only buyer turns receive updates.
+- Verifiable reward remains the paper's economic-surplus scalar.
+- SDPO adds feedback-conditioned self-teacher log-probs for dense token credit.
+
+Default run policy:
+- Use Qwen/Qwen3.5-9B by default. Qwen3.5 is a newer multimodal
+  ImageTextToText/ForConditionalGeneration family, so this script keeps text-only
+  wrappers around processor/model calls and runs a startup canary by default.
+- Start GRPO-heavy and quickly hand off to SDPO shaping: by default
+  A_total decays from 0.9 * A_GRPO + 0.1 * A_SDPO to a balanced 0.5/0.5 mix by iter 10.
+- Use strict feedback by default: no exact seller cost or private floor is placed
+  into the teacher prompt. Oracle feedback is an explicit ablation only.
+- Keep the HF Jobs shape analogous to train_negotiation_pure.py: one standalone
+  file, env-var config, W&B logging, and periodic Hub checkpoints.
+"""
+
+import gc
+import json
+import os
+import random
+import re
+import shutil
+import sys
+import time
+import traceback
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# HF Jobs log streaming: avoid buffered multi-minute stalls.
+os.environ["PYTHONUNBUFFERED"] = "1"
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+
+import torch
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+try:
+    from transformers import AutoModelForImageTextToText
+except ImportError:  # Older Transformers fallback; Qwen3.5 canary will fail loudly.
+    AutoModelForImageTextToText = None
+
+
+# ─── Liger Kernel: optional fused Triton kernels for Qwen3 ────────────────────
+# Liger's Triton kernels are safe on a single fully-GPU-resident model, but they
+# are not safe with Accelerate device_map CPU/offload. The previous a10g-largex4
+# run used MAX_MEMORY_PER_GPU_GIB and hit:
+#   ValueError: Pointer argument ... cannot be accessed from Triton (cpu tensor?)
+# Default Liger off whenever explicit multi-GPU memory caps are requested; users
+# can still force USE_LIGER=1 for a known fully GPU-resident sharded setup.
+_MULTI_GPU_MEMORY_CAP_REQUESTED = bool(os.environ.get("MAX_MEMORY_PER_GPU_GIB", "").strip())
+_DEFAULT_USE_LIGER = "0" if _MULTI_GPU_MEMORY_CAP_REQUESTED else "1"
+USE_LIGER = os.environ.get("USE_LIGER", _DEFAULT_USE_LIGER) == "1"
+if _MULTI_GPU_MEMORY_CAP_REQUESTED and USE_LIGER:
+    print("[LIGER] WARNING: USE_LIGER=1 with explicit max_memory caps; disable it if device_map offloads to CPU")
+if USE_LIGER:
+    try:
+        from liger_kernel.transformers import apply_liger_kernel_to_qwen3
+
+        apply_liger_kernel_to_qwen3()
+        print("[LIGER] Qwen3 kernels patched (SwiGLU, RMSNorm, RoPE, FusedLinearCE)")
+    except ImportError:
+        print("[LIGER] liger-kernel not installed, skipping")
+        USE_LIGER = False
+    except Exception as e:
+        print(f"[LIGER] Patch failed (non-fatal): {e}")
+        USE_LIGER = False
+
+
+_IMAGE_TEXT_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe"}
+_TEXT_BATCH_KEYS = {"input_ids", "attention_mask", "position_ids", "labels"}
+
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+# SDPO is scale-sensitive. This Qwen3.5 variant defaults to Qwen/Qwen3.5-9B,
+# a newer ImageTextToText/ForConditionalGeneration checkpoint.
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3.5-9B")
+SELLER_MODEL_NAME = os.environ.get("SELLER_MODEL_NAME", MODEL_NAME)
+NUM_ITERS = int(os.environ.get("NUM_ITERS", "60"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
+GROUP_SIZE = int(os.environ.get("GROUP_SIZE", "8"))
+MAX_TURNS = int(os.environ.get("MAX_TURNS", "6"))
+# Dense Qwen RLVR collapsed at 3e-5 in this repo; 5e-6 is the intentionally
+# bolder real-run default, cushioned by warmup, clipping, and weight decay.
+LR = float(os.environ.get("LR", "5e-6"))
+WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.01"))
+WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", "10"))
+GRAD_CLIP_NORM = float(os.environ.get("GRAD_CLIP_NORM", "1.0"))
+EPSILON = float(os.environ.get("EPSILON", "0.2"))
+# True ref-free/on-policy SDPO+GRPO: no frozen reference-policy forward is
+# used in the update. Keep the env var for run metadata/backward-compatible
+# launch commands, but default to the paper-aligned no-KL setting.
+KL_COEF = float(os.environ.get("KL_COEF", "0.0"))
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "300"))
+BUYER_TEMP = float(os.environ.get("BUYER_TEMP", "1.0"))
+SELLER_TEMP = float(os.environ.get("SELLER_TEMP", "0.7"))  # paper Table 5
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/model")
+HUB_MODEL_ID = os.environ.get("HUB_MODEL_ID", "")
+GRADIENT_CHECKPOINTING = os.environ.get("GRADIENT_CHECKPOINTING", "1") == "1"
+MODEL_DEVICE_MAP = os.environ.get("MODEL_DEVICE_MAP", "auto")
+MAX_MEMORY_PER_GPU_GIB = os.environ.get("MAX_MEMORY_PER_GPU_GIB", "").strip()
+GEN_BATCH_LIMIT = int(os.environ.get("GEN_BATCH_LIMIT", "128"))
+NUM_INNER_EPOCHS = int(os.environ.get("NUM_INNER_EPOCHS", "1"))
+NORMALIZE_ADVANTAGES = os.environ.get("NORMALIZE_ADVANTAGES", "1") == "1"
+CHECKPOINT_EVERY = int(os.environ.get("CHECKPOINT_EVERY", "10"))
+SEED = int(os.environ.get("SEED", "42"))
+TRAIN_SPLIT_SIZE = int(os.environ.get("TRAIN_SPLIT_SIZE", "802"))
+TEST_SPLIT_SIZE = int(os.environ.get("TEST_SPLIT_SIZE", "128"))
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "anchor-negotiation-sdpo")
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "chalk") or None
+WANDB_MODE = os.environ.get("WANDB_MODE", "online")
+WANDB_TAGS = [t.strip() for t in os.environ.get("WANDB_TAGS", "sdpo,negotiation,rlvr").split(",") if t.strip()]
+WANDB_JOB_TYPE = os.environ.get("WANDB_JOB_TYPE", "train")
+RUN_NAME = os.environ.get("RUN_NAME", "")
+PUSH_TRAINING_SCRIPT = os.environ.get("PUSH_TRAINING_SCRIPT", "1") == "1"
+QWEN35_TEXT_CANARY = os.environ.get("QWEN35_TEXT_CANARY", "1") == "1"
+SDPO_LAMBDA = float(os.environ.get("SDPO_LAMBDA", "0.9"))  # 1.0 = pure GRPO, 0.0 = pure SDPO
+# For Qwen3.5 runs, start GRPO-heavy while the self-teacher is noisy, then
+# aggressively hand off to SDPO shaping. Default: 0.9 -> 0.5 by iter 10.
+SDPO_LAMBDA_FINAL = float(os.environ.get("SDPO_LAMBDA_FINAL", "0.5"))
+SDPO_LAMBDA_DECAY_ITERS = int(os.environ.get("SDPO_LAMBDA_DECAY_ITERS", "10"))
+SDPO_FEEDBACK_MODE = os.environ.get("SDPO_FEEDBACK_MODE", "strict").lower()
+SDPO_ADV_CLIP = float(os.environ.get("SDPO_ADV_CLIP", "5.0"))
+SDPO_MAX_DEMO_CHARS = int(os.environ.get("SDPO_MAX_DEMO_CHARS", "1400"))
+SDPO_MAX_FEEDBACK_CHARS = int(os.environ.get("SDPO_MAX_FEEDBACK_CHARS", "1800"))
+# On 8B full fine-tuning, foreach AdamW briefly materializes extra tensor lists
+# at optimizer.step(); disabling foreach preserves the objective and lowers peak VRAM.
+ADAMW_FOREACH = os.environ.get("ADAMW_FOREACH", "0") == "1"
+# Optimizer choice is an implementation detail, not a training-method change. The
+# default remains exact full-parameter AdamW updates, but stores optimizer state
+# on CPU to avoid the 8B A100 optimizer.step OOM seen in job 6a05acb... .
+# Set OPTIMIZER=adamw_cuda for a fully CUDA AdamW attempt; keep it only if VRAM is enough.
+OPTIMIZER = os.environ.get("OPTIMIZER", "adamw_cpu").lower()
+# Update-path performance controls. The old implementation processed one buyer
+# turn at a time and stepped CPU AdamW once per GRPO group. These defaults batch
+# buyer turns into microbatches and step once per 16 groups (= once per 16-product
+# production-shape iteration) while preserving full-parameter training.
+UPDATE_MICROBATCH_SIZE = int(os.environ.get("UPDATE_MICROBATCH_SIZE", "4"))
+OPTIM_STEP_EVERY_GROUPS = int(os.environ.get("OPTIM_STEP_EVERY_GROUPS", "16"))
+UPDATE_PAD_TO_MULTIPLE_OF = int(os.environ.get("UPDATE_PAD_TO_MULTIPLE_OF", "8"))
+ROLLOUT_MAX_LENGTH = int(os.environ.get("ROLLOUT_MAX_LENGTH", "3072"))
+UPDATE_MAX_LENGTH = int(os.environ.get("UPDATE_MAX_LENGTH", "3072"))
+# Experimental SDPO/SDRO design metadata for run naming and W&B config. These do
+# not alter the current token-level SDPO objective unless corresponding code is
+# added/enabled in a future ablation.
+DISTILLATION_LEVEL = os.environ.get("DISTILLATION_LEVEL", "token")  # token | topk-logit
+TOP_K_DISTILLATION = int(os.environ.get("TOP_K_DISTILLATION", "0"))
+DISTILLATION_DIVERGENCE = os.environ.get("DISTILLATION_DIVERGENCE", "token-logprob-gap")
+TRUST_REGION_INTERPOLATION = os.environ.get("TRUST_REGION_INTERPOLATION", "0") == "1"
+TEACHER_EMA_DECAY = os.environ.get("TEACHER_EMA_DECAY", "")
+
+
+def _fmt_run_value(value):
+    text = f"{value:g}" if isinstance(value, float) else str(value)
+    return text.replace("e-0", "e-").replace("e+0", "e+").replace(".", "p")
+
+
+def _model_slug(model_name):
+    slug = model_name.split("/")[-1].lower()
+    slug = slug.replace("qwen3", "q3").replace("instruct", "i")
+    slug = slug.replace("-2507", "2507")
+    slug = re.sub(r"[^a-z0-9.]+", "-", slug).strip("-")
+    slug = slug.replace("-i-", "-i")
+    return slug
+
+
+def _distill_slug():
+    if DISTILLATION_LEVEL == "topk-logit":
+        div = DISTILLATION_DIVERGENCE.lower().replace("jensen-shannon", "js").replace("jshannon", "js")
+        div = re.sub(r"[^a-z0-9]+", "", div) or "kl"
+        interp = "tri" if TRUST_REGION_INTERPOLATION else "notri"
+        ema = f"ema{_fmt_run_value(TEACHER_EMA_DECAY)}" if TEACHER_EMA_DECAY else "noema"
+        return f"topk{TOP_K_DISTILLATION}-{div}-{interp}-{ema}"
+    return "tokgap"
+
+
+def default_run_name():
+    return (
+        f"sdpo__{_model_slug(MODEL_NAME)}__l{_fmt_run_value(SDPO_LAMBDA)}__{_distill_slug()}"
+        f"__i{NUM_ITERS}_b{BATCH_SIZE}xg{GROUP_SIZE}"
+        f"__fb{SDPO_FEEDBACK_MODE}_clip{_fmt_run_value(SDPO_ADV_CLIP)}"
+        f"__lr{_fmt_run_value(LR)}_kl{_fmt_run_value(KL_COEF)}__s{SEED}"
+    )
+
+
+def default_wandb_group():
+    return f"sdpo__{_model_slug(MODEL_NAME)}__{_distill_slug()}__fb{SDPO_FEEDBACK_MODE}"
+
+
+def active_sdpo_lambda(iteration):
+    """GRPO-heavy -> SDPO-balanced schedule for Qwen3.5 experiments."""
+    if SDPO_LAMBDA_DECAY_ITERS <= 0:
+        return SDPO_LAMBDA_FINAL
+    frac = min(max(float(iteration) / float(SDPO_LAMBDA_DECAY_ITERS), 0.0), 1.0)
+    return SDPO_LAMBDA + frac * (SDPO_LAMBDA_FINAL - SDPO_LAMBDA)
+
+
+random.seed(SEED)
+torch.manual_seed(SEED)
+
+
+def _model_load_kwargs():
+    """Shared model loading kwargs, with optional multi-GPU memory caps."""
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "device_map": MODEL_DEVICE_MAP,
+        "trust_remote_code": True,
+    }
+    if MAX_MEMORY_PER_GPU_GIB:
+        if not torch.cuda.is_available():
+            return kwargs
+        n_gpu = torch.cuda.device_count()
+        # Reserve a CPU entry so Accelerate has an explicit place for layers that
+        # do not fit on the GPUs instead of failing unpredictably.
+        kwargs["max_memory"] = {i: f"{MAX_MEMORY_PER_GPU_GIB}GiB" for i in range(n_gpu)}
+        kwargs["max_memory"]["cpu"] = "240GiB"
+    return kwargs
+
+
+def _config_model_type(config):
+    return str(getattr(config, "model_type", "") or "")
+
+
+def _is_image_text_config(config):
+    return _config_model_type(config) in _IMAGE_TEXT_MODEL_TYPES and hasattr(config, "vision_config")
+
+
+def _is_image_text_model(model):
+    return _is_image_text_config(getattr(model, "config", None))
+
+
+def _first_model_device(model):
+    return next(model.parameters()).device
+
+
+def _model_input_device(model):
+    """Device where tokenized inputs should be placed.
+
+    Accelerate-dispatched models can span multiple GPUs. For those, inputs must
+    start on the first layer's device, not necessarily on the lm_head device.
+    If the map starts on CPU, fail early: generation with CPU-dispatched input
+    layers is incompatible with the CUDA/Triton path we use for training.
+    """
+    hf_map = getattr(model, "hf_device_map", None)
+    if isinstance(hf_map, dict):
+        for key in ("model.embed_tokens", "transformer.wte", "model"):  # Qwen, GPT-like, fallback
+            if key in hf_map:
+                dev = torch.device(hf_map[key])
+                if dev.type == "cpu":
+                    raise RuntimeError(f"Input layer {key} is on CPU in hf_device_map; use larger GPU memory or lower MAX_MEMORY_PER_GPU_GIB")
+                return dev
+        first = next(iter(hf_map.values()))
+        dev = torch.device(first)
+        if dev.type == "cpu":
+            raise RuntimeError("First model shard is on CPU; use larger GPU memory or lower MAX_MEMORY_PER_GPU_GIB")
+        return dev
+    return _first_model_device(model)
+
+
+def _load_text_or_image_text_stack(model_name):
+    """Load Qwen3/Qwen3.5 text-compatible model plus processor/tokenizer.
+
+    Qwen3.5/3.6 official checkpoints are ImageTextToText wrappers with a text
+    backbone. For text-only negotiation, use AutoProcessor +
+    AutoModelForImageTextToText when available, while exposing the underlying
+    tokenizer to the rest of the script. Older CausalLM checkpoints keep the
+    original AutoTokenizer + AutoModelForCausalLM path.
+    """
+    cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    if _is_image_text_config(cfg):
+        if AutoModelForImageTextToText is None:
+            raise ImportError(
+                f"{model_name} is {_config_model_type(cfg)} and requires AutoModelForImageTextToText. "
+                "Install a recent transformers version (Qwen3.5 model card uses >=4.57)."
+            )
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError(f"AutoProcessor for {model_name} does not expose .tokenizer")
+        model = AutoModelForImageTextToText.from_pretrained(model_name, **_model_load_kwargs())
+        return model, processor, tokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(model_name, **_model_load_kwargs())
+    return model, tokenizer, tokenizer
+
+
+def _text_only_batch(batch):
+    return {k: v for k, v in batch.items() if k in _TEXT_BATCH_KEYS and v is not None}
+
+
+def _move_batch_to_device(batch, device):
+    return {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
+
+
+def _apply_chat_template_text(processor_or_tokenizer, messages, *, tokenize, add_generation_prompt, **kwargs):
+    try:
+        return processor_or_tokenizer.apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+    except TypeError:
+        # Some processor/tokenizer variants do not support enable_thinking.
+        kwargs.pop("enable_thinking", None)
+        return processor_or_tokenizer.apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+
+
+def _qwen35_text_canary(model, processor_or_tokenizer, tokenizer, device, label):
+    if not QWEN35_TEXT_CANARY or not _is_image_text_model(model):
+        return
+    print(f"[QWEN3.5 CANARY] Text-only compatibility check for {label}...")
+    msgs = [{"role": "user", "content": "Reply with exactly: OK"}]
+    try:
+        inputs = _apply_chat_template_text(
+            processor_or_tokenizer,
+            msgs,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            enable_thinking=False,
+        )
+    except TypeError:
+        prompt = _apply_chat_template_text(
+            tokenizer,
+            msgs,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        inputs = tokenizer(prompt, return_tensors="pt")
+    if not isinstance(inputs, dict):
+        inputs = {"input_ids": inputs}
+    if "attention_mask" not in inputs:
+        inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+    if any(k.startswith("pixel") or "image" in k or "video" in k for k in inputs):
+        raise AssertionError(f"{label} text-only canary unexpectedly produced multimodal tensors: {sorted(inputs)}")
+    bad_token_ids = [
+        getattr(processor_or_tokenizer, "image_token_id", None),
+        getattr(processor_or_tokenizer, "video_token_id", None),
+        getattr(getattr(model, "config", None), "image_token_id", None),
+        getattr(getattr(model, "config", None), "video_token_id", None),
+    ]
+    ids = inputs["input_ids"]
+    for bad in {x for x in bad_token_ids if x is not None}:
+        if bool((ids == int(bad)).any().item()):
+            raise AssertionError(f"{label} text-only canary contains multimodal token id {bad}")
+    inputs = _move_batch_to_device(_text_only_batch(inputs), device)
+    with torch.no_grad():
+        out = model(**inputs, use_cache=False)
+    if not hasattr(out, "logits") or out.logits.shape[:2] != inputs["input_ids"].shape:
+        raise AssertionError(f"{label} text-only forward did not return expected logits shape")
+    with torch.no_grad():
+        gen = model.generate(**inputs, max_new_tokens=4, do_sample=False, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
+    text = tokenizer.batch_decode(gen[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+    print(f"[QWEN3.5 CANARY] {label} OK; sample={text!r}")
+
+
+def _assert_no_cpu_offload(model, name):
+    """Fail fast if Accelerate placed any module on CPU/disk.
+
+    The previous a10g-largex4 run allowed CPU/offload and then failed inside a
+    Triton RMSNorm during generation. Full fine-tuning also needs all trainable
+    buyer weights on GPU for meaningful optimizer updates.
+    """
+    hf_map = getattr(model, "hf_device_map", None)
+    if not isinstance(hf_map, dict):
+        return
+    bad = {k: v for k, v in hf_map.items() if str(v).startswith("cpu") or str(v).startswith("disk")}
+    if bad:
+        sample = list(bad.items())[:8]
+        raise RuntimeError(
+            f"{name} has CPU/disk-offloaded modules in hf_device_map (sample={sample}). "
+            "This script does full-parameter training/generation and requires all modules on GPU. "
+            "Use A100/L40S-class memory or reduce per-GPU memory caps; do not use Liger with CPU offload."
+        )
+
+
+# ─── Dataset: AmazonHistoryPrice ─────────────────────────────────────────────
+DATASET_URL_BASE = (
+    "https://raw.githubusercontent.com/TianXiaSJTU/AmazonPriceHistory"
+    "/main/data/AmazonHistoryPrice/"
+)
+# Important: include all 18 categories. Older scripts omitted toys-games and
+# video-games, producing 901 examples. The paper/JOURNAL dataset has 930.
+CATEGORIES = [
+    "automotive",
+    "baby-products",
+    "beauty",
+    "books",
+    "electronics",
+    "health-personal-care",
+    "home-kitchen",
+    "industrial-scientific",
+    "movies-tv",
+    "music",
+    "other",
+    "patio-lawn-garden",
+    "pet-supplies",
+    "software",
+    "sports-outdoors",
+    "tools-home-improvement",
+    "toys-games",
+    "video-games",
+]
+
+
+def parse_price(s):
+    return float(str(s).replace("$", "").replace(",", "").strip())
+
+
+def load_products(seed=SEED):
+    import urllib.request
+
+    all_items = []
+    category_counts = {}
+    for cat in CATEGORIES:
+        url = DATASET_URL_BASE + f"{cat}.json"
+        try:
+            with urllib.request.urlopen(url, timeout=20) as resp:
+                items = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            print(f"  [WARN] Skip {cat}: {e}")
+            continue
+        n_valid = 0
+        for idx, it in enumerate(items):
+            try:
+                lp = parse_price(it.get("list_price", "0"))
+                cost = parse_price(it.get("lowest_price", "0"))
+                if lp <= 0 or cost <= 0:
+                    continue
+                budget = round(lp * 0.8, 2)
+                all_items.append(
+                    {
+                        "codename": f"{cat}_{idx}",
+                        "title": it.get("title", "")[:120],
+                        "description": it.get("description", "")[:200],
+                        "features": it.get("features", "")[:300],
+                        "current_price": parse_price(it.get("current_price", lp)),
+                        "average_price": parse_price(it.get("average_price", lp)),
+                        "highest_price": parse_price(it.get("highest_price", lp)),
+                        "category": cat,
+                        "list_price": lp,
+                        "cost": cost,
+                        "budget": budget,
+                        "mi": budget > cost,
+                    }
+                )
+                n_valid += 1
+            except Exception:
+                continue
+        category_counts[cat] = n_valid
+
+    random.seed(seed)
+    random.shuffle(all_items)
+    if len(all_items) >= TRAIN_SPLIT_SIZE + TEST_SPLIT_SIZE:
+        train = all_items[:TRAIN_SPLIT_SIZE]
+        test = all_items[TRAIN_SPLIT_SIZE : TRAIN_SPLIT_SIZE + TEST_SPLIT_SIZE]
+    else:
+        split = int(len(all_items) * 0.8623655913978494)  # 802/930
+        train, test = all_items[:split], all_items[split:]
+
+    mi_total = sum(1 for p in all_items if p["mi"])
+    mi_train = sum(1 for p in train if p["mi"])
+    mi_test = sum(1 for p in test if p["mi"])
+    print(
+        f"[DATA] Products={len(all_items)} train={len(train)} test={len(test)} "
+        f"MI={mi_total} CI={len(all_items)-mi_total}",
+        flush=True,
+    )
+    print(f"[DATA] Train MI={mi_train} CI={len(train)-mi_train}; Test MI={mi_test} CI={len(test)-mi_test}")
+    print(f"[DATA] Category counts: {category_counts}")
+    return train, test
+
+
+# ─── Prompts (paper Appendix C, adapted to Thought/Talk/Action format) ───────
+BUYER_SYSTEM = """You are a buyer looking forward to buying things on your Shopping List from me, the seller.
+You have access to the seller's Inventory List and you can bargain about the prices.
+Your task is to bargain with the seller and reach a deal with the price as low as possible in limited turns.
+You can only buy things on the Shopping List in the limited quantity. Use the codename of the product, instead of the title.
+You can only buy things that cost less than your budget, otherwise, you should quit negotiating.
+Again, try to make deal with a price as low as possible. That is, your goal is to spend as little money as possible, not just reaching your budget.
+
+Your Reply should include 3 parts: Thought, Talk, and Action.
+Thought: your inner strategic thinking of this bargaining session;
+Talk: short talk that you are going to say to the seller. Speak concisely and cut to the chase. Generate authentic and diverse sentences, avoiding repetition of sentences that have already appeared in the conversation;
+Action: one of the limited actions that define the real intention of your Talk. The type of your Action must be one of "[BUY],[REJECT],[DEAL],[QUIT]".
+1. '[BUY] $M (N codename_1)' if you wish to offer the seller $M to purchase all N items of the product with the codename "codename_1".
+2. '[REJECT]' if you choose to reject the other side's offer and await a new offer from the seller.
+3. '[DEAL] $M (N codename_1)' if you finally accept on a former offer proposed by the seller. $M (N codename_1) is an exact copy of seller's previous offer. You should not use this action to propose a new price. This action will immediately end the conversation and close the deal.
+4. '[QUIT]' if you believe that a mutually acceptable deal cannot be reached in limited turns. This action will immediately end the conversation.
+You shouldn't choose action '[DEAL] $M' before seller's action '[SELL] $M'. Your first action should be '[BUY] $M (N codename_1)' or '[REJECT]'.
+'[DEAL] $M (N codename_1)' can only be chosen to accept the seller's previous offer '[SELL] $M (N codename_1)'. Otherwise, you always choose from '[BUY]', '[REJECT]' and '[QUIT]'.
+
+Your reply should STRICTLY follow this format (not following the format will directly lead to failure), for example:
+Thought: I'm a buyer and I want to bargain. The listing price of codename "apple_1" is $15, which is too expensive, so I try to buy an apple for $10.
+Talk: Hello, I'm tight on budget. can you sell it for 10$?
+Action: [BUY] $10 (1x apple_1)"""
+
+SELLER_SYSTEM = """You are a seller looking forward to selling things on your Inventory List to me, the buyer.
+Your task is to bargain with the buyer and reach a deal with the price as high as possible in limited turns.
+You can only sell things that are on the Inventory List. Use the codename of the product, instead of the title.
+You have access to private information: the cost price of each product in the Inventory List, and do not disclose the real cost to the buyer.
+You should only agree on a deal when the selling price is higher than the cost, otherwise, you should quit negotiating.
+
+Your Reply should include 3 parts: Thought, Talk, and Action.
+Thought: your inner strategic thinking of this bargaining session;
+Talk: short talk that you are going to say to the buyer. Speak concisely and cut to the chase. Generate authentic and diverse sentences, avoiding repetition of sentences that have already appeared in the conversation;
+Action: one of the limited actions that define the real intention of your Talk. The type of your Action must be one of "[SELL],[REJECT],[DEAL],[QUIT]".
+1. '[SELL] $M (N codename_1)' if you want to propose selling N items of the product with the codename "codename_1" to the buyer for the total price of $M.
+2. '[REJECT]' if you choose to reject the other side's offer and await a new offer from the buyer.
+3. '[DEAL] $M (N codename_1)' if you finally agree on a former offer proposed by the buyer, and sell N items of the product with the codename "codename_1" to the buyer for the total price of $M. $M (N codename_1) is an exact copy of buyer's previous offer. You should not use this action to propose a new price. This action will immediately end the conversation and close the deal.
+4. '[QUIT]' if you believe that a mutually acceptable deal cannot be reached in limited turns. This action will immediately end the conversation.
+You shouldn't choose action '[DEAL]' before buyer's action '[BUY]'.
+'[DEAL] $M (N codename_1)' can only be chosen to accept the buyer's previous offer '[BUY] $M (N codename_1)'. Otherwise, you always choose from '[SELL]', '[REJECT]' and '[QUIT]'.
+
+Your reply should strictly follow this format, for example:
+Thought: I'm a seller, so I must sell the product with codename "apple_1" higher than its cost.
+Talk: blah, blah...
+Action: [SELL] $15 (1x apple_1)"""
+
+
+def build_buyer_prompt(product):
+    inv = (
+        f"Inventory List\n"
+        f"- codename: {product['codename']}\n"
+        f"  title: {product['title']}\n"
+        f"  description: {product['description']}\n"
+        f"  features: {product.get('features', '')}\n"
+        f"  category: {product['category']}\n"
+        f"  list_price: ${product['list_price']:.2f}\n"
+        f"  current_price: ${product.get('current_price', product['list_price']):.2f}\n"
+        f"  average_price: ${product.get('average_price', product['list_price']):.2f}\n"
+        f"  highest_price: ${product.get('highest_price', product['list_price']):.2f}"
+    )
+    need = (
+        f"Shopping List\n"
+        f"- codename: {product['codename']}\n"
+        f"  quantity: 1\n"
+        f"  budget_limit: ${product['budget']:.2f}"
+    )
+    user = (
+        f"{inv}\n\n{need}\n\n"
+        f"Now, I play the role of seller and you play the role of buyer. "
+        f"We are going to negotiate based on the Inventory List in {MAX_TURNS} turns."
+    )
+    return [
+        {"role": "system", "content": BUYER_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_seller_prompt(product):
+    inv = (
+        f"Inventory List\n"
+        f"- codename: {product['codename']}\n"
+        f"  title: {product['title']}\n"
+        f"  description: {product['description']}\n"
+        f"  features: {product.get('features', '')}\n"
+        f"  category: {product['category']}\n"
+        f"  list_price: ${product['list_price']:.2f}\n"
+        f"  current_price: ${product.get('current_price', product['list_price']):.2f}\n"
+        f"  average_price: ${product.get('average_price', product['list_price']):.2f}\n"
+        f"  highest_price: ${product.get('highest_price', product['list_price']):.2f}\n"
+        f"  cost_price (private): ${product['cost']:.2f}"
+    )
+    user = (
+        f"{inv}\n\n"
+        f"Now, I play the role of buyer and you play the role of seller. "
+        f"We are going to negotiate based on the Inventory List in {MAX_TURNS} turns."
+    )
+    return [
+        {"role": "system", "content": SELLER_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+
+
+# ─── Action extraction + hidden scratchpad stripping ─────────────────────────
+ACTION_PATTERN = r"\[(BUY|SELL|DEAL|REJECT|QUIT)\](?:\s*\$([\d,\.]+))?(?:\s*\(([^)]*)\))?"
+ACTION_RE = re.compile(ACTION_PATTERN, re.IGNORECASE)
+ACTION_LINE_RE = re.compile(r"(?:^|\n)\s*Action\s*:\s*" + ACTION_PATTERN, re.IGNORECASE)
+QWEN_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
+QWEN_THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
+QWEN_THINK_CLOSE_RE = re.compile(r"</think\s*>", re.IGNORECASE)
+
+
+def strip_qwen_native_thinking(text):
+    """Remove Qwen3 native <think>...</think> content from visible text.
+
+    Qwen3 thinking mode emits private reasoning wrapped in native think tags. That
+    content must never be passed to the opponent or used as the parsed economic
+    action. If an opening tag is unterminated, keep only content after the first
+    public protocol marker (Thought/Talk/Action), otherwise drop the tail.
+    """
+    text = text or ""
+    text = QWEN_THINK_BLOCK_RE.sub("", text)
+
+    closes = list(QWEN_THINK_CLOSE_RE.finditer(text))
+    if closes and not QWEN_THINK_OPEN_RE.search(text):
+        text = text[closes[-1].end() :]
+
+    m = QWEN_THINK_OPEN_RE.search(text)
+    if m:
+        tail = text[m.end() :]
+        public = re.search(r"(?:^|\n)\s*(?:Thought|Talk|Action)\s*:", tail, re.IGNORECASE)
+        text = text[: m.start()] + (tail[public.start() :] if public else "")
+    return text.strip()
+
+
+def _parse_action_match(m):
+    ps = m.group(2)
+    price = float(ps.replace(",", "")) if ps else None
+    return {"type": m.group(1).upper(), "price": price, "objects": m.group(3)}
+
+
+def extract_action(text):
+    public_text = strip_qwen_native_thinking(text or "")
+
+    # Prefer explicit Action: lines outside any native Qwen thinking block.
+    line_matches = list(ACTION_LINE_RE.finditer(public_text))
+    if line_matches:
+        return _parse_action_match(line_matches[-1])
+
+    # If the model produced our structured Thought field, remove it before any
+    # fallback parse so an action mentioned only in private reasoning is not used.
+    public_text = strip_thought(public_text)
+    matches = list(ACTION_RE.finditer(public_text or ""))
+    m = matches[-1] if matches else None
+    if m:
+        return _parse_action_match(m)
+    return {"type": "UNKNOWN", "price": None, "objects": None}
+
+
+def replace_final_action(text, action_type, price, product):
+    """Replace the final public structured action after environment regulation."""
+    replacement = f"[{action_type}] ${price:.2f} (1x {product['codename']})"
+    text = strip_qwen_native_thinking(text or "")
+    line_matches = list(ACTION_LINE_RE.finditer(text))
+    if line_matches:
+        m = line_matches[-1]
+        old_match = list(ACTION_RE.finditer(m.group(0)))[-1]
+        start = m.start() + old_match.start()
+        end = m.start() + old_match.end()
+        return text[:start] + replacement + text[end:]
+    visible = strip_thought(text)
+    matches = list(ACTION_RE.finditer(visible))
+    if not matches:
+        return text.rstrip() + f"\nAction: {replacement}"
+    old = matches[-1].group(0)
+    idx = text.rfind(old)
+    if idx < 0:
+        return text.rstrip() + f"\nAction: {replacement}"
+    return text[:idx] + replacement + text[idx + len(old) :]
+
+
+def strip_thought(text):
+    """Remove hidden scratchpads, keeping only Talk + Action for the counterparty.
+
+    Paper §3.1: reasoning is a hidden scratchpad and is trimmed before being
+    passed to the opponent. This also strips Qwen3 native <think> blocks so a
+    Qwen thinking-mode ablation does not leak private reasoning.
+    """
+    text = strip_qwen_native_thinking(text or "")
+    m = re.search(r"(?:^|\n)\s*Talk\s*:", text, re.IGNORECASE)
+    if m:
+        result = text[m.start() :].strip()
+        _assert_strip_thought_complete(result, text)
+        return result
+    m = re.search(r"(?:^|\n)\s*Action\s*:", text, re.IGNORECASE)
+    if m and re.search(r"(?:^|\n)\s*Thought\s*:", text[: m.start()], re.IGNORECASE):
+        result = text[m.start() :].strip()
+        _assert_strip_thought_complete(result, text)
+        return result
+    m = re.search(r"(?:^|\n)\s*Thought\s*:.*?(?=\n\s*(?:Talk|Action)\s*:)", text, re.IGNORECASE | re.DOTALL)
+    if m:
+        result = text[m.end() :].strip()
+        _assert_strip_thought_complete(result, text)
+        return result
+    if re.search(r"(?:^|\n)\s*Thought\s*:", text, re.IGNORECASE):
+        return ""
+    _assert_strip_thought_complete(text, text)
+    return text
+
+
+def _assert_strip_thought_complete(stripped_text, original_text):
+    has_structured_thought = bool(re.search(r"(?:^|\n)\s*Thought\s*:", original_text or ""))
+    leaked_thought = bool(re.search(r"(?:^|\n)\s*Thought\s*:", stripped_text or ""))
+    leaked_qwen_think = bool(QWEN_THINK_OPEN_RE.search(stripped_text or "") or QWEN_THINK_CLOSE_RE.search(stripped_text or ""))
+    if (has_structured_thought and leaked_thought) or leaked_qwen_think:
+        raise AssertionError(
+            "strip_thought() INCOMPLETE: hidden reasoning block survived. "
+            f"Original={original_text[:200]!r}; Stripped={stripped_text[:200]!r}"
+        )
+
+
+def _assert_no_private_info_leak(prompt_text, product, role):
+    """Crash on clear counterparty-private-info leakage.
+
+    Avoids regex heuristics that caused false positives in JOURNAL v10.4.
+    """
+    budget_str = f"${product['budget']:.2f}"
+    if role == "buyer":
+        if "cost_price" in prompt_text:
+            raise AssertionError(
+                f"INFORMATION LEAK: buyer prompt contains seller cost field. Product={product['codename']}"
+            )
+    elif role == "seller":
+        if "Shopping List" in prompt_text:
+            raise AssertionError(
+                f"INFORMATION LEAK: seller prompt contains buyer Shopping List. Product={product['codename']}"
+            )
+        if f"budget_limit: {budget_str}" in prompt_text:
+            raise AssertionError(
+                f"INFORMATION LEAK: seller prompt contains buyer budget_limit={budget_str}. "
+                f"Product={product['codename']}"
+            )
+
+
+# ─── Reward + seller regulation ──────────────────────────────────────────────
+def regulate_seller(seller_action, buyer_price, product):
+    """Regulate seller per paper: prevent below-cost accepts/proposals."""
+    cost = product["cost"]
+    at = seller_action["type"]
+    price = seller_action["price"]
+
+    if at == "UNKNOWN":
+        return None, True, "SELLER_FORMAT_ERROR"
+    if at == "QUIT":
+        return None, True, "SELLER_QUIT"
+    if at == "DEAL":
+        if buyer_price is None:
+            return None, True, "NO_PRIOR_BUYER_OFFER"
+        if buyer_price < cost:
+            return None, True, "SELLER_CANNOT_ACCEPT_BELOW_COST"
+        return buyer_price, True, "DEAL_SELLER_ACCEPTS"
+    if at == "SELL":
+        if price is None:
+            return None, True, "NO_PRICE_IN_SELL"
+        if price < cost:
+            price = round(cost * 1.05, 2)
+        return price, False, "SELL"
+    if at == "REJECT":
+        return None, False, "REJECT"
+    return None, True, f"UNEXPECTED_{at}"
+
+
+def compute_buyer_reward(final_price, budget, cost, outcome):
+    """Buyer reward per paper Eq. 1, with terminal penalties."""
+    if "FORMAT_ERROR" in outcome or "UNEXPECTED" in outcome:
+        return -1.0
+    if outcome in {"BUYER_BUDGET_VIOLATION", "BUYER_DEAL_INVALID_SELLER_OFFER", "BUYER_DEAL_PRICE_MISMATCH"}:
+        return -1.0
+    if final_price is None:
+        return 0.0
+    if final_price > budget:
+        return -1.0
+    denom = abs(budget - cost)
+    if denom < 1e-6:
+        return 0.0
+    r = (budget - final_price) / denom
+    return max(-1.0, min(1.0, r))
+
+
+# ─── Batched generation ──────────────────────────────────────────────────────
+@torch.no_grad()
+def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device):
+    """Generate completions for a list of prompts using sub-batched HF generate."""
+    if not prompts_text_list:
+        return []
+
+    all_results = []
+    for batch_start in range(0, len(prompts_text_list), GEN_BATCH_LIMIT):
+        batch_prompts = prompts_text_list[batch_start : batch_start + GEN_BATCH_LIMIT]
+        orig_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        inputs = tokenizer(
+            batch_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=ROLLOUT_MAX_LENGTH,
+        )
+        inputs = _move_batch_to_device(_text_only_batch(inputs), device)
+        tokenizer.padding_side = orig_side
+
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new,
+            do_sample=True,
+            temperature=max(temp, 0.01),
+            top_p=1.0,
+            repetition_penalty=1.1,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        prompt_len = inputs["input_ids"].shape[1]
+        for i in range(len(batch_prompts)):
+            gen_tokens = output_ids[i][prompt_len:]
+            gen_tokens = gen_tokens[gen_tokens != tokenizer.pad_token_id]
+            # Protocol is Thought/Talk/Action with Qwen native thinking disabled.
+            # If a backend/model still emits <think>, strip it before storing history
+            # or training targets; keep our explicit Thought: field intact.
+            all_results.append(strip_qwen_native_thinking(tokenizer.decode(gen_tokens, skip_special_tokens=True)))
+    return all_results
+
+
+# ─── Episode state/data ──────────────────────────────────────────────────────
+@dataclass
+class EpisodeState:
+    product: dict
+    idx: int
+    buyer_texts: List[str] = field(default_factory=list)
+    seller_texts: List[str] = field(default_factory=list)
+    all_turns: List[Tuple[str, str]] = field(default_factory=list)
+    final_price: Optional[float] = None
+    outcome: str = "TIMEOUT"
+    done: bool = False
+    last_buyer_price: Optional[float] = None
+
+
+@dataclass
+class Episode:
+    product: dict
+    turns: List[Tuple[str, str]]  # [("buyer"|"seller", text), ...]
+    final_price: Optional[float]
+    reward: float
+    num_turns: int
+    outcome: str
+    first_offer_price: Optional[float]
+    budget_violations: int
+
+
+def run_episodes_batched(buyer_model, seller_model, tokenizer, products_expanded, device, seller_tokenizer=None):
+    """Run buyer-only negotiation episodes with frozen seller, batched per turn."""
+    seller_tokenizer = seller_tokenizer or tokenizer
+    states = [EpisodeState(product=p, idx=i) for i, p in enumerate(products_expanded)]
+
+    for turn_round in range(MAX_TURNS):
+        active_buyer = [s for s in states if not s.done]
+        if not active_buyer:
+            break
+
+        buyer_prompts = []
+        for s in active_buyer:
+            msgs = build_buyer_prompt(s.product)
+            for bt, st in zip(s.buyer_texts, s.seller_texts):
+                msgs.append({"role": "assistant", "content": bt})  # own Thought kept
+                msgs.append({"role": "user", "content": strip_thought(st)})
+            prompt_text = _apply_chat_template_text(
+                tokenizer, msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+            _assert_no_private_info_leak(prompt_text, s.product, "buyer")
+            buyer_prompts.append(prompt_text)
+
+        buyer_texts = generate_batched(buyer_model, tokenizer, buyer_prompts, MAX_NEW_TOKENS, BUYER_TEMP, device)
+
+        still_active_for_seller = []
+        for s, b_text in zip(active_buyer, buyer_texts):
+            b_act = extract_action(b_text)
+            s.buyer_texts.append(b_text)
+            s.all_turns.append(("buyer", b_text))
+
+            if b_act["type"] == "QUIT":
+                s.outcome = "BUYER_QUIT"
+                s.done = True
+            elif b_act["type"] == "UNKNOWN":
+                s.outcome = "BUYER_FORMAT_ERROR"
+                s.done = True
+            elif b_act["type"] == "DEAL":
+                if not s.seller_texts:
+                    s.outcome = "BUYER_DEAL_NO_SELLER_OFFER"
+                    s.done = True
+                else:
+                    last_s_act = extract_action(s.seller_texts[-1])
+                    if last_s_act["type"] != "SELL" or last_s_act.get("price") is None:
+                        s.outcome = "BUYER_DEAL_INVALID_SELLER_OFFER"
+                        s.done = True
+                    elif b_act.get("price") is not None and abs(b_act["price"] - last_s_act["price"]) > 0.01:
+                        s.outcome = "BUYER_DEAL_PRICE_MISMATCH"
+                        s.done = True
+                    else:
+                        s.final_price = last_s_act["price"]
+                        s.outcome = "DEAL_BUYER_ACCEPTS"
+                        s.done = True
+            elif b_act["type"] == "BUY":
+                b_price = b_act["price"]
+                if b_price is not None and b_price > s.product["budget"]:
+                    s.outcome = "BUYER_BUDGET_VIOLATION"
+                    s.done = True
+                else:
+                    s.last_buyer_price = b_price
+                    still_active_for_seller.append(s)
+            elif b_act["type"] == "REJECT":
+                s.last_buyer_price = None
+                still_active_for_seller.append(s)
+            else:
+                s.outcome = f"UNEXPECTED_{b_act['type']}"
+                s.done = True
+
+        if not still_active_for_seller:
+            continue
+
+        seller_prompts = []
+        for s in still_active_for_seller:
+            msgs = build_seller_prompt(s.product)
+            for bt, st in zip(s.buyer_texts, s.seller_texts):
+                msgs.append({"role": "user", "content": strip_thought(bt)})
+                msgs.append({"role": "assistant", "content": st})  # seller own Thought kept
+            if len(s.buyer_texts) > len(s.seller_texts):
+                msgs.append({"role": "user", "content": strip_thought(s.buyer_texts[-1])})
+            prompt_text = _apply_chat_template_text(
+                seller_tokenizer, msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+            _assert_no_private_info_leak(prompt_text, s.product, "seller")
+            seller_prompts.append(prompt_text)
+
+        seller_texts = generate_batched(seller_model, seller_tokenizer, seller_prompts, MAX_NEW_TOKENS, SELLER_TEMP, device)
+
+        for s, s_text in zip(still_active_for_seller, seller_texts):
+            s_act = extract_action(s_text)
+            r_price, done, reason = regulate_seller(s_act, s.last_buyer_price, s.product)
+            if reason == "SELL" and r_price is not None and s_act.get("price") != r_price:
+                # The regulated seller environment intercepts below-cost proposals.
+                # Update the visible Action so future buyer context and reward parsing
+                # use the valid regulated price, not the hallucinated below-cost one.
+                s_text = replace_final_action(s_text, "SELL", r_price, s.product)
+                s_act = extract_action(s_text)
+
+            s.seller_texts.append(s_text)
+            s.all_turns.append(("seller", s_text))
+
+            if done:
+                if reason == "DEAL_SELLER_ACCEPTS":
+                    s.final_price = r_price
+                s.outcome = reason
+                s.done = True
+
+    episodes = []
+    for s in states:
+        first_offer = None
+        budget_violations = 0
+        for role, text in s.all_turns:
+            if role != "buyer":
+                continue
+            act = extract_action(text)
+            if act["type"] == "BUY" and act["price"] is not None:
+                if first_offer is None:
+                    first_offer = act["price"]
+                if act["price"] > s.product["budget"]:
+                    budget_violations += 1
+        reward = compute_buyer_reward(s.final_price, s.product["budget"], s.product["cost"], s.outcome)
+        episodes.append(
+            Episode(
+                product=s.product,
+                turns=s.all_turns,
+                final_price=s.final_price,
+                reward=reward,
+                num_turns=len(s.all_turns),
+                outcome=s.outcome,
+                first_offer_price=first_offer,
+                budget_violations=budget_violations,
+            )
+        )
+    return episodes
+
+
+# ─── Log-probs and SDPO+GRPO buyer update ────────────────────────────────────
+def _token_logprobs(model, input_ids, attention_mask):
+    """Per-token log-probs using gather + logsumexp, avoiding full softmax tensor."""
+    out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    if not hasattr(out, "logits"):
+        raise RuntimeError(f"Model forward returned {type(out)} without .logits")
+    logits = out.logits[:, :-1, :]
+    target = input_ids[:, 1:].unsqueeze(-1)
+    target_logit = torch.gather(logits, 2, target).squeeze(-1)
+    log_z = torch.logsumexp(logits, dim=-1)
+    return target_logit - log_z
+
+
+def _sync_cuda():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _timer_start():
+    _sync_cuda()
+    return time.perf_counter()
+
+
+def _timer_add(timers, key, start):
+    _sync_cuda()
+    timers[key] = timers.get(key, 0.0) + (time.perf_counter() - start)
+
+
+def _chunked(seq, size):
+    size = max(int(size), 1)
+    for start in range(0, len(seq), size):
+        yield seq[start : start + size]
+
+
+def _norm_advantages(t):
+    if t.numel() < 2 or not NORMALIZE_ADVANTAGES:
+        return t
+    return (t - t.mean()) / (t.std() + 1e-8)
+
+
+def build_buyer_turn_prompt(ep, turn_idx):
+    """Reconstruct buyer prompt for ep.turns[turn_idx]."""
+    role, _ = ep.turns[turn_idx]
+    assert role == "buyer"
+    prompt_msgs = build_buyer_prompt(ep.product)
+    for j in range(turn_idx):
+        prev_role, prev_text = ep.turns[j]
+        if prev_role == "buyer":
+            prompt_msgs.append({"role": "assistant", "content": prev_text})
+        else:
+            prompt_msgs.append({"role": "user", "content": strip_thought(prev_text)})
+    return prompt_msgs
+
+
+def _public_transcript(ep, max_chars=SDPO_MAX_DEMO_CHARS):
+    """Public Talk/Action-only transcript for feedback demos."""
+    lines = []
+    for role, text in ep.turns:
+        speaker = "Buyer" if role == "buyer" else "Seller"
+        lines.append(f"{speaker}: {strip_thought(text)}")
+    transcript = "\n".join(lines).strip()
+    if len(transcript) <= max_chars:
+        return transcript
+    return transcript[:max_chars].rstrip() + "\n[truncated]"
+
+
+def _quality_label(reward):
+    if reward >= 0.75:
+        return "strong surplus"
+    if reward >= 0.35:
+        return "moderate surplus"
+    if reward > 0:
+        return "weak surplus"
+    if reward == 0:
+        return "no positive surplus"
+    return "negative outcome"
+
+
+def _best_demo_for(ep, group_eps):
+    """Pick an on-policy same-product demo without using any external teacher."""
+    better = [
+        other
+        for other in group_eps
+        if other.final_price is not None and other.reward > max(ep.reward + 1e-6, 0.0)
+    ]
+    if better:
+        return max(better, key=lambda other: other.reward), "sibling"
+    if ep.final_price is not None and ep.reward > 0:
+        return ep, "self"
+    return None, ""
+
+
+def _format_outcome_feedback(ep):
+    product = ep.product
+    budget = product["budget"]
+    lines = [
+        "Verifier feedback for the previous negotiation rollout:",
+        f"- Outcome: {ep.outcome}.",
+    ]
+
+    if "FORMAT_ERROR" in ep.outcome:
+        lines.append("- Diagnosis: the buyer output was not parseable as Thought/Talk/Action with a valid Action tag.")
+        lines.append("- Fix: keep the exact format and end with one explicit Action line.")
+    elif ep.outcome in {"BUYER_BUDGET_VIOLATION", "BUYER_DEAL_PRICE_MISMATCH", "BUYER_DEAL_INVALID_SELLER_OFFER"}:
+        lines.append("- Diagnosis: the buyer violated a hard protocol or budget constraint.")
+        lines.append("- Fix: never offer above the private budget; only DEAL an exact prior seller SELL offer.")
+    elif ep.final_price is None:
+        lines.append("- Diagnosis: no deal was reached, so the buyer captured no surplus.")
+        lines.append("- Fix: use an opening anchor and concessions that keep the seller engaged without revealing the budget.")
+    else:
+        price_ratio = ep.final_price / max(budget, 1e-6)
+        lines.append(f"- Final price: ${ep.final_price:.2f} against buyer budget ${budget:.2f}.")
+        lines.append(f"- Verifier label: {_quality_label(ep.reward)}.")
+        if price_ratio > 0.85:
+            lines.append("- Fix: the deal was too close to the budget; anchor lower and concede more slowly.")
+        elif price_ratio > 0.60:
+            lines.append("- Fix: valid deal, but there may be room for stronger anchoring or persuasion.")
+        else:
+            lines.append("- Keep: the price was meaningfully below budget; preserve the pressure-and-concession pattern.")
+
+    if SDPO_FEEDBACK_MODE == "oracle":
+        lines.extend(
+            [
+                "",
+                "Oracle-only ablation details:",
+                f"- Seller private cost: ${product['cost']:.2f}.",
+                f"- Mutual-interest instance: {product['mi']}.",
+                f"- Numeric reward: {ep.reward:.4f}.",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def build_sdpo_feedback(ep, group_eps):
+    """Build concise feedback for the self-teacher prompt.
+
+    Strict mode intentionally avoids exact seller cost/private floor text. It may
+    use qualitative verifier labels and on-policy public sibling demos.
+    """
+    if SDPO_FEEDBACK_MODE not in {"strict", "oracle"}:
+        raise ValueError(f"Unsupported SDPO_FEEDBACK_MODE={SDPO_FEEDBACK_MODE!r}")
+
+    feedback_parts = [_format_outcome_feedback(ep)]
+    demo, demo_kind = _best_demo_for(ep, group_eps)
+    has_demo = demo is not None
+    if demo is not None:
+        if demo_kind == "sibling":
+            feedback_parts.append(
+                "\nA better rollout sampled by the current policy for this same product is shown below. "
+                "It is a public Talk/Action transcript, not an external teacher answer."
+            )
+        else:
+            feedback_parts.append(
+                "\nThis rollout itself reached a positive deal. Use the public transcript below to reinforce "
+                "the useful parts without overfitting to wording."
+            )
+        feedback_parts.append(_public_transcript(demo))
+
+    feedback_parts.append(
+        "\nCorrectly continue the original buyer turn. Prefer valid format, budget discipline, "
+        "low but plausible anchoring, and concise persuasion."
+    )
+    feedback = "\n".join(feedback_parts).strip()
+    if len(feedback) > SDPO_MAX_FEEDBACK_CHARS:
+        feedback = feedback[:SDPO_MAX_FEEDBACK_CHARS].rstrip() + "\n[feedback truncated]"
+
+    if SDPO_FEEDBACK_MODE == "strict" and "cost_price" in feedback:
+        raise AssertionError("Strict SDPO feedback leaked cost_price field.")
+    return feedback, has_demo
+
+
+def build_sdpo_teacher_turn_prompt(ep, turn_idx, feedback):
+    """Prompt the same buyer model as a hindsight self-teacher."""
+    prompt_msgs = build_buyer_turn_prompt(ep, turn_idx)
+    prompt_msgs.append(
+        {
+            "role": "user",
+            "content": (
+                "Hindsight training feedback is available for your previous negotiation attempt. "
+                "Use it only to judge what the next buyer message should make more or less likely.\n\n"
+                f"{feedback}"
+            ),
+        }
+    )
+    return prompt_msgs
+
+
+def _current_lr(step_idx):
+    """Linear warmup only; no decay for the short 42-step RLVR run.
+
+    ``step_idx`` is the zero-based optimizer-step index. With WARMUP_STEPS=10,
+    the first step uses 10% of LR and the 10th step reaches the configured LR.
+    """
+    if WARMUP_STEPS <= 0:
+        return LR
+    return LR * min(1.0, float(step_idx + 1) / float(WARMUP_STEPS))
+
+
+def _cpu_adamw_step(params, state, lr, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=WEIGHT_DECAY):
+    """Exact AdamW step with optimizer state kept on CPU.
+
+    This preserves full fine-tuning and AdamW semantics while removing ~2x
+    parameter-size optimizer state from CUDA memory. Gradients are copied to CPU
+    one parameter at a time, so peak VRAM stays close to forward/backward memory.
+    """
+    with torch.no_grad():
+        for p in params:
+            if p.grad is None:
+                continue
+            sid = id(p)
+            st = state.get(sid)
+            if st is None:
+                st = {
+                    "step": 0,
+                    "exp_avg": torch.zeros_like(p.detach(), device="cpu", dtype=torch.float32),
+                    "exp_avg_sq": torch.zeros_like(p.detach(), device="cpu", dtype=torch.float32),
+                }
+                state[sid] = st
+            st["step"] += 1
+            grad = p.grad.detach().to(device="cpu", dtype=torch.float32)
+            exp_avg = st["exp_avg"]
+            exp_avg_sq = st["exp_avg_sq"]
+            exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+            bias_correction1 = 1.0 - beta1 ** st["step"]
+            bias_correction2 = 1.0 - beta2 ** st["step"]
+            denom = (exp_avg_sq.sqrt() / (bias_correction2 ** 0.5)).add_(eps)
+            update = exp_avg / bias_correction1 / denom
+            update = update.to(device=p.device, dtype=p.dtype)
+            if weight_decay:
+                # Decoupled AdamW decay: p <- p * (1 - lr * wd), independent of
+                # the adaptive gradient update. This mirrors torch.optim.AdamW.
+                p.add_(p, alpha=-lr * weight_decay)
+            p.add_(update, alpha=-lr)
+            p.grad = None
+            del grad, update
+
+
+def _optimizer_step(buyer_model, optimizer, cpu_adamw_state, step_idx):
+    grad_norm = torch.nn.utils.clip_grad_norm_(buyer_model.parameters(), GRAD_CLIP_NORM)
+    step_lr = _current_lr(step_idx)
+    if OPTIMIZER == "adamw_cpu":
+        _cpu_adamw_step([p for p in buyer_model.parameters() if p.requires_grad], cpu_adamw_state, lr=step_lr)
+    else:
+        for group in optimizer.param_groups:
+            group["lr"] = step_lr
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+    return float(grad_norm.detach().cpu().item() if torch.is_tensor(grad_norm) else grad_norm), step_lr
+
+
+def _encode_prompt_completion(tokenizer, prompt_text, completion_text):
+    """Pre-tokenize prompt and completion once and keep completion-mask metadata.
+
+    Prompt and completion are tokenized separately, then concatenated. That avoids
+    BPE boundary drift from tokenizing ``prompt`` and ``prompt + completion`` in
+    separate calls while still matching the causal-LM shifted-logprob objective.
+    If the pair exceeds UPDATE_MAX_LENGTH, left-truncate the prompt first so at
+    least the generated completion remains trainable.
+    """
+    prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+    completion_ids = tokenizer(completion_text or "", add_special_tokens=False)["input_ids"]
+    if not completion_ids:
+        completion_ids = [tokenizer.eos_token_id]
+
+    max_len = max(int(UPDATE_MAX_LENGTH), 2)
+    if len(completion_ids) >= max_len:
+        completion_ids = completion_ids[: max_len - 1]
+        prompt_ids = prompt_ids[-1:]
+    else:
+        prompt_budget = max_len - len(completion_ids)
+        if len(prompt_ids) > prompt_budget:
+            prompt_ids = prompt_ids[-prompt_budget:]
+
+    input_ids = prompt_ids + completion_ids
+    if len(input_ids) < 2:
+        input_ids = [tokenizer.eos_token_id] + input_ids
+    prompt_len = min(len(prompt_ids), len(input_ids) - 1)
+    completion_shift_start = max(prompt_len - 1, 0)
+    completion_shift_end = max(len(input_ids) - 1, completion_shift_start)
+    return {
+        "input_ids": input_ids,
+        "prompt_len": prompt_len,
+        "completion_shift_start": completion_shift_start,
+        "completion_shift_end": completion_shift_end,
+    }
+
+
+def _pad_encoded_batch(encoded_items, tokenizer, device):
+    if not encoded_items:
+        raise ValueError("Cannot collate an empty update microbatch")
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    max_len = max(len(item["input_ids"]) for item in encoded_items)
+    if UPDATE_PAD_TO_MULTIPLE_OF > 1:
+        rem = max_len % UPDATE_PAD_TO_MULTIPLE_OF
+        if rem:
+            max_len += UPDATE_PAD_TO_MULTIPLE_OF - rem
+    input_rows, attn_rows, mask_rows = [], [], []
+    for item in encoded_items:
+        ids = item["input_ids"]
+        seq_len = len(ids)
+        pad_len = max_len - seq_len
+        input_rows.append(ids + [pad_id] * pad_len)
+        attn_rows.append([1] * seq_len + [0] * pad_len)
+        # Mask shape matches shifted log-probs: [seq_len - 1]. Completion tokens
+        # occupy the precomputed shifted interval, clamped to the unpadded length.
+        shifted_len = max(max_len - 1, 0)
+        mask = [0] * shifted_len
+        start = max(min(item.get("completion_shift_start", item["prompt_len"] - 1), shifted_len), 0)
+        end = max(min(item.get("completion_shift_end", seq_len - 1), shifted_len), start)
+        for j in range(start, end):
+            mask[j] = 1
+        mask_rows.append(mask)
+    return {
+        "input_ids": torch.tensor(input_rows, dtype=torch.long, device=device),
+        "attention_mask": torch.tensor(attn_rows, dtype=torch.long, device=device),
+        "completion_mask": torch.tensor(mask_rows, dtype=torch.float32, device=device),
+    }
+
+
+def _build_group_update_examples(tokenizer, group_eps, advantages, timers):
+    """Flatten a GRPO group into buyer-turn update examples and pre-tokenize."""
+    start = _timer_start()
+    examples = []
+    sdpo_demo_count = 0
+    for i, ep in enumerate(group_eps):
+        feedback, has_demo = build_sdpo_feedback(ep, group_eps)
+        sdpo_demo_count += int(has_demo)
+        for turn_idx, (role, text) in enumerate(ep.turns):
+            if role != "buyer":
+                continue
+            prompt_msgs = build_buyer_turn_prompt(ep, turn_idx)
+            prompt_text = _apply_chat_template_text(
+                tokenizer, prompt_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+            _assert_no_private_info_leak(prompt_text, ep.product, "buyer")
+
+            teacher_prompt_msgs = build_sdpo_teacher_turn_prompt(ep, turn_idx, feedback)
+            teacher_prompt_text = _apply_chat_template_text(
+                tokenizer, teacher_prompt_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+            _assert_no_private_info_leak(teacher_prompt_text, ep.product, "buyer")
+
+            student_enc = _encode_prompt_completion(tokenizer, prompt_text, text)
+            teacher_enc = _encode_prompt_completion(tokenizer, teacher_prompt_text, text)
+            if len(student_enc["input_ids"]) < 2 or len(teacher_enc["input_ids"]) < 2:
+                continue
+            examples.append(
+                {
+                    "student": student_enc,
+                    "teacher": teacher_enc,
+                    "grpo_adv": float(advantages[i].detach().cpu().item()),
+                }
+            )
+    _timer_add(timers, "update_pretokenize_s", start)
+    return examples, sdpo_demo_count
+
+
+def _maybe_optimizer_step(buyer_model, optimizer, cpu_adamw_state, timers, step_idx, force=False):
+    start = _timer_start()
+    grad_present = any(p.grad is not None for p in buyer_model.parameters() if p.requires_grad)
+    _timer_add(timers, "update_grad_check_s", start)
+    if not grad_present:
+        return False, 0.0, _current_lr(step_idx)
+    start = _timer_start()
+    grad_norm, step_lr = _optimizer_step(buyer_model, optimizer, cpu_adamw_state, step_idx)
+    _timer_add(timers, "update_optimizer_s", start)
+    return True, grad_norm, step_lr
+
+
+def _rowwise_sdpo_adv(pol_lp, teacher_lp, student_mask, teacher_mask):
+    """Align teacher/student completion log-prob gaps independently per row."""
+    sdpo_adv = torch.zeros_like(pol_lp)
+    total_tokens = 0
+    abs_adv = 0.0
+    for row in range(pol_lp.shape[0]):
+        student_idx = student_mask[row].bool().nonzero(as_tuple=False).flatten()
+        teacher_idx = teacher_mask[row].bool().nonzero(as_tuple=False).flatten()
+        n_align = min(student_idx.numel(), teacher_idx.numel())
+        if not n_align:
+            continue
+        s_idx = student_idx[:n_align]
+        t_idx = teacher_idx[:n_align]
+        sdpo_values = (teacher_lp[row, t_idx] - pol_lp.detach()[row, s_idx]).clamp(-SDPO_ADV_CLIP, SDPO_ADV_CLIP)
+        sdpo_adv[row, s_idx] = sdpo_values.to(sdpo_adv.dtype)
+        total_tokens += int(n_align)
+        abs_adv += float(sdpo_values.abs().sum().item())
+    return sdpo_adv, total_tokens, abs_adv
+
+
+def sdpo_grpo_update(
+    buyer_model,
+    tokenizer,
+    episodes,
+    optimizer,
+    device,
+    cpu_adamw_state=None,
+    optimizer_step_start=0,
+    sdpo_lambda_value=None,
+):
+    """Buyer-only ref-free/on-policy GRPO update plus feedback-conditioned SDPO.
+
+    Performance notes:
+    - Buyer turns are flattened to pre-tokenized update examples per GRPO group.
+    - Forward/backward runs over UPDATE_MICROBATCH_SIZE examples rather than one
+      buyer turn at a time, improving A100 occupancy.
+    - CPU AdamW steps every OPTIM_STEP_EVERY_GROUPS groups by default. Losses are
+      scaled by the active accumulation window to preserve update magnitude.
+
+    Objective note:
+    - This is true ref-free/on-policy training: no frozen reference-policy model,
+      no reference forward, and no KL penalty. The loss is the sampled-token policy
+      gradient ``-A * log πθ(token)`` over buyer completion tokens. The SDPO
+      self-teacher is still the current buyer model under hindsight feedback.
+    """
+    buyer_model.train()
+    sdpo_lambda_value = SDPO_LAMBDA if sdpo_lambda_value is None else float(sdpo_lambda_value)
+    cpu_adamw_state = {} if cpu_adamw_state is None else cpu_adamw_state
+    G = GROUP_SIZE
+    num_groups = len(episodes) // G
+    total_loss = 0.0
+    turn_count = 0
+    sdpo_tokens = 0
+    sdpo_abs_adv = 0.0
+    sdpo_demo_count = 0
+    optimizer_steps = 0
+    grad_norm_last = 0.0
+    global_step = int(optimizer_step_start)
+    lr_last = _current_lr(global_step)
+    timers: Dict[str, float] = {
+        "update_pretokenize_s": 0.0,
+        "update_collate_s": 0.0,
+        "update_policy_forward_s": 0.0,
+        # Retained as a zero-valued schema-compatible metric for old dashboards.
+        "update_ref_forward_s": 0.0,
+        "update_teacher_forward_s": 0.0,
+        "update_loss_backward_s": 0.0,
+        "update_optimizer_s": 0.0,
+        "update_grad_check_s": 0.0,
+    }
+
+    optim_every = max(1, OPTIM_STEP_EVERY_GROUPS)
+    accum_groups = 0
+    loss_count = 0
+
+    for g in range(num_groups):
+        group_eps = episodes[g * G : (g + 1) * G]
+        rewards = torch.tensor([ep.reward for ep in group_eps], dtype=torch.float32, device=device)
+        advantages = _norm_advantages(rewards - rewards.mean())
+        group_examples, demo_count = _build_group_update_examples(tokenizer, group_eps, advantages, timers)
+        sdpo_demo_count += demo_count
+        if not group_examples:
+            continue
+
+        group_turn_count = len(group_examples)
+        window_start_group = (g // optim_every) * optim_every
+        loss_scale_groups = max(1, min(optim_every, num_groups - window_start_group))
+        for _inner in range(NUM_INNER_EPOCHS):
+            for mb_examples in _chunked(group_examples, UPDATE_MICROBATCH_SIZE):
+                start = _timer_start()
+                student_batch = _pad_encoded_batch([ex["student"] for ex in mb_examples], tokenizer, device)
+                teacher_batch = _pad_encoded_batch([ex["teacher"] for ex in mb_examples], tokenizer, device)
+                grpo_adv = torch.tensor([ex["grpo_adv"] for ex in mb_examples], dtype=torch.float32, device=device)
+                _timer_add(timers, "update_collate_s", start)
+
+                start = _timer_start()
+                pol_lp = _token_logprobs(buyer_model, student_batch["input_ids"], student_batch["attention_mask"])
+                _timer_add(timers, "update_policy_forward_s", start)
+
+                start = _timer_start()
+                with torch.no_grad():
+                    teacher_lp = _token_logprobs(
+                        buyer_model, teacher_batch["input_ids"], teacher_batch["attention_mask"]
+                    )
+                _timer_add(timers, "update_teacher_forward_s", start)
+
+                student_mask = student_batch["completion_mask"]
+                teacher_mask = teacher_batch["completion_mask"]
+                sdpo_adv, n_align, mb_abs_adv = _rowwise_sdpo_adv(pol_lp, teacher_lp, student_mask, teacher_mask)
+                sdpo_abs_adv += mb_abs_adv
+                sdpo_tokens += n_align
+
+                adv = (sdpo_lambda_value * grpo_adv.view(-1, 1) + (1.0 - sdpo_lambda_value) * sdpo_adv).detach()
+                policy_loss = -adv * pol_lp
+
+                token_counts = student_mask.sum(dim=1).clamp_min(1.0)
+                row_losses = (policy_loss * student_mask).sum(dim=1) / token_counts
+                # Preserve the old per-turn averaged objective: each buyer turn
+                # contributes one mean-over-completion loss, and microbatching only
+                # changes how those turn losses are grouped into forward/backward calls.
+                unscaled_loss = row_losses.sum()
+                loss = unscaled_loss / loss_scale_groups
+
+                start = _timer_start()
+                loss.backward()
+                _timer_add(timers, "update_loss_backward_s", start)
+
+                total_loss += float(row_losses.detach().sum().item())
+                loss_count += int(row_losses.numel())
+
+        turn_count += group_turn_count
+        accum_groups += 1
+
+        if accum_groups >= optim_every:
+            stepped, grad_norm_last, lr_last = _maybe_optimizer_step(
+                buyer_model, optimizer, cpu_adamw_state, timers, global_step
+            )
+            if stepped:
+                optimizer_steps += 1
+                global_step += 1
+            accum_groups = 0
+
+    if accum_groups > 0:
+        # If NUM_ITERS/BATCH_SIZE creates a remainder, take the final accumulated step.
+        stepped, grad_norm_last, lr_last = _maybe_optimizer_step(
+            buyer_model, optimizer, cpu_adamw_state, timers, global_step, force=True
+        )
+        if stepped:
+            optimizer_steps += 1
+            global_step += 1
+
+    return {
+        "loss": total_loss / max(loss_count, 1),
+        "sdpo_tokens": sdpo_tokens,
+        "sdpo_mean_abs_adv": sdpo_abs_adv / max(sdpo_tokens, 1),
+        "sdpo_demo_count": sdpo_demo_count,
+        "update_examples": turn_count,
+        "optimizer_steps": optimizer_steps,
+        "optimizer_global_step": global_step,
+        "grad_norm_last": grad_norm_last,
+        "lr_last": lr_last,
+        "sdpo_lambda_active": sdpo_lambda_value,
+        **timers,
+    }
+
+
+# ─── Metrics / checkpoint helpers ────────────────────────────────────────────
+def compute_iter_metrics(episodes):
+    rewards = [ep.reward for ep in episodes]
+    mean_r = sum(rewards) / max(len(rewards), 1)
+    deals = [ep for ep in episodes if ep.final_price is not None]
+    deal_rate = len(deals) / max(len(episodes), 1)
+    mean_price = sum(ep.final_price for ep in deals) / max(len(deals), 1) if deals else 0.0
+    mean_turns = sum(ep.num_turns for ep in episodes) / max(len(episodes), 1)
+    outcomes: Dict[str, int] = {}
+    for ep in episodes:
+        outcomes[ep.outcome] = outcomes.get(ep.outcome, 0) + 1
+    role_confusions = 0
+    for ep in episodes:
+        for role, text in ep.turns:
+            act = extract_action(text)
+            if role == "buyer" and act["type"] == "SELL":
+                role_confusions += 1
+            elif role == "seller" and act["type"] == "BUY":
+                role_confusions += 1
+    budget_violations = sum(1 for ep in episodes if ep.budget_violations > 0)
+    first_offer_ratios = [ep.first_offer_price / ep.product["budget"] for ep in episodes if ep.first_offer_price]
+    mean_first_offer_ratio = sum(first_offer_ratios) / max(len(first_offer_ratios), 1) if first_offer_ratios else None
+
+    return {
+        "mean_reward": mean_r,
+        "deal_rate": deal_rate,
+        "mean_price": mean_price,
+        "mean_turns": mean_turns,
+        "outcomes": dict(sorted(outcomes.items(), key=lambda x: -x[1])),
+        "role_confusions": role_confusions,
+        "price_overshoot_rate": budget_violations / max(len(episodes), 1),
+        "first_offer_ratio": mean_first_offer_ratio,
+    }
+
+
+def save_and_push_checkpoint(buyer_model, tokenizer, metrics, iteration, final=False, processor=None):
+    if not HUB_MODEL_ID:
+        return
+    branch = "main" if final else f"iter-{iteration + 1}"
+    label = "FINAL" if final else f"iter {iteration + 1}"
+    path = Path(OUTPUT_DIR if final else f"/tmp/sdpo-ckpt-{iteration+1}")
+    path.mkdir(parents=True, exist_ok=True)
+    buyer_model.save_pretrained(path)
+    (processor or tokenizer).save_pretrained(path)
+    with open(path / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+    if PUSH_TRAINING_SCRIPT:
+        try:
+            shutil.copyfile(__file__, path / "train_negotiation_sdpo.py")
+        except Exception:
+            pass
+
+    try:
+        from huggingface_hub import HfApi, create_repo
+
+        token = os.environ.get("HF_TOKEN")
+        api = HfApi(token=token)
+        create_repo(HUB_MODEL_ID, exist_ok=True, token=token)
+        if not final:
+            try:
+                api.create_branch(HUB_MODEL_ID, branch=branch, repo_type="model")
+            except Exception:
+                pass
+        api.upload_folder(
+            folder_path=path,
+            repo_id=HUB_MODEL_ID,
+            repo_type="model",
+            revision=branch,
+            commit_message=f"SDPO negotiation {label}",
+        )
+        print(f"  [CHECKPOINT] ✅ Pushed {label} to {HUB_MODEL_ID}@{branch}")
+    except Exception as e:
+        print(f"  [CHECKPOINT] ⚠️ Push failed (non-fatal): {e}")
+    finally:
+        if not final:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+def check_cuda():
+    print(f"PyTorch: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if not torch.cuda.is_available():
+        print("FATAL: No CUDA")
+        sys.exit(1)
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    x = torch.randn(2, 2).cuda() @ torch.randn(2, 2).cuda()
+    print(f"Compute test: {x.device} OK")
+    print("=" * 70, flush=True)
+
+
+def main():
+    check_cuda()
+
+    print("[CONFIG] Negotiation SDPO+GRPO buyer-only training")
+    print(f"[CONFIG] BuyerModel={MODEL_NAME} SellerModel={SELLER_MODEL_NAME}")
+    print(f"[CONFIG] Iters={NUM_ITERS} Batch={BATCH_SIZE} Group={GROUP_SIZE} Episodes/iter={BATCH_SIZE*GROUP_SIZE}")
+    print(f"[CONFIG] Turns={MAX_TURNS} LR={LR} WarmupSteps={WARMUP_STEPS} WD={WEIGHT_DECAY} GradClip={GRAD_CLIP_NORM}")
+    print(f"[CONFIG] RefFree=True KL={KL_COEF} Eps={EPSILON} (unused ref-free)")
+    print(f"[CONFIG] BuyerTemp={BUYER_TEMP} SellerTemp={SELLER_TEMP} MaxNew={MAX_NEW_TOKENS}")
+    print(f"[CONFIG] GradCheckpoint={GRADIENT_CHECKPOINTING} GenBatchLimit={GEN_BATCH_LIMIT} RolloutMaxLength={ROLLOUT_MAX_LENGTH}")
+    print(f"[CONFIG] DeviceMap={MODEL_DEVICE_MAP} MaxMemoryPerGPUGiB={MAX_MEMORY_PER_GPU_GIB or '(unset)'}")
+    print(f"[CONFIG] InnerEpochs={NUM_INNER_EPOCHS} NormAdvantages={NORMALIZE_ADVANTAGES}")
+    print(
+        f"[CONFIG] SDPO_LambdaStart={SDPO_LAMBDA} Final={SDPO_LAMBDA_FINAL} "
+        f"DecayIters={SDPO_LAMBDA_DECAY_ITERS} FeedbackMode={SDPO_FEEDBACK_MODE} "
+        f"AdvClip={SDPO_ADV_CLIP} MaxFeedbackChars={SDPO_MAX_FEEDBACK_CHARS} AdamWForeach={ADAMW_FOREACH}"
+    )
+    print(
+        f"[CONFIG] UpdateMicrobatch={UPDATE_MICROBATCH_SIZE} "
+        f"OptimStepEveryGroups={OPTIM_STEP_EVERY_GROUPS} "
+        f"UpdatePadMultiple={UPDATE_PAD_TO_MULTIPLE_OF} UpdateMaxLength={UPDATE_MAX_LENGTH}"
+    )
+    print(f"[CONFIG] CheckpointEvery={CHECKPOINT_EVERY} Hub={HUB_MODEL_ID or '(disabled)'}")
+    print("=" * 70, flush=True)
+
+    try:
+        import wandb
+
+        run_name = RUN_NAME or default_run_name()
+        wandb_run = wandb.init(
+            entity=WANDB_ENTITY,
+            project=WANDB_PROJECT,
+            name=run_name,
+            group=os.environ.get("WANDB_GROUP", default_wandb_group()),
+            job_type=WANDB_JOB_TYPE,
+            mode=WANDB_MODE,
+            tags=WANDB_TAGS,
+            save_code=False,
+            config={
+                "method": "negotiation_sdpo_grpo_qwen35_ref_free",
+                "buyer_model": MODEL_NAME,
+                "seller_model": SELLER_MODEL_NAME,
+                "num_iters": NUM_ITERS,
+                "batch_size": BATCH_SIZE,
+                "group_size": GROUP_SIZE,
+                "max_turns": MAX_TURNS,
+                "lr": LR,
+                "weight_decay": WEIGHT_DECAY,
+                "warmup_steps": WARMUP_STEPS,
+                "grad_clip_norm": GRAD_CLIP_NORM,
+                "epsilon": EPSILON,
+                "kl_coef": KL_COEF,
+                "ref_free_objective": True,
+                "reference_model_used": False,
+                "max_new_tokens": MAX_NEW_TOKENS,
+                "buyer_temp": BUYER_TEMP,
+                "seller_temp": SELLER_TEMP,
+                "normalize_advantages": NORMALIZE_ADVANTAGES,
+                "num_inner_epochs": NUM_INNER_EPOCHS,
+                "sdpo_lambda": SDPO_LAMBDA,
+                "sdpo_lambda_final": SDPO_LAMBDA_FINAL,
+                "sdpo_lambda_decay_iters": SDPO_LAMBDA_DECAY_ITERS,
+                "sdpo_feedback_mode": SDPO_FEEDBACK_MODE,
+                "sdpo_adv_clip": SDPO_ADV_CLIP,
+                "distillation_level": DISTILLATION_LEVEL,
+                "top_k_distillation": TOP_K_DISTILLATION,
+                "distillation_divergence": DISTILLATION_DIVERGENCE,
+                "trust_region_interpolation": TRUST_REGION_INTERPOLATION,
+                "teacher_ema_decay": TEACHER_EMA_DECAY,
+                "sdpo_max_demo_chars": SDPO_MAX_DEMO_CHARS,
+                "sdpo_max_feedback_chars": SDPO_MAX_FEEDBACK_CHARS,
+                "optimizer": OPTIMIZER,
+                "adamw_foreach": ADAMW_FOREACH,
+                "update_microbatch_size": UPDATE_MICROBATCH_SIZE,
+                "optim_step_every_groups": OPTIM_STEP_EVERY_GROUPS,
+                "update_pad_to_multiple_of": UPDATE_PAD_TO_MULTIPLE_OF,
+                "rollout_max_length": ROLLOUT_MAX_LENGTH,
+                "update_max_length": UPDATE_MAX_LENGTH,
+                "model_device_map": MODEL_DEVICE_MAP,
+                "max_memory_per_gpu_gib": MAX_MEMORY_PER_GPU_GIB,
+                "liger_kernel": USE_LIGER,
+                "dataset_categories": CATEGORIES,
+            },
+        )
+        WANDB_OK = True
+        print(f"[WANDB] Run: {wandb_run.url}")
+    except Exception as e:
+        print(f"[WANDB] Init failed (non-fatal): {e}")
+        WANDB_OK = False
+        wandb = None
+        wandb_run = None
+
+    print("\n[1/5] Loading dataset...")
+    train_products, _ = load_products(seed=SEED)
+
+    print(f"\n[2/5] Loading tokenizer/processor ({MODEL_NAME})...")
+    buyer_processor = None
+    seller_processor = None
+    print("  [OK] Deferred to model loader so Qwen3.5 can use AutoProcessor")
+
+    print("\n[3/5] Loading trainable buyer model...")
+    buyer_model, buyer_processor, tokenizer = _load_text_or_image_text_stack(MODEL_NAME)
+    _assert_no_cpu_offload(buyer_model, "buyer_model")
+    if GRADIENT_CHECKPOINTING:
+        buyer_model.gradient_checkpointing_enable()
+        if hasattr(buyer_model, "config"):
+            buyer_model.config.use_cache = False
+    dev = _model_input_device(buyer_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    _qwen35_text_canary(buyer_model, buyer_processor, tokenizer, dev, "buyer_model")
+    print(f"  [OK] InputDevice={dev} FirstParamDevice={_first_model_device(buyer_model)} VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
+
+    print("\n[4/5] Loading frozen seller/environment model (no reference-policy model)...")
+    seller_model, seller_processor, seller_tokenizer = _load_text_or_image_text_stack(SELLER_MODEL_NAME)
+    _assert_no_cpu_offload(seller_model, "seller_model")
+    if seller_tokenizer.pad_token is None:
+        seller_tokenizer.pad_token = seller_tokenizer.eos_token
+    if SELLER_MODEL_NAME != MODEL_NAME:
+        print("  [WARN] Separate seller tokenizer loaded; rollouts use buyer tokenizer for shared prompt formatting")
+    _qwen35_text_canary(seller_model, seller_processor, seller_tokenizer, _model_input_device(seller_model), "seller_model")
+    seller_model.eval()
+    for p in seller_model.parameters():
+        p.requires_grad = False
+    print(f"  [OK] VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
+
+    print(
+        f"\n[5/5] Optimizer (AdamW, lr={LR}, warmup_steps={WARMUP_STEPS}, "
+        f"betas=(0.9,0.95), wd={WEIGHT_DECAY}, grad_clip={GRAD_CLIP_NORM}, "
+        f"optimizer={OPTIMIZER}, foreach={ADAMW_FOREACH})..."
+    )
+    if OPTIMIZER == "adamw_cpu":
+        optimizer = None
+        cpu_adamw_state = {}
+        print("  [OK] AdamW optimizer state will be stored on CPU to avoid CUDA optimizer-step OOM")
+    elif OPTIMIZER == "adamw_cuda":
+        optimizer = torch.optim.AdamW(
+            buyer_model.parameters(),
+            lr=LR,
+            betas=(0.9, 0.95),
+            weight_decay=WEIGHT_DECAY,
+            foreach=ADAMW_FOREACH,
+        )
+        cpu_adamw_state = None
+    else:
+        raise ValueError(f"Unsupported OPTIMIZER={OPTIMIZER}; use adamw_cpu or adamw_cuda")
+    n_params = sum(p.numel() for p in buyer_model.parameters() if p.requires_grad)
+    print(f"  Trainable params: {n_params:,}")
+
+    print(f"\n{'=' * 70}\nNEGOTIATION SDPO+GRPO TRAINING\n{'=' * 70}")
+    metrics = []
+    optimizer_global_step = 0
+    t0 = time.time()
+
+    for iteration in range(NUM_ITERS):
+        t_iter = time.time()
+        print(f"\n--- Iteration {iteration} ---")
+        print(f"  VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB")
+
+        products = random.sample(train_products, min(BATCH_SIZE, len(train_products)))
+        products_expanded = [p for p in products for _ in range(GROUP_SIZE)]
+        n_episodes = len(products_expanded)
+        print(f"  Sampling {len(products)} products × {GROUP_SIZE} rollouts = {n_episodes} episodes...")
+
+        lambda_active = active_sdpo_lambda(iteration)
+        print(f"  Active SDPO_LAMBDA={lambda_active:.4f} (GRPO weight; SDPO weight={1.0 - lambda_active:.4f})")
+        buyer_model.eval()
+        seller_model.eval()
+        torch.cuda.reset_peak_memory_stats()
+        rollout_t0 = time.time()
+        episodes = run_episodes_batched(buyer_model, seller_model, tokenizer, products_expanded, dev, seller_tokenizer=seller_tokenizer)
+        rollout_time = time.time() - rollout_t0
+        rollout_peak_vram = torch.cuda.max_memory_allocated() / 1e9
+        print(f"  Rollout: {n_episodes} episodes in {rollout_time:.0f}s ({rollout_time/n_episodes:.1f}s/ep)")
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        buyer_model.train()
+        print("  SDPO+GRPO update on buyer turns only...")
+        torch.cuda.reset_peak_memory_stats()
+        update_stats = sdpo_grpo_update(
+            buyer_model,
+            tokenizer,
+            episodes,
+            optimizer,
+            dev,
+            cpu_adamw_state,
+            optimizer_global_step,
+            sdpo_lambda_value=lambda_active,
+        )
+        update_peak_vram = torch.cuda.max_memory_allocated() / 1e9
+        optimizer_global_step = update_stats["optimizer_global_step"]
+        loss = update_stats["loss"]
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        iter_metrics = compute_iter_metrics(episodes)
+        elapsed = time.time() - t_iter
+        update_time = elapsed - rollout_time
+        current_vram = torch.cuda.memory_allocated() / 1e9
+        peak_vram = max(rollout_peak_vram, update_peak_vram)
+
+        print(
+            f"  Loss={loss:.4f} Reward={iter_metrics['mean_reward']:.4f} "
+            f"Deal={iter_metrics['deal_rate']:.1%} Price=${iter_metrics['mean_price']:.2f} "
+            f"Turns={iter_metrics['mean_turns']:.1f}"
+        )
+        print(
+            f"  SDPO tokens={update_stats['sdpo_tokens']} "
+            f"mean|A|={update_stats['sdpo_mean_abs_adv']:.4f} "
+            f"demos={update_stats['sdpo_demo_count']}"
+        )
+        print(f"  FirstOfferRatio={iter_metrics['first_offer_ratio']} Overshoot={iter_metrics['price_overshoot_rate']:.1%}")
+        print(
+            f"  Update: examples={update_stats['update_examples']} "
+            f"optimizer_steps={update_stats['optimizer_steps']} lr={update_stats['lr_last']:.2e} "
+            f"grad_norm={update_stats['grad_norm_last']:.4f}"
+        )
+        print(f"  Time={elapsed:.0f}s (rollout={rollout_time:.0f}s update={update_time:.0f}s)")
+        print(
+            f"  Phase VRAM peaks: rollout={rollout_peak_vram:.1f}GB "
+            f"update={update_peak_vram:.1f}GB overall={peak_vram:.1f}GB"
+        )
+        print(
+            "  Update timers: "
+            f"pretokenize={update_stats['update_pretokenize_s']:.1f}s "
+            f"collate={update_stats['update_collate_s']:.1f}s "
+            f"policy_fwd={update_stats['update_policy_forward_s']:.1f}s "
+            f"ref_fwd={update_stats['update_ref_forward_s']:.1f}s(ref-free) "
+            f"teacher_fwd={update_stats['update_teacher_forward_s']:.1f}s "
+            f"backward={update_stats['update_loss_backward_s']:.1f}s "
+            f"optimizer={update_stats['update_optimizer_s']:.1f}s "
+            f"grad_check={update_stats['update_grad_check_s']:.1f}s"
+        )
+        print(f"  Outcomes: {dict(list(iter_metrics['outcomes'].items())[:6])}")
+        if iter_metrics["role_confusions"]:
+            print(f"  ⚠️ ROLE CONFUSIONS: {iter_metrics['role_confusions']}")
+        print(f"  VRAM: {current_vram:.1f}GB current, {peak_vram:.1f}GB peak", flush=True)
+
+        row = {
+            "iteration": iteration,
+            "loss": loss,
+            **iter_metrics,
+            "sdpo_tokens": update_stats["sdpo_tokens"],
+            "sdpo_mean_abs_adv": update_stats["sdpo_mean_abs_adv"],
+            "sdpo_demo_count": update_stats["sdpo_demo_count"],
+            "update_examples": update_stats["update_examples"],
+            "optimizer_steps": update_stats["optimizer_steps"],
+            "optimizer_global_step": update_stats["optimizer_global_step"],
+            "lr_last": update_stats["lr_last"],
+            "grad_norm_last": update_stats["grad_norm_last"],
+            "sdpo_lambda_active": update_stats["sdpo_lambda_active"],
+            "time": elapsed,
+            "rollout_time": rollout_time,
+            "update_time": update_time,
+            "update_pretokenize_s": update_stats["update_pretokenize_s"],
+            "update_collate_s": update_stats["update_collate_s"],
+            "update_policy_forward_s": update_stats["update_policy_forward_s"],
+            "update_ref_forward_s": update_stats["update_ref_forward_s"],
+            "update_teacher_forward_s": update_stats["update_teacher_forward_s"],
+            "update_loss_backward_s": update_stats["update_loss_backward_s"],
+            "update_optimizer_s": update_stats["update_optimizer_s"],
+            "update_grad_check_s": update_stats["update_grad_check_s"],
+            "vram_current_gb": current_vram,
+            "vram_peak_gb": peak_vram,
+            "rollout_vram_peak_gb": rollout_peak_vram,
+            "update_vram_peak_gb": update_peak_vram,
+        }
+        metrics.append(row)
+
+        if WANDB_OK:
+            try:
+                wandb.log(
+                    {
+                        "train/loss": loss,
+                        "reward/buyer": iter_metrics["mean_reward"],
+                        "negotiation/deal_rate": iter_metrics["deal_rate"],
+                        "negotiation/mean_price": iter_metrics["mean_price"],
+                        "negotiation/mean_turns": iter_metrics["mean_turns"],
+                        "negotiation/first_offer_ratio": iter_metrics["first_offer_ratio"] or 0.0,
+                        "negotiation/price_overshoot_rate": iter_metrics["price_overshoot_rate"],
+                        "sdpo/tokens": update_stats["sdpo_tokens"],
+                        "sdpo/mean_abs_adv": update_stats["sdpo_mean_abs_adv"],
+                        "sdpo/demo_count": update_stats["sdpo_demo_count"],
+                        "perf/iter_time_s": elapsed,
+                        "perf/rollout_time_s": rollout_time,
+                        "perf/update_time_s": update_time,
+                        "objective/ref_free": 1,
+                        "objective/reference_model_used": 0,
+                        "objective/kl_coef": KL_COEF,
+                        "objective/sdpo_lambda_active": update_stats["sdpo_lambda_active"],
+                        "perf/update_pretokenize_s": update_stats["update_pretokenize_s"],
+                        "perf/update_collate_s": update_stats["update_collate_s"],
+                        "perf/update_policy_forward_s": update_stats["update_policy_forward_s"],
+                        "perf/update_ref_forward_s": update_stats["update_ref_forward_s"],
+                        "perf/update_teacher_forward_s": update_stats["update_teacher_forward_s"],
+                        "perf/update_loss_backward_s": update_stats["update_loss_backward_s"],
+                        "perf/update_optimizer_s": update_stats["update_optimizer_s"],
+                        "perf/update_grad_check_s": update_stats["update_grad_check_s"],
+                        "perf/update_examples": update_stats["update_examples"],
+                        "perf/optimizer_steps": update_stats["optimizer_steps"],
+                        "train/optimizer_global_step": update_stats["optimizer_global_step"],
+                        "train/lr": update_stats["lr_last"],
+                        "train/grad_norm_last": update_stats["grad_norm_last"],
+                        "perf/vram_gb": current_vram,
+                        "perf/vram_peak_gb": peak_vram,
+                        "perf/rollout_vram_peak_gb": rollout_peak_vram,
+                        "perf/update_vram_peak_gb": update_peak_vram,
+                        "sanity/role_confusions": iter_metrics["role_confusions"],
+                    },
+                    step=iteration,
+                )
+                if iteration == 0:
+                    wandb.alert(
+                        "sdpo_negotiation_started",
+                        f"iter=0 reward={iter_metrics['mean_reward']:.4f} deal_rate={iter_metrics['deal_rate']:.3f}; continue 42-iter run if format errors stay low",
+                        level=wandb.AlertLevel.INFO,
+                    )
+                if iter_metrics["mean_reward"] < -0.5:
+                    wandb.alert(
+                        "low_reward_warning",
+                        f"reward={iter_metrics['mean_reward']:.4f} at iter={iteration}; if persistent, reduce LR or lower SDPO weight",
+                        level=wandb.AlertLevel.WARN,
+                    )
+                fmt_errors = iter_metrics["outcomes"].get("BUYER_FORMAT_ERROR", 0)
+                if fmt_errors > 0.25 * n_episodes:
+                    wandb.alert(
+                        "format_collapse_warning",
+                        f"buyer_format_errors={fmt_errors}/{n_episodes} at iter={iteration}; try LR x0.1 or SDPO_LAMBDA closer to 1.0",
+                        level=wandb.AlertLevel.WARN,
+                    )
+            except Exception as e:
+                print(f"  [WANDB] Log/alert failed (non-fatal): {e}")
+
+        should_ckpt = (
+            CHECKPOINT_EVERY > 0
+            and (iteration + 1) % CHECKPOINT_EVERY == 0
+            and iteration < NUM_ITERS - 1
+        )
+        if should_ckpt:
+            print(f"  [CHECKPOINT] Saving iter {iteration+1}...")
+            save_and_push_checkpoint(buyer_model, tokenizer, metrics, iteration, final=False, processor=buyer_processor)
+
+    print(f"\n{'=' * 70}\nSAVING FINAL\n{'=' * 70}")
+    save_path = Path(OUTPUT_DIR)
+    save_path.mkdir(parents=True, exist_ok=True)
+    buyer_model.save_pretrained(save_path)
+    (buyer_processor or tokenizer).save_pretrained(save_path)
+    with open(save_path / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+    if PUSH_TRAINING_SCRIPT:
+        try:
+            shutil.copyfile(__file__, save_path / "train_negotiation_sdpo.py")
+        except Exception:
+            pass
+    print(f"  Saved to {save_path}")
+
+    if HUB_MODEL_ID:
+        save_and_push_checkpoint(buyer_model, tokenizer, metrics, NUM_ITERS - 1, final=True, processor=buyer_processor)
+
+    total = time.time() - t0
+    print(f"\n{'=' * 70}")
+    print(f"COMPLETE  Total time: {total:.1f}s ({total/60:.1f} min)")
+    print(f"{'=' * 70}")
+
+    if WANDB_OK:
+        try:
+            wandb.alert("sdpo_negotiation_complete", f"iters={NUM_ITERS}; final_reward={metrics[-1]['mean_reward']:.4f}; final_deal_rate={metrics[-1]['deal_rate']:.3f}", level=wandb.AlertLevel.INFO)
+            wandb.finish()
+            print(f"[WANDB] Finished. Run: {wandb_run.url if wandb_run else '(unavailable)'}")
+        except Exception as e:
+            print(f"[WANDB] Finish failed (non-fatal): {e}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"\nFATAL: {e}")
+        traceback.print_exc()
+        sys.exit(1)
