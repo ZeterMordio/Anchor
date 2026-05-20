@@ -38,6 +38,7 @@ from typing import Dict, List, Optional, Tuple
 
 # HF Jobs log streaming: avoid buffered multi-minute stalls.
 os.environ["PYTHONUNBUFFERED"] = "1"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
