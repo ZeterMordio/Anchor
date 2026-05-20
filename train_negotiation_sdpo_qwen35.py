@@ -88,9 +88,10 @@ NUM_ITERS = int(os.environ.get("NUM_ITERS", "60"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 GROUP_SIZE = int(os.environ.get("GROUP_SIZE", "8"))
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "6"))
-# Dense Qwen RLVR collapsed at 3e-5 in this repo; 5e-6 is the intentionally
-# bolder real-run default, cushioned by warmup, clipping, and weight decay.
-LR = float(os.environ.get("LR", "5e-6"))
+# Dense Qwen RLVR collapsed at 3e-5 in this repo. Qwen3.5 9B's 2-iter
+# production-shape smoke only exercised warmup up to 1e-6, so use a cautious
+# real-run default while keeping warmup, clipping, and weight decay.
+LR = float(os.environ.get("LR", "3e-6"))
 WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.01"))
 WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", "10"))
 GRAD_CLIP_NORM = float(os.environ.get("GRAD_CLIP_NORM", "1.0"))
@@ -1564,6 +1565,57 @@ def sdpo_grpo_update(
 
 
 # ─── Metrics / checkpoint helpers ────────────────────────────────────────────
+def compute_product_mix_metrics(products):
+    if not products:
+        return {
+            "sample_product_count": 0,
+            "sample_unique_product_count": 0,
+            "sample_product_hash": "",
+            "sample_mean_budget": 0.0,
+            "sample_mean_cost": 0.0,
+            "sample_mean_list_price": 0.0,
+            "sample_mean_current_price": 0.0,
+            "sample_mean_average_price": 0.0,
+            "sample_mean_highest_price": 0.0,
+            "sample_mean_budget_cost_spread": 0.0,
+            "sample_mean_budget_cost_spread_ratio": 0.0,
+            "sample_mi_rate": 0.0,
+            "sample_category_counts": {},
+            "sample_product_ids": [],
+        }
+
+    import hashlib
+
+    ids = [str(p.get("codename", "")) for p in products]
+    categories: Dict[str, int] = {}
+    for p in products:
+        cat = str(p.get("category", "unknown"))
+        categories[cat] = categories.get(cat, 0) + 1
+
+    def mean_key(key):
+        return sum(float(p.get(key, 0.0) or 0.0) for p in products) / len(products)
+
+    spreads = [float(p.get("budget", 0.0) or 0.0) - float(p.get("cost", 0.0) or 0.0) for p in products]
+    budgets = [max(float(p.get("budget", 0.0) or 0.0), 1e-6) for p in products]
+    digest = hashlib.sha1(",".join(ids).encode("utf-8")).hexdigest()[:12]
+    return {
+        "sample_product_count": len(products),
+        "sample_unique_product_count": len(set(ids)),
+        "sample_product_hash": digest,
+        "sample_mean_budget": mean_key("budget"),
+        "sample_mean_cost": mean_key("cost"),
+        "sample_mean_list_price": mean_key("list_price"),
+        "sample_mean_current_price": mean_key("current_price"),
+        "sample_mean_average_price": mean_key("average_price"),
+        "sample_mean_highest_price": mean_key("highest_price"),
+        "sample_mean_budget_cost_spread": sum(spreads) / len(spreads),
+        "sample_mean_budget_cost_spread_ratio": sum(s / b for s, b in zip(spreads, budgets)) / len(spreads),
+        "sample_mi_rate": sum(1 for p in products if p.get("mi")) / len(products),
+        "sample_category_counts": dict(sorted(categories.items())),
+        "sample_product_ids": ids,
+    }
+
+
 def compute_iter_metrics(episodes):
     rewards = [ep.reward for ep in episodes]
     mean_r = sum(rewards) / max(len(rewards), 1)
@@ -1816,9 +1868,16 @@ def main():
         print(f"  VRAM: total={current_vram_total:.1f}GB per_gpu={_fmt_gpu_gb(current_vram_per_gpu)}")
 
         products = random.sample(train_products, min(BATCH_SIZE, len(train_products)))
+        product_mix = compute_product_mix_metrics(products)
         products_expanded = [p for p in products for _ in range(GROUP_SIZE)]
         n_episodes = len(products_expanded)
         print(f"  Sampling {len(products)} products × {GROUP_SIZE} rollouts = {n_episodes} episodes...")
+        print(
+            f"  Product mix: hash={product_mix['sample_product_hash']} "
+            f"budget=${product_mix['sample_mean_budget']:.2f} cost=${product_mix['sample_mean_cost']:.2f} "
+            f"list=${product_mix['sample_mean_list_price']:.2f} spread=${product_mix['sample_mean_budget_cost_spread']:.2f} "
+            f"MI={product_mix['sample_mi_rate']:.1%} cats={product_mix['sample_category_counts']}"
+        )
 
         lambda_active = active_sdpo_lambda(iteration)
         print(f"  Active SDPO_LAMBDA={lambda_active:.4f} (GRPO weight; SDPO weight={1.0 - lambda_active:.4f})")
@@ -1924,6 +1983,7 @@ def main():
             "iteration": iteration,
             "loss": loss,
             **iter_metrics,
+            **product_mix,
             "sdpo_tokens": update_stats["sdpo_tokens"],
             "sdpo_mean_abs_adv": update_stats["sdpo_mean_abs_adv"],
             "sdpo_demo_count": update_stats["sdpo_demo_count"],
@@ -1974,6 +2034,18 @@ def main():
                         "negotiation/mean_turns": iter_metrics["mean_turns"],
                         "negotiation/first_offer_ratio": iter_metrics["first_offer_ratio"] or 0.0,
                         "negotiation/price_overshoot_rate": iter_metrics["price_overshoot_rate"],
+                        "sample/product_count": product_mix["sample_product_count"],
+                        "sample/unique_product_count": product_mix["sample_unique_product_count"],
+                        "sample/mean_budget": product_mix["sample_mean_budget"],
+                        "sample/mean_cost": product_mix["sample_mean_cost"],
+                        "sample/mean_list_price": product_mix["sample_mean_list_price"],
+                        "sample/mean_current_price": product_mix["sample_mean_current_price"],
+                        "sample/mean_average_price": product_mix["sample_mean_average_price"],
+                        "sample/mean_highest_price": product_mix["sample_mean_highest_price"],
+                        "sample/mean_budget_cost_spread": product_mix["sample_mean_budget_cost_spread"],
+                        "sample/mean_budget_cost_spread_ratio": product_mix["sample_mean_budget_cost_spread_ratio"],
+                        "sample/mi_rate": product_mix["sample_mi_rate"],
+                        **{f"sample/category_count/{k}": v for k, v in product_mix["sample_category_counts"].items()},
                         "sdpo/tokens": update_stats["sdpo_tokens"],
                         "sdpo/mean_abs_adv": update_stats["sdpo_mean_abs_adv"],
                         "sdpo/demo_count": update_stats["sdpo_demo_count"],
