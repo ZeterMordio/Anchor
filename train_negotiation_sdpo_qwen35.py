@@ -997,6 +997,31 @@ def _sync_cuda():
         torch.cuda.synchronize()
 
 
+def _reset_peak_memory_stats_all_gpus():
+    if not torch.cuda.is_available():
+        return
+    for idx in range(torch.cuda.device_count()):
+        torch.cuda.reset_peak_memory_stats(idx)
+
+
+def _peak_memory_allocated_all_gpus_gb():
+    if not torch.cuda.is_available():
+        return 0.0, []
+    per_gpu = [torch.cuda.max_memory_allocated(idx) / 1e9 for idx in range(torch.cuda.device_count())]
+    return max(per_gpu) if per_gpu else 0.0, per_gpu
+
+
+def _memory_allocated_all_gpus_gb():
+    if not torch.cuda.is_available():
+        return 0.0, []
+    per_gpu = [torch.cuda.memory_allocated(idx) / 1e9 for idx in range(torch.cuda.device_count())]
+    return sum(per_gpu), per_gpu
+
+
+def _fmt_gpu_gb(values):
+    return "[" + ", ".join(f"{v:.1f}" for v in values) + "]"
+
+
 def _timer_start():
     _sync_cuda()
     return time.perf_counter()
@@ -1765,7 +1790,8 @@ def main():
     for iteration in range(NUM_ITERS):
         t_iter = time.time()
         print(f"\n--- Iteration {iteration} ---")
-        print(f"  VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB")
+        current_vram_total, current_vram_per_gpu = _memory_allocated_all_gpus_gb()
+        print(f"  VRAM: total={current_vram_total:.1f}GB per_gpu={_fmt_gpu_gb(current_vram_per_gpu)}")
 
         products = random.sample(train_products, min(BATCH_SIZE, len(train_products)))
         products_expanded = [p for p in products for _ in range(GROUP_SIZE)]
@@ -1776,18 +1802,18 @@ def main():
         print(f"  Active SDPO_LAMBDA={lambda_active:.4f} (GRPO weight; SDPO weight={1.0 - lambda_active:.4f})")
         buyer_model.eval()
         seller_model.eval()
-        torch.cuda.reset_peak_memory_stats()
+        _reset_peak_memory_stats_all_gpus()
         rollout_t0 = time.time()
         episodes = run_episodes_batched(buyer_model, seller_model, tokenizer, products_expanded, dev, seller_tokenizer=seller_tokenizer)
         rollout_time = time.time() - rollout_t0
-        rollout_peak_vram = torch.cuda.max_memory_allocated() / 1e9
+        rollout_peak_vram, rollout_peak_vram_per_gpu = _peak_memory_allocated_all_gpus_gb()
         print(f"  Rollout: {n_episodes} episodes in {rollout_time:.0f}s ({rollout_time/n_episodes:.1f}s/ep)")
         torch.cuda.empty_cache()
         gc.collect()
 
         buyer_model.train()
         print("  SDPO+GRPO update on buyer turns only...")
-        torch.cuda.reset_peak_memory_stats()
+        _reset_peak_memory_stats_all_gpus()
         update_stats = sdpo_grpo_update(
             buyer_model,
             tokenizer,
@@ -1798,7 +1824,7 @@ def main():
             optimizer_global_step,
             sdpo_lambda_value=lambda_active,
         )
-        update_peak_vram = torch.cuda.max_memory_allocated() / 1e9
+        update_peak_vram, update_peak_vram_per_gpu = _peak_memory_allocated_all_gpus_gb()
         optimizer_global_step = update_stats["optimizer_global_step"]
         loss = update_stats["loss"]
         torch.cuda.empty_cache()
@@ -1807,8 +1833,11 @@ def main():
         iter_metrics = compute_iter_metrics(episodes)
         elapsed = time.time() - t_iter
         update_time = elapsed - rollout_time
-        current_vram = torch.cuda.memory_allocated() / 1e9
+        current_vram, current_vram_per_gpu = _memory_allocated_all_gpus_gb()
         peak_vram = max(rollout_peak_vram, update_peak_vram)
+        peak_vram_per_gpu = [
+            max(r, u) for r, u in zip(rollout_peak_vram_per_gpu, update_peak_vram_per_gpu)
+        ]
 
         print(
             f"  Loss={loss:.4f} Reward={iter_metrics['mean_reward']:.4f} "
@@ -1828,8 +1857,9 @@ def main():
         )
         print(f"  Time={elapsed:.0f}s (rollout={rollout_time:.0f}s update={update_time:.0f}s)")
         print(
-            f"  Phase VRAM peaks: rollout={rollout_peak_vram:.1f}GB "
-            f"update={update_peak_vram:.1f}GB overall={peak_vram:.1f}GB"
+            f"  Phase VRAM peaks: rollout={rollout_peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(rollout_peak_vram_per_gpu)} "
+            f"update={update_peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(update_peak_vram_per_gpu)} "
+            f"overall={peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(peak_vram_per_gpu)}"
         )
         print(
             "  Update timers: "
@@ -1845,7 +1875,11 @@ def main():
         print(f"  Outcomes: {dict(list(iter_metrics['outcomes'].items())[:6])}")
         if iter_metrics["role_confusions"]:
             print(f"  ⚠️ ROLE CONFUSIONS: {iter_metrics['role_confusions']}")
-        print(f"  VRAM: {current_vram:.1f}GB current, {peak_vram:.1f}GB peak", flush=True)
+        print(
+            f"  VRAM: total_current={current_vram:.1f}GB per_gpu={_fmt_gpu_gb(current_vram_per_gpu)} "
+            f"peak={peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(peak_vram_per_gpu)}",
+            flush=True,
+        )
 
         row = {
             "iteration": iteration,
@@ -1872,9 +1906,13 @@ def main():
             "update_optimizer_s": update_stats["update_optimizer_s"],
             "update_grad_check_s": update_stats["update_grad_check_s"],
             "vram_current_gb": current_vram,
+            "vram_current_per_gpu_gb": current_vram_per_gpu,
             "vram_peak_gb": peak_vram,
+            "vram_peak_per_gpu_gb": peak_vram_per_gpu,
             "rollout_vram_peak_gb": rollout_peak_vram,
+            "rollout_vram_peak_per_gpu_gb": rollout_peak_vram_per_gpu,
             "update_vram_peak_gb": update_peak_vram,
+            "update_vram_peak_per_gpu_gb": update_peak_vram_per_gpu,
         }
         metrics.append(row)
 
@@ -1916,6 +1954,10 @@ def main():
                         "perf/vram_peak_gb": peak_vram,
                         "perf/rollout_vram_peak_gb": rollout_peak_vram,
                         "perf/update_vram_peak_gb": update_peak_vram,
+                        **{f"perf/vram_current_gpu{i}_gb": v for i, v in enumerate(current_vram_per_gpu)},
+                        **{f"perf/vram_peak_gpu{i}_gb": v for i, v in enumerate(peak_vram_per_gpu)},
+                        **{f"perf/rollout_vram_peak_gpu{i}_gb": v for i, v in enumerate(rollout_peak_vram_per_gpu)},
+                        **{f"perf/update_vram_peak_gpu{i}_gb": v for i, v in enumerate(update_peak_vram_per_gpu)},
                         "sanity/role_confusions": iter_metrics["role_confusions"],
                     },
                     step=iteration,
