@@ -1018,10 +1018,24 @@ def _peak_memory_allocated_all_gpus_gb():
     return max(per_gpu) if per_gpu else 0.0, per_gpu
 
 
+def _peak_memory_reserved_all_gpus_gb():
+    if not torch.cuda.is_available():
+        return 0.0, []
+    per_gpu = [torch.cuda.max_memory_reserved(idx) / 1e9 for idx in range(torch.cuda.device_count())]
+    return max(per_gpu) if per_gpu else 0.0, per_gpu
+
+
 def _memory_allocated_all_gpus_gb():
     if not torch.cuda.is_available():
         return 0.0, []
     per_gpu = [torch.cuda.memory_allocated(idx) / 1e9 for idx in range(torch.cuda.device_count())]
+    return sum(per_gpu), per_gpu
+
+
+def _memory_reserved_all_gpus_gb():
+    if not torch.cuda.is_available():
+        return 0.0, []
+    per_gpu = [torch.cuda.memory_reserved(idx) / 1e9 for idx in range(torch.cuda.device_count())]
     return sum(per_gpu), per_gpu
 
 
@@ -1816,6 +1830,7 @@ def main():
         episodes = run_episodes_batched(buyer_model, seller_model, tokenizer, products_expanded, dev, seller_tokenizer=seller_tokenizer)
         rollout_time = time.time() - rollout_t0
         rollout_peak_vram, rollout_peak_vram_per_gpu = _peak_memory_allocated_all_gpus_gb()
+        rollout_reserved_peak_vram, rollout_reserved_peak_vram_per_gpu = _peak_memory_reserved_all_gpus_gb()
         print(f"  Rollout: {n_episodes} episodes in {rollout_time:.0f}s ({rollout_time/n_episodes:.1f}s/ep)")
         torch.cuda.empty_cache()
         gc.collect()
@@ -1834,6 +1849,7 @@ def main():
             sdpo_lambda_value=lambda_active,
         )
         update_peak_vram, update_peak_vram_per_gpu = _peak_memory_allocated_all_gpus_gb()
+        update_reserved_peak_vram, update_reserved_peak_vram_per_gpu = _peak_memory_reserved_all_gpus_gb()
         optimizer_global_step = update_stats["optimizer_global_step"]
         loss = update_stats["loss"]
         torch.cuda.empty_cache()
@@ -1843,9 +1859,14 @@ def main():
         elapsed = time.time() - t_iter
         update_time = elapsed - rollout_time
         current_vram, current_vram_per_gpu = _memory_allocated_all_gpus_gb()
+        current_reserved_vram, current_reserved_vram_per_gpu = _memory_reserved_all_gpus_gb()
         peak_vram = max(rollout_peak_vram, update_peak_vram)
         peak_vram_per_gpu = [
             max(r, u) for r, u in zip(rollout_peak_vram_per_gpu, update_peak_vram_per_gpu)
+        ]
+        reserved_peak_vram = max(rollout_reserved_peak_vram, update_reserved_peak_vram)
+        reserved_peak_vram_per_gpu = [
+            max(r, u) for r, u in zip(rollout_reserved_peak_vram_per_gpu, update_reserved_peak_vram_per_gpu)
         ]
 
         print(
@@ -1866,9 +1887,14 @@ def main():
         )
         print(f"  Time={elapsed:.0f}s (rollout={rollout_time:.0f}s update={update_time:.0f}s)")
         print(
-            f"  Phase VRAM peaks: rollout={rollout_peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(rollout_peak_vram_per_gpu)} "
+            f"  Phase VRAM allocated peaks: rollout={rollout_peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(rollout_peak_vram_per_gpu)} "
             f"update={update_peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(update_peak_vram_per_gpu)} "
             f"overall={peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(peak_vram_per_gpu)}"
+        )
+        print(
+            f"  Phase VRAM reserved peaks: rollout={rollout_reserved_peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(rollout_reserved_peak_vram_per_gpu)} "
+            f"update={update_reserved_peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(update_reserved_peak_vram_per_gpu)} "
+            f"overall={reserved_peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(reserved_peak_vram_per_gpu)}"
         )
         print(
             "  Update timers: "
@@ -1885,8 +1911,13 @@ def main():
         if iter_metrics["role_confusions"]:
             print(f"  ⚠️ ROLE CONFUSIONS: {iter_metrics['role_confusions']}")
         print(
-            f"  VRAM: total_current={current_vram:.1f}GB per_gpu={_fmt_gpu_gb(current_vram_per_gpu)} "
+            f"  VRAM allocated: total_current={current_vram:.1f}GB per_gpu={_fmt_gpu_gb(current_vram_per_gpu)} "
             f"peak={peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(peak_vram_per_gpu)}",
+            flush=True,
+        )
+        print(
+            f"  VRAM reserved: total_current={current_reserved_vram:.1f}GB per_gpu={_fmt_gpu_gb(current_reserved_vram_per_gpu)} "
+            f"peak={reserved_peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(reserved_peak_vram_per_gpu)}",
             flush=True,
         )
 
@@ -1916,12 +1947,20 @@ def main():
             "update_grad_check_s": update_stats["update_grad_check_s"],
             "vram_current_gb": current_vram,
             "vram_current_per_gpu_gb": current_vram_per_gpu,
+            "vram_reserved_current_gb": current_reserved_vram,
+            "vram_reserved_current_per_gpu_gb": current_reserved_vram_per_gpu,
             "vram_peak_gb": peak_vram,
             "vram_peak_per_gpu_gb": peak_vram_per_gpu,
+            "vram_reserved_peak_gb": reserved_peak_vram,
+            "vram_reserved_peak_per_gpu_gb": reserved_peak_vram_per_gpu,
             "rollout_vram_peak_gb": rollout_peak_vram,
             "rollout_vram_peak_per_gpu_gb": rollout_peak_vram_per_gpu,
+            "rollout_vram_reserved_peak_gb": rollout_reserved_peak_vram,
+            "rollout_vram_reserved_peak_per_gpu_gb": rollout_reserved_peak_vram_per_gpu,
             "update_vram_peak_gb": update_peak_vram,
             "update_vram_peak_per_gpu_gb": update_peak_vram_per_gpu,
+            "update_vram_reserved_peak_gb": update_reserved_peak_vram,
+            "update_vram_reserved_peak_per_gpu_gb": update_reserved_peak_vram_per_gpu,
         }
         metrics.append(row)
 
@@ -1961,12 +2000,20 @@ def main():
                         "train/grad_norm_last": update_stats["grad_norm_last"],
                         "perf/vram_gb": current_vram,
                         "perf/vram_peak_gb": peak_vram,
+                        "perf/vram_reserved_gb": current_reserved_vram,
+                        "perf/vram_reserved_peak_gb": reserved_peak_vram,
                         "perf/rollout_vram_peak_gb": rollout_peak_vram,
+                        "perf/rollout_vram_reserved_peak_gb": rollout_reserved_peak_vram,
                         "perf/update_vram_peak_gb": update_peak_vram,
+                        "perf/update_vram_reserved_peak_gb": update_reserved_peak_vram,
                         **{f"perf/vram_current_gpu{i}_gb": v for i, v in enumerate(current_vram_per_gpu)},
                         **{f"perf/vram_peak_gpu{i}_gb": v for i, v in enumerate(peak_vram_per_gpu)},
+                        **{f"perf/vram_reserved_current_gpu{i}_gb": v for i, v in enumerate(current_reserved_vram_per_gpu)},
+                        **{f"perf/vram_reserved_peak_gpu{i}_gb": v for i, v in enumerate(reserved_peak_vram_per_gpu)},
                         **{f"perf/rollout_vram_peak_gpu{i}_gb": v for i, v in enumerate(rollout_peak_vram_per_gpu)},
+                        **{f"perf/rollout_vram_reserved_peak_gpu{i}_gb": v for i, v in enumerate(rollout_reserved_peak_vram_per_gpu)},
                         **{f"perf/update_vram_peak_gpu{i}_gb": v for i, v in enumerate(update_peak_vram_per_gpu)},
+                        **{f"perf/update_vram_reserved_peak_gpu{i}_gb": v for i, v in enumerate(update_reserved_peak_vram_per_gpu)},
                         "sanity/role_confusions": iter_metrics["role_confusions"],
                     },
                     step=iteration,
