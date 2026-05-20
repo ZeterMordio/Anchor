@@ -1616,18 +1616,22 @@ def main():
 
         buyer_model.eval()
         seller_model.eval()
+        torch.cuda.reset_peak_memory_stats()
         rollout_t0 = time.time()
         episodes = run_episodes_batched(buyer_model, seller_model, tokenizer, products_expanded, dev)
         rollout_time = time.time() - rollout_t0
+        rollout_peak_vram = torch.cuda.max_memory_allocated() / 1e9
         print(f"  Rollout: {n_episodes} episodes in {rollout_time:.0f}s ({rollout_time/n_episodes:.1f}s/ep)")
         torch.cuda.empty_cache()
         gc.collect()
 
         buyer_model.train()
         print("  SDPO+GRPO update on buyer turns only...")
+        torch.cuda.reset_peak_memory_stats()
         update_stats = sdpo_grpo_update(
             buyer_model, tokenizer, episodes, optimizer, dev, cpu_adamw_state, optimizer_global_step
         )
+        update_peak_vram = torch.cuda.max_memory_allocated() / 1e9
         optimizer_global_step = update_stats["optimizer_global_step"]
         loss = update_stats["loss"]
         torch.cuda.empty_cache()
@@ -1637,8 +1641,7 @@ def main():
         elapsed = time.time() - t_iter
         update_time = elapsed - rollout_time
         current_vram = torch.cuda.memory_allocated() / 1e9
-        peak_vram = torch.cuda.max_memory_allocated() / 1e9
-        torch.cuda.reset_peak_memory_stats()
+        peak_vram = max(rollout_peak_vram, update_peak_vram)
 
         print(
             f"  Loss={loss:.4f} Reward={iter_metrics['mean_reward']:.4f} "
@@ -1657,6 +1660,10 @@ def main():
             f"grad_norm={update_stats['grad_norm_last']:.4f}"
         )
         print(f"  Time={elapsed:.0f}s (rollout={rollout_time:.0f}s update={update_time:.0f}s)")
+        print(
+            f"  Phase VRAM peaks: rollout={rollout_peak_vram:.1f}GB "
+            f"update={update_peak_vram:.1f}GB overall={peak_vram:.1f}GB"
+        )
         print(
             "  Update timers: "
             f"pretokenize={update_stats['update_pretokenize_s']:.1f}s "
@@ -1698,6 +1705,8 @@ def main():
             "update_grad_check_s": update_stats["update_grad_check_s"],
             "vram_current_gb": current_vram,
             "vram_peak_gb": peak_vram,
+            "rollout_vram_peak_gb": rollout_peak_vram,
+            "update_vram_peak_gb": update_peak_vram,
         }
         metrics.append(row)
 
@@ -1736,6 +1745,8 @@ def main():
                         "train/grad_norm_last": update_stats["grad_norm_last"],
                         "perf/vram_gb": current_vram,
                         "perf/vram_peak_gb": peak_vram,
+                        "perf/rollout_vram_peak_gb": rollout_peak_vram,
+                        "perf/update_vram_peak_gb": update_peak_vram,
                         "sanity/role_confusions": iter_metrics["role_confusions"],
                     },
                     step=iteration,
