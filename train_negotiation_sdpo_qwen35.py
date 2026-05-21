@@ -138,6 +138,9 @@ CHAT_TEMPLATE_ENABLE_THINKING = os.environ.get("CHAT_TEMPLATE_ENABLE_THINKING", 
 STRIP_NATIVE_THINKING_FROM_HISTORY = os.environ.get("STRIP_NATIVE_THINKING_FROM_HISTORY", "0" if ENABLE_NATIVE_THINKING else "1") == "1"
 NATIVE_REASONING_PROTOCOL = ENABLE_NATIVE_THINKING or CHAT_TEMPLATE_ENABLE_THINKING
 DEBUG_SAMPLE_BUYER_OUTPUTS = int(os.environ.get("DEBUG_SAMPLE_BUYER_OUTPUTS", "0"))
+NATIVE_PUBLIC_FINALIZER = os.environ.get("NATIVE_PUBLIC_FINALIZER", "1" if NATIVE_REASONING_PROTOCOL else "0") == "1"
+NATIVE_THINK_TOKENS = int(os.environ.get("NATIVE_THINK_TOKENS", str(MAX_NEW_TOKENS)))
+NATIVE_FINAL_TOKENS = int(os.environ.get("NATIVE_FINAL_TOKENS", "96"))
 SDPO_LAMBDA = float(os.environ.get("SDPO_LAMBDA", "0.9"))  # 1.0 = pure GRPO, 0.0 = pure SDPO
 # For Qwen3.5 runs, start GRPO-heavy while the self-teacher is noisy, then
 # gradually hand off to SDPO shaping. Default: 0.9 -> 0.5 by iter 20.
@@ -757,6 +760,9 @@ def strip_qwen_native_thinking(text):
 
     closes = list(QWEN_THINK_CLOSE_RE.finditer(text))
     if closes and not QWEN_THINK_OPEN_RE.search(text):
+        # Decoded completions from an open native-thinking prompt often contain the
+        # private body followed by </think> but not the opening <think>. Preserve
+        # only the public suffix after the final close tag.
         text = text[closes[-1].end() :]
 
     m = QWEN_THINK_OPEN_RE.search(text)
@@ -964,6 +970,30 @@ def compute_buyer_reward(final_price, budget, cost, outcome):
 
 # ─── Batched generation ──────────────────────────────────────────────────────
 @torch.no_grad()
+def _append_native_public_finalizer(prompt_text, decoded_thinking):
+    """Close the native thinking block and ask for the public Talk/Action only.
+
+    Qwen3.5 often uses the entire native-thinking budget for useful private
+    reasoning and does not reach </think> by itself. Rather than truncating that
+    reasoning or training on format errors, use a second short decode after the
+    same hidden scratchpad that explicitly starts the public answer. This mirrors
+    how an interactive user would let the model finish thinking, then require the
+    final answer in the task protocol.
+    """
+    body = (decoded_thinking or "").strip()
+    if QWEN_THINK_CLOSE_RE.search(body):
+        prefix = prompt_text + body
+        if not prefix.rstrip().endswith("\n"):
+            prefix += "\n"
+    else:
+        prefix = prompt_text + body.rstrip() + "\n</think>\n\n"
+    prefix += (
+        "Now output the public negotiation message only. Use exactly these two lines and stop.\n"
+        "Talk:"
+    )
+    return prefix
+
+
 def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device):
     """Generate completions for a list of prompts using sub-batched HF generate."""
     if not prompts_text_list:
@@ -984,9 +1014,13 @@ def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device)
         inputs = _move_batch_to_device(_text_only_batch(inputs), device)
         tokenizer.padding_side = orig_side
 
+        think_budget = max_new
+        if NATIVE_PUBLIC_FINALIZER and NATIVE_REASONING_PROTOCOL and CHAT_TEMPLATE_ENABLE_THINKING:
+            think_budget = max(1, min(max_new, NATIVE_THINK_TOKENS))
+
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=max_new,
+            max_new_tokens=think_budget,
             do_sample=True,
             temperature=max(temp, 0.01),
             top_p=1.0,
@@ -995,6 +1029,7 @@ def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device)
             eos_token_id=tokenizer.eos_token_id,
         )
         prompt_len = inputs["input_ids"].shape[1]
+        decoded_batch = []
         for i in range(len(batch_prompts)):
             gen_tokens = output_ids[i][prompt_len:]
             gen_tokens = gen_tokens[gen_tokens != tokenizer.pad_token_id]
@@ -1004,6 +1039,45 @@ def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device)
             # acting model's same-role assistant history while strip_thought() still
             # removes them before opponent visibility and action parsing.
             decoded = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+            decoded_batch.append(decoded)
+
+        if NATIVE_PUBLIC_FINALIZER and NATIVE_REASONING_PROTOCOL and CHAT_TEMPLATE_ENABLE_THINKING:
+            unfinished = [i for i, decoded in enumerate(decoded_batch) if not ACTION_LINE_RE.search(strip_qwen_native_thinking(decoded))]
+            if unfinished:
+                finalizer_prompts = [_append_native_public_finalizer(batch_prompts[i], decoded_batch[i]) for i in unfinished]
+                orig_side = tokenizer.padding_side
+                tokenizer.padding_side = "left"
+                fin_inputs = tokenizer(
+                    finalizer_prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=ROLLOUT_MAX_LENGTH,
+                )
+                fin_inputs = _move_batch_to_device(_text_only_batch(fin_inputs), device)
+                tokenizer.padding_side = orig_side
+                fin_output_ids = model.generate(
+                    **fin_inputs,
+                    max_new_tokens=max(1, NATIVE_FINAL_TOKENS),
+                    do_sample=True,
+                    temperature=max(temp, 0.01),
+                    top_p=1.0,
+                    repetition_penalty=1.05,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+                fin_prompt_len = fin_inputs["input_ids"].shape[1]
+                for local_i, orig_i in enumerate(unfinished):
+                    fin_tokens = fin_output_ids[local_i][fin_prompt_len:]
+                    fin_tokens = fin_tokens[fin_tokens != tokenizer.pad_token_id]
+                    fin_decoded = tokenizer.decode(fin_tokens, skip_special_tokens=True)
+                    decoded_batch[orig_i] = (
+                        (decoded_batch[orig_i] or "").rstrip()
+                        + "\n</think>\n\nTalk:"
+                        + fin_decoded.lstrip()
+                    )
+
+        for decoded in decoded_batch:
             # The native-thinking prompt pre-fills an opening '<think>\n' inside
             # the prompt. Decoded new tokens may therefore contain only the body
             # plus a closing tag. Reattach the opening tag so private histories and
@@ -1069,7 +1143,7 @@ def run_episodes_batched(buyer_model, seller_model, tokenizer, products_expanded
         still_active_for_seller = []
         for idx, (s, b_text) in enumerate(zip(active_buyer, buyer_texts)):
             if DEBUG_SAMPLE_BUYER_OUTPUTS > 0 and idx < DEBUG_SAMPLE_BUYER_OUTPUTS:
-                print(f"  [DEBUG buyer raw turn={turn_round} ep={s.idx}] {b_text[:800]!r}", flush=True)
+                print(f"  [DEBUG buyer raw turn={turn_round} ep={s.idx}] {b_text[:1600]!r}", flush=True)
                 print(f"  [DEBUG buyer public turn={turn_round} ep={s.idx}] {strip_thought(b_text)[:500]!r}", flush=True)
             b_act = extract_action(b_text)
             s.buyer_texts.append(b_text)
@@ -1481,12 +1555,16 @@ def _normalize_completion_for_update(completion_text):
     if CHAT_TEMPLATE_ENABLE_THINKING:
         text = re.sub(r"^\s*<think\b[^>]*>\s*", "", text, count=1, flags=re.IGNORECASE)
         if NATIVE_REASONING_PROTOCOL:
-            # The supervised target should match the model's generated completion
-            # after the prompt-prefilled <think>, but public Action is the only
-            # externally verifiable part we want to reinforce. Dropping the native
-            # private thought avoids spending the policy-gradient signal on long
-            # hidden chains while still letting generation use them.
-            text = strip_qwen_native_thinking(text)
+            # The supervised target should preserve the hidden native-thinking
+            # context and reinforce the public Talk/Action that follows it. The
+            # two-stage finalizer may inject a close tag plus public suffix when
+            # Qwen spends the full thinking budget before answering; keep that
+            # suffix trainable instead of collapsing the sample to EOS.
+            if QWEN_THINK_CLOSE_RE.search(text):
+                public_suffix = QWEN_THINK_CLOSE_RE.split(text, maxsplit=1)[-1]
+                text = "</think>" + public_suffix
+            else:
+                text = strip_qwen_native_thinking(text)
     return text
 
 
@@ -1947,6 +2025,7 @@ def main():
     print(
         f"[CONFIG] ReasoningMode={REASONING_MODE} NativeThinking={ENABLE_NATIVE_THINKING} "
         f"NativeProtocol={NATIVE_REASONING_PROTOCOL} ChatTemplateThinking={CHAT_TEMPLATE_ENABLE_THINKING} "
+        f"NativeFinalizer={NATIVE_PUBLIC_FINALIZER} ThinkTokens={NATIVE_THINK_TOKENS} FinalTokens={NATIVE_FINAL_TOKENS} "
         f"StripNativeFromHistory={STRIP_NATIVE_THINKING_FROM_HISTORY} DebugBuyerOutputs={DEBUG_SAMPLE_BUYER_OUTPUTS}"
     )
     print(f"[CONFIG] GradCheckpoint={GRADIENT_CHECKPOINTING} GenBatchLimit={GEN_BATCH_LIMIT} RolloutMaxLength={ROLLOUT_MAX_LENGTH}")
@@ -2007,6 +2086,9 @@ def main():
                 "enable_native_thinking": ENABLE_NATIVE_THINKING,
                 "native_reasoning_protocol": NATIVE_REASONING_PROTOCOL,
                 "chat_template_enable_thinking": CHAT_TEMPLATE_ENABLE_THINKING,
+                "native_public_finalizer": NATIVE_PUBLIC_FINALIZER,
+                "native_think_tokens": NATIVE_THINK_TOKENS,
+                "native_final_tokens": NATIVE_FINAL_TOKENS,
                 "strip_native_thinking_from_history": STRIP_NATIVE_THINKING_FROM_HISTORY,
                 "debug_sample_buyer_outputs": DEBUG_SAMPLE_BUYER_OUTPUTS,
                 "normalize_advantages": NORMALIZE_ADVANTAGES,
