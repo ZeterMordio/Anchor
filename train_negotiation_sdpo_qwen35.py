@@ -969,7 +969,6 @@ def compute_buyer_reward(final_price, budget, cost, outcome):
 
 
 # ─── Batched generation ──────────────────────────────────────────────────────
-@torch.no_grad()
 def _append_native_public_finalizer(prompt_text, decoded_thinking):
     """Close the native thinking block and ask for the public Talk/Action only.
 
@@ -994,6 +993,7 @@ def _append_native_public_finalizer(prompt_text, decoded_thinking):
     return prefix
 
 
+@torch.no_grad()
 def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device):
     """Generate completions for a list of prompts using sub-batched HF generate."""
     if not prompts_text_list:
