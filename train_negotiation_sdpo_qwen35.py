@@ -124,6 +124,18 @@ WANDB_JOB_TYPE = os.environ.get("WANDB_JOB_TYPE", "train")
 RUN_NAME = os.environ.get("RUN_NAME", "")
 PUSH_TRAINING_SCRIPT = os.environ.get("PUSH_TRAINING_SCRIPT", "1") == "1"
 QWEN35_TEXT_CANARY = os.environ.get("QWEN35_TEXT_CANARY", "1") == "1"
+# Public/private reasoning control:
+# - option_a: disable native Qwen thinking in the chat template and rely on the
+#   explicit private Thought/Talk/Action protocol. Public text is canonicalized to
+#   Talk + the first Action line.
+# - option_b: enable native Qwen thinking in the chat template for Qwen3.5-style
+#   models. Generated <think>...</think> blocks are retained in raw same-role
+#   assistant history, but stripped before opponent visibility/action parsing.
+# - off/0/false: compatibility alias for option_a behavior without extra labeling.
+REASONING_MODE = os.environ.get("REASONING_MODE", "option_a").strip().lower().replace("-", "_")
+ENABLE_NATIVE_THINKING = REASONING_MODE in {"option_b", "native", "native_thinking", "thinking", "qwen", "qwen_thinking"}
+CHAT_TEMPLATE_ENABLE_THINKING = os.environ.get("CHAT_TEMPLATE_ENABLE_THINKING", "1" if ENABLE_NATIVE_THINKING else "0") == "1"
+STRIP_NATIVE_THINKING_FROM_HISTORY = os.environ.get("STRIP_NATIVE_THINKING_FROM_HISTORY", "0" if ENABLE_NATIVE_THINKING else "1") == "1"
 SDPO_LAMBDA = float(os.environ.get("SDPO_LAMBDA", "0.9"))  # 1.0 = pure GRPO, 0.0 = pure SDPO
 # For Qwen3.5 runs, start GRPO-heavy while the self-teacher is noisy, then
 # gradually hand off to SDPO shaping. Default: 0.9 -> 0.5 by iter 20.
@@ -682,11 +694,21 @@ def strip_qwen_native_thinking(text):
     public protocol marker (Thought/Talk/Action), otherwise drop the tail.
     """
     text = text or ""
+    had_native_marker = bool(QWEN_THINK_OPEN_RE.search(text) or QWEN_THINK_CLOSE_RE.search(text))
     text = QWEN_THINK_BLOCK_RE.sub("", text)
 
     closes = list(QWEN_THINK_CLOSE_RE.finditer(text))
     if closes and not QWEN_THINK_OPEN_RE.search(text):
         text = text[closes[-1].end() :]
+
+    # With native Qwen thinking enabled, the chat template pre-fills an opening
+    # "<think>\n" inside the prompt. Decoded completion text may contain only
+    # private thinking without any marker if generation ends before </think>.
+    # Only treat no-marker text as incomplete private thinking for decoded
+    # completions; normal prompt construction still passes CHAT_TEMPLATE text
+    # containing <|im_start|> markers and should remain parseable.
+    if CHAT_TEMPLATE_ENABLE_THINKING and not had_native_marker and "<|im_start|>" not in text:
+        return ""
 
     m = QWEN_THINK_OPEN_RE.search(text)
     if m:
@@ -923,10 +945,21 @@ def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device)
         for i in range(len(batch_prompts)):
             gen_tokens = output_ids[i][prompt_len:]
             gen_tokens = gen_tokens[gen_tokens != tokenizer.pad_token_id]
-            # Protocol is Thought/Talk/Action with Qwen native thinking disabled.
-            # If a backend/model still emits <think>, strip it before storing history
-            # or training targets; keep our explicit Thought: field intact.
-            all_results.append(strip_qwen_native_thinking(tokenizer.decode(gen_tokens, skip_special_tokens=True)))
+            # Option A stores explicit Thought/Talk/Action only and strips any
+            # unexpected native Qwen <think> blocks from private history. Option B
+            # intentionally enables native thinking; keep those raw blocks in the
+            # acting model's same-role assistant history while strip_thought() still
+            # removes them before opponent visibility and action parsing.
+            decoded = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+            # The native-thinking prompt pre-fills an opening '<think>\n' inside
+            # the prompt. Decoded new tokens may therefore contain only the body
+            # plus a closing tag. Reattach the opening tag so private histories and
+            # metrics faithfully record a complete native-think block.
+            if CHAT_TEMPLATE_ENABLE_THINKING and QWEN_THINK_CLOSE_RE.search(decoded) and not QWEN_THINK_OPEN_RE.search(decoded):
+                decoded = "<think>\n" + decoded
+            if STRIP_NATIVE_THINKING_FROM_HISTORY:
+                decoded = strip_qwen_native_thinking(decoded)
+            all_results.append(decoded)
     return all_results
 
 
@@ -973,7 +1006,7 @@ def run_episodes_batched(buyer_model, seller_model, tokenizer, products_expanded
                 msgs.append({"role": "assistant", "content": bt})  # own Thought kept
                 msgs.append({"role": "user", "content": strip_thought(st)})
             prompt_text = _apply_chat_template_text(
-                tokenizer, msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+                tokenizer, msgs, tokenize=False, add_generation_prompt=True, enable_thinking=CHAT_TEMPLATE_ENABLE_THINKING
             )
             _assert_no_private_info_leak(prompt_text, s.product, "buyer")
             buyer_prompts.append(prompt_text)
@@ -1035,7 +1068,7 @@ def run_episodes_batched(buyer_model, seller_model, tokenizer, products_expanded
             if len(s.buyer_texts) > len(s.seller_texts):
                 msgs.append({"role": "user", "content": strip_thought(s.buyer_texts[-1])})
             prompt_text = _apply_chat_template_text(
-                seller_tokenizer, msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+                seller_tokenizer, msgs, tokenize=False, add_generation_prompt=True, enable_thinking=CHAT_TEMPLATE_ENABLE_THINKING
             )
             _assert_no_private_info_leak(prompt_text, s.product, "seller")
             seller_prompts.append(prompt_text)
@@ -1381,6 +1414,19 @@ def _optimizer_step(buyer_model, optimizer, cpu_adamw_state, step_idx):
     return float(grad_norm.detach().cpu().item() if torch.is_tensor(grad_norm) else grad_norm), step_lr
 
 
+def _normalize_completion_for_update(completion_text):
+    """Return completion tokens consistent with the prompt's chat-template state.
+
+    In Qwen3.5 native-thinking mode, add_generation_prompt=True puts an open
+    ``<think>\n`` in the prompt. If we reattach that marker to the decoded private
+    history for auditing, do not train the model to emit the marker again.
+    """
+    text = completion_text or ""
+    if CHAT_TEMPLATE_ENABLE_THINKING:
+        text = re.sub(r"^\s*<think\b[^>]*>\s*", "", text, count=1, flags=re.IGNORECASE)
+    return text
+
+
 def _encode_prompt_completion(tokenizer, prompt_text, completion_text):
     """Pre-tokenize prompt and completion once and keep completion-mask metadata.
 
@@ -1391,7 +1437,7 @@ def _encode_prompt_completion(tokenizer, prompt_text, completion_text):
     least the generated completion remains trainable.
     """
     prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
-    completion_ids = tokenizer(completion_text or "", add_special_tokens=False)["input_ids"]
+    completion_ids = tokenizer(_normalize_completion_for_update(completion_text), add_special_tokens=False)["input_ids"]
     if not completion_ids:
         completion_ids = [tokenizer.eos_token_id]
 
@@ -1463,13 +1509,13 @@ def _build_group_update_examples(tokenizer, group_eps, advantages, timers):
                 continue
             prompt_msgs = build_buyer_turn_prompt(ep, turn_idx)
             prompt_text = _apply_chat_template_text(
-                tokenizer, prompt_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+                tokenizer, prompt_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=CHAT_TEMPLATE_ENABLE_THINKING
             )
             _assert_no_private_info_leak(prompt_text, ep.product, "buyer")
 
             teacher_prompt_msgs = build_sdpo_teacher_turn_prompt(ep, turn_idx, feedback)
             teacher_prompt_text = _apply_chat_template_text(
-                tokenizer, teacher_prompt_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+                tokenizer, teacher_prompt_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=CHAT_TEMPLATE_ENABLE_THINKING
             )
             _assert_no_private_info_leak(teacher_prompt_text, ep.product, "buyer")
 
@@ -1737,6 +1783,19 @@ def compute_iter_metrics(episodes):
             elif role == "seller" and act["type"] == "BUY":
                 role_confusions += 1
     budget_violations = sum(1 for ep in episodes if ep.budget_violations > 0)
+    total_turns = sum(len(ep.turns) for ep in episodes)
+    native_think_marker_turns = sum(
+        1
+        for ep in episodes
+        for _, text in ep.turns
+        if QWEN_THINK_OPEN_RE.search(text or "") or QWEN_THINK_CLOSE_RE.search(text or "")
+    )
+    structured_thought_turns = sum(
+        1
+        for ep in episodes
+        for _, text in ep.turns
+        if re.search(r"(?:^|\n)\s*Thought\s*:", text or "", re.IGNORECASE)
+    )
     first_offer_ratios = [ep.first_offer_price / ep.product["budget"] for ep in episodes if ep.first_offer_price]
     mean_first_offer_ratio = sum(first_offer_ratios) / max(len(first_offer_ratios), 1) if first_offer_ratios else None
 
@@ -1747,6 +1806,10 @@ def compute_iter_metrics(episodes):
         "mean_turns": mean_turns,
         "outcomes": dict(sorted(outcomes.items(), key=lambda x: -x[1])),
         "role_confusions": role_confusions,
+        "native_think_marker_turns": native_think_marker_turns,
+        "native_think_marker_rate": native_think_marker_turns / max(total_turns, 1),
+        "structured_thought_turns": structured_thought_turns,
+        "structured_thought_rate": structured_thought_turns / max(total_turns, 1),
         "price_overshoot_rate": budget_violations / max(len(episodes), 1),
         "first_offer_ratio": mean_first_offer_ratio,
     }
@@ -1818,6 +1881,10 @@ def main():
     print(f"[CONFIG] Turns={MAX_TURNS} LR={LR} WarmupSteps={WARMUP_STEPS} WD={WEIGHT_DECAY} GradClip={GRAD_CLIP_NORM}")
     print(f"[CONFIG] RefFree=True KL={KL_COEF} Eps={EPSILON} (unused ref-free)")
     print(f"[CONFIG] BuyerTemp={BUYER_TEMP} SellerTemp={SELLER_TEMP} MaxNew={MAX_NEW_TOKENS}")
+    print(
+        f"[CONFIG] ReasoningMode={REASONING_MODE} NativeThinking={ENABLE_NATIVE_THINKING} "
+        f"ChatTemplateThinking={CHAT_TEMPLATE_ENABLE_THINKING} StripNativeFromHistory={STRIP_NATIVE_THINKING_FROM_HISTORY}"
+    )
     print(f"[CONFIG] GradCheckpoint={GRADIENT_CHECKPOINTING} GenBatchLimit={GEN_BATCH_LIMIT} RolloutMaxLength={ROLLOUT_MAX_LENGTH}")
     print(f"[CONFIG] DeviceMap={MODEL_DEVICE_MAP} MaxMemoryPerGPUGiB={MAX_MEMORY_PER_GPU_GIB or '(unset)'}")
     print(f"[CONFIG] InnerEpochs={NUM_INNER_EPOCHS} NormAdvantages={NORMALIZE_ADVANTAGES}")
@@ -1872,6 +1939,10 @@ def main():
                 "max_new_tokens": MAX_NEW_TOKENS,
                 "buyer_temp": BUYER_TEMP,
                 "seller_temp": SELLER_TEMP,
+                "reasoning_mode": REASONING_MODE,
+                "enable_native_thinking": ENABLE_NATIVE_THINKING,
+                "chat_template_enable_thinking": CHAT_TEMPLATE_ENABLE_THINKING,
+                "strip_native_thinking_from_history": STRIP_NATIVE_THINKING_FROM_HISTORY,
                 "normalize_advantages": NORMALIZE_ADVANTAGES,
                 "num_inner_epochs": NUM_INNER_EPOCHS,
                 "sdpo_lambda": SDPO_LAMBDA,
@@ -2100,6 +2171,12 @@ def main():
             )
         if iter_metrics["role_confusions"]:
             print(f"  ⚠️ ROLE CONFUSIONS: {iter_metrics['role_confusions']}")
+        print(
+            f"  Reasoning markers: native_think={iter_metrics['native_think_marker_turns']} "
+            f"({iter_metrics['native_think_marker_rate']:.1%} of turns), "
+            f"explicit Thought={iter_metrics['structured_thought_turns']} "
+            f"({iter_metrics['structured_thought_rate']:.1%} of turns)"
+        )
         print(
             f"  VRAM allocated: total_current={current_vram:.1f}GB per_gpu={_fmt_gpu_gb(current_vram_per_gpu)} "
             f"peak={peak_vram:.1f}GB per_gpu={_fmt_gpu_gb(peak_vram_per_gpu)}",
