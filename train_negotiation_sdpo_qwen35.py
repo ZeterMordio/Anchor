@@ -619,9 +619,13 @@ Again, try to make deal with a price as low as possible. That is, your goal is t
 Use your native private thinking block to reason carefully about budget, seller offers, strategy, and exact action legality. That private thinking is hidden from the seller.
 After the private thinking block, output ONLY the public message below. Do not include a public Thought line. Do not reveal your budget. Do not output extra text after the Action line.
 
-Public reply format after </think>:
-Talk: short talk that you are going to say to the seller. Speak concisely and cut to the chase. Generate authentic and diverse sentences, avoiding repetition of sentences that have already appeared in the conversation.
-Action: one of the limited actions that define the real intention of your Talk. The type of your Action must be one of "[BUY],[REJECT],[DEAL],[QUIT]".
+After </think>, the final public answer must be exactly two lines:
+Talk: one short seller-facing sentence in your own words
+Action: one concrete legal buyer action
+
+Do not write labels, markdown, explanations, examples, placeholders, or quoted actions in the public answer. Never output strings like "short talk", "Talk content here", "One of", "[Action]", "[ACTION]", or "must be". For BUY or DEAL, the Action line must include a concrete price and the current product codename.
+
+Legal buyer actions:
 1. '[BUY] $M (N codename_1)' if you wish to offer the seller $M to purchase all N items of the product with the codename "codename_1".
 2. '[REJECT]' if you choose to reject the other side's offer and await a new offer from the seller.
 3. '[DEAL] $M (N codename_1)' if you finally accept on a former offer proposed by the seller. $M (N codename_1) is an exact copy of seller's previous offer. You should not use this action to propose a new price. This action will immediately end the conversation and close the deal.
@@ -664,9 +668,13 @@ You should only agree on a deal when the selling price is higher than the cost, 
 Use your native private thinking block to reason carefully about your cost, the buyer offer, strategy, and exact action legality. That private thinking is hidden from the buyer.
 After the private thinking block, output ONLY the public message below. Do not include a public Thought line. Do not reveal the cost. Do not output extra text after the Action line.
 
-Public reply format after </think>:
-Talk: short talk that you are going to say to the buyer. Speak concisely and cut to the chase. Generate authentic and diverse sentences, avoiding repetition of sentences that have already appeared in the conversation.
-Action: one of the limited actions that define the real intention of your Talk. The type of your Action must be one of "[SELL],[REJECT],[DEAL],[QUIT]".
+After </think>, the final public answer must be exactly two lines:
+Talk: one short buyer-facing sentence in your own words
+Action: one concrete legal seller action
+
+Do not write labels, markdown, explanations, examples, placeholders, or quoted actions in the public answer. Never output strings like "short talk", "Talk content here", "One of", "[Action]", "[ACTION]", or "must be". For SELL or DEAL, the Action line must include a concrete price and the current product codename.
+
+Legal seller actions:
 1. '[SELL] $M (N codename_1)' if you want to propose selling N items of the product with the codename "codename_1" to the buyer for the total price of $M.
 2. '[REJECT]' if you choose to reject the other side's offer and await a new offer from the buyer.
 3. '[DEAL] $M (N codename_1)' if you finally agree on a former offer proposed by the buyer, and sell N items of the product with the codename "codename_1" to the buyer for the total price of $M. $M (N codename_1) is an exact copy of buyer's previous offer. You should not use this action to propose a new price. This action will immediately end the conversation and close the deal.
@@ -790,10 +798,11 @@ def extract_action(text):
     if line_matches:
         return _parse_action_match(line_matches[-1])
 
-    matches = list(ACTION_RE.finditer(public_text or ""))
-    m = matches[-1] if matches else None
-    if m:
-        return _parse_action_match(m)
+    if not re.search(r"(?:^|\n)\s*Action\s*:", public_text or "", re.IGNORECASE):
+        matches = list(ACTION_RE.finditer(public_text or ""))
+        m = matches[-1] if matches else None
+        if m:
+            return _parse_action_match(m)
     return {"type": "UNKNOWN", "price": None, "objects": None}
 
 
@@ -863,6 +872,9 @@ def canonical_public_message(text):
         return ""
     else:
         public = text
+
+    public = re.sub(r"\[(Action|ACTION)\]", "", public)
+    public = re.sub(r"\[ACTION\]", "", public)
 
     action_line = ACTION_LINE_RE.search(public)
     if action_line:
@@ -986,10 +998,11 @@ def _append_native_public_finalizer(prompt_text, decoded_thinking):
             prefix += "\n"
     else:
         prefix = prompt_text + body.rstrip() + "\n</think>\n\n"
-    prefix += (
-        "Now output the public negotiation message only. Use exactly these two lines and stop.\n"
-        "Talk:"
-    )
+    # Important: this is still the same assistant turn, not a new user/system
+    # instruction. Only close the hidden scratchpad and prefill the public marker;
+    # the task prompt already tells the model which actions are legal. Adding more
+    # prose here made Qwen copy schema text such as "Action: [Action]".
+    prefix += "Talk:"
     return prefix
 
 
