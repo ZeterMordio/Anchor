@@ -136,6 +136,8 @@ REASONING_MODE = os.environ.get("REASONING_MODE", "option_a").strip().lower().re
 ENABLE_NATIVE_THINKING = REASONING_MODE in {"option_b", "native", "native_thinking", "thinking", "qwen", "qwen_thinking"}
 CHAT_TEMPLATE_ENABLE_THINKING = os.environ.get("CHAT_TEMPLATE_ENABLE_THINKING", "1" if ENABLE_NATIVE_THINKING else "0") == "1"
 STRIP_NATIVE_THINKING_FROM_HISTORY = os.environ.get("STRIP_NATIVE_THINKING_FROM_HISTORY", "0" if ENABLE_NATIVE_THINKING else "1") == "1"
+NATIVE_REASONING_PROTOCOL = ENABLE_NATIVE_THINKING or CHAT_TEMPLATE_ENABLE_THINKING
+DEBUG_SAMPLE_BUYER_OUTPUTS = int(os.environ.get("DEBUG_SAMPLE_BUYER_OUTPUTS", "0"))
 SDPO_LAMBDA = float(os.environ.get("SDPO_LAMBDA", "0.9"))  # 1.0 = pure GRPO, 0.0 = pure SDPO
 # For Qwen3.5 runs, start GRPO-heavy while the self-teacher is noisy, then
 # gradually hand off to SDPO shaping. Default: 0.9 -> 0.5 by iter 20.
@@ -572,7 +574,13 @@ def load_products(seed=SEED):
 
 
 # ─── Prompts (paper Appendix C, adapted to Thought/Talk/Action format) ───────
-BUYER_SYSTEM = """You are a buyer looking forward to buying things on your Shopping List from me, the seller.
+# Qwen3.5 native-thinking mode already creates a private <think>...</think>
+# scratchpad in the assistant completion. In that mode, do not ask the model to
+# emit a public `Thought:` field as well; it wastes tokens and confused the tiny
+# smoke into spending all 120 tokens inside private reasoning. Instead, use the
+# full native thinking budget privately and require only public Talk + Action
+# after </think>. The legacy explicit protocol remains the default for Option A.
+BUYER_SYSTEM_EXPLICIT = """You are a buyer looking forward to buying things on your Shopping List from me, the seller.
 You have access to the seller's Inventory List and you can bargain about the prices.
 Your task is to bargain with the seller and reach a deal with the price as low as possible in limited turns.
 You can only buy things on the Shopping List in the limited quantity. Use the codename of the product, instead of the title.
@@ -598,7 +606,31 @@ Thought: I'm a buyer and I want to bargain. The listing price of codename "apple
 Talk: Hello, I'm tight on budget. can you sell it for 10$?
 Action: [BUY] $10 (1x apple_1)"""
 
-SELLER_SYSTEM = """You are a seller looking forward to selling things on your Inventory List to me, the buyer.
+BUYER_SYSTEM_NATIVE = """You are a buyer looking forward to buying things on your Shopping List from me, the seller.
+You have access to the seller's Inventory List and you can bargain about the prices.
+Your task is to bargain with the seller and reach a deal with the price as low as possible in limited turns.
+You can only buy things on the Shopping List in the limited quantity. Use the codename of the product, instead of the title.
+You can only buy things that cost less than your budget. Never offer above your private budget. Never accept or DEAL above your private budget; if no legal deal is possible, choose [QUIT].
+Again, try to make deal with a price as low as possible. That is, your goal is to spend as little money as possible, not just reaching your budget.
+
+Use your native private thinking block to reason carefully about budget, seller offers, strategy, and exact action legality. That private thinking is hidden from the seller.
+After the private thinking block, output ONLY the public message below. Do not include a public Thought line. Do not reveal your budget. Do not output extra text after the Action line.
+
+Public reply format after </think>:
+Talk: short talk that you are going to say to the seller. Speak concisely and cut to the chase. Generate authentic and diverse sentences, avoiding repetition of sentences that have already appeared in the conversation.
+Action: one of the limited actions that define the real intention of your Talk. The type of your Action must be one of "[BUY],[REJECT],[DEAL],[QUIT]".
+1. '[BUY] $M (N codename_1)' if you wish to offer the seller $M to purchase all N items of the product with the codename "codename_1".
+2. '[REJECT]' if you choose to reject the other side's offer and await a new offer from the seller.
+3. '[DEAL] $M (N codename_1)' if you finally accept on a former offer proposed by the seller. $M (N codename_1) is an exact copy of seller's previous offer. You should not use this action to propose a new price. This action will immediately end the conversation and close the deal.
+4. '[QUIT]' if you believe that a mutually acceptable deal cannot be reached in limited turns. This action will immediately end the conversation.
+You shouldn't choose action '[DEAL] $M' before seller's action '[SELL] $M'. Your first action should be '[BUY] $M (N codename_1)' or '[REJECT]'.
+'[DEAL] $M (N codename_1)' can only be chosen to accept the seller's previous offer '[SELL] $M (N codename_1)' and only if $M is within your budget. Otherwise, you always choose from '[BUY]', '[REJECT]' and '[QUIT]'.
+
+Example final public reply after your hidden thinking:
+Talk: Hello, I'm tight on budget. can you sell it for 10$?
+Action: [BUY] $10 (1x apple_1)"""
+
+SELLER_SYSTEM_EXPLICIT = """You are a seller looking forward to selling things on your Inventory List to me, the buyer.
 Your task is to bargain with the buyer and reach a deal with the price as high as possible in limited turns.
 You can only sell things that are on the Inventory List. Use the codename of the product, instead of the title.
 You have access to private information: the cost price of each product in the Inventory List, and do not disclose the real cost to the buyer.
@@ -619,6 +651,32 @@ Your reply should strictly follow this format, for example:
 Thought: I'm a seller, so I must sell the product with codename "apple_1" higher than its cost.
 Talk: blah, blah...
 Action: [SELL] $15 (1x apple_1)"""
+
+SELLER_SYSTEM_NATIVE = """You are a seller looking forward to selling things on your Inventory List to me, the buyer.
+Your task is to bargain with the buyer and reach a deal with the price as high as possible in limited turns.
+You can only sell things that are on the Inventory List. Use the codename of the product, instead of the title.
+You have access to private information: the cost price of each product in the Inventory List, and do not disclose the real cost to the buyer.
+You should only agree on a deal when the selling price is higher than the cost, otherwise, you should quit negotiating.
+
+Use your native private thinking block to reason carefully about your cost, the buyer offer, strategy, and exact action legality. That private thinking is hidden from the buyer.
+After the private thinking block, output ONLY the public message below. Do not include a public Thought line. Do not reveal the cost. Do not output extra text after the Action line.
+
+Public reply format after </think>:
+Talk: short talk that you are going to say to the buyer. Speak concisely and cut to the chase. Generate authentic and diverse sentences, avoiding repetition of sentences that have already appeared in the conversation.
+Action: one of the limited actions that define the real intention of your Talk. The type of your Action must be one of "[SELL],[REJECT],[DEAL],[QUIT]".
+1. '[SELL] $M (N codename_1)' if you want to propose selling N items of the product with the codename "codename_1" to the buyer for the total price of $M.
+2. '[REJECT]' if you choose to reject the other side's offer and await a new offer from the buyer.
+3. '[DEAL] $M (N codename_1)' if you finally agree on a former offer proposed by the buyer, and sell N items of the product with the codename "codename_1" to the buyer for the total price of $M. $M (N codename_1) is an exact copy of buyer's previous offer. You should not use this action to propose a new price. This action will immediately end the conversation and close the deal.
+4. '[QUIT]' if you believe that a mutually acceptable deal cannot be reached in limited turns. This action will immediately end the conversation.
+You shouldn't choose action '[DEAL]' before buyer's action '[BUY]'.
+'[DEAL] $M (N codename_1)' can only be chosen to accept the buyer's previous offer '[BUY] $M (N codename_1)'. Otherwise, you always choose from '[SELL]', '[REJECT]' and '[QUIT]'.
+
+Example final public reply after your hidden thinking:
+Talk: I can offer it for $15.
+Action: [SELL] $15 (1x apple_1)"""
+
+BUYER_SYSTEM = BUYER_SYSTEM_NATIVE if NATIVE_REASONING_PROTOCOL else BUYER_SYSTEM_EXPLICIT
+SELLER_SYSTEM = SELLER_SYSTEM_NATIVE if NATIVE_REASONING_PROTOCOL else SELLER_SYSTEM_EXPLICIT
 
 
 def build_buyer_prompt(product):
@@ -701,15 +759,6 @@ def strip_qwen_native_thinking(text):
     if closes and not QWEN_THINK_OPEN_RE.search(text):
         text = text[closes[-1].end() :]
 
-    # With native Qwen thinking enabled, the chat template pre-fills an opening
-    # "<think>\n" inside the prompt. Decoded completion text may contain only
-    # private thinking without any marker if generation ends before </think>.
-    # Only treat no-marker text as incomplete private thinking for decoded
-    # completions; normal prompt construction still passes CHAT_TEMPLATE text
-    # containing <|im_start|> markers and should remain parseable.
-    if CHAT_TEMPLATE_ENABLE_THINKING and not had_native_marker and "<|im_start|>" not in text:
-        return ""
-
     m = QWEN_THINK_OPEN_RE.search(text)
     if m:
         tail = text[m.end() :]
@@ -790,7 +839,9 @@ def canonical_public_message(text):
     handles reasoning models that produce a valid public action and then continue
     with a second private Thought/self-correction block.
     """
-    text = strip_qwen_native_thinking(text or "")
+    raw_text = text or ""
+    had_native_marker = bool(QWEN_THINK_OPEN_RE.search(raw_text) or QWEN_THINK_CLOSE_RE.search(raw_text))
+    text = strip_qwen_native_thinking(raw_text)
 
     talk_match = re.search(r"(?:^|\n)\s*Talk\s*:", text, re.IGNORECASE)
     action_match = re.search(r"(?:^|\n)\s*Action\s*:", text, re.IGNORECASE)
@@ -801,6 +852,8 @@ def canonical_public_message(text):
     elif action_match and thought_match and thought_match.start() < action_match.start():
         public = text[action_match.start() :]
     elif thought_match:
+        return ""
+    elif NATIVE_REASONING_PROTOCOL and CHAT_TEMPLATE_ENABLE_THINKING and not had_native_marker and "<|im_start|>" not in text:
         return ""
     else:
         public = text
@@ -1014,7 +1067,10 @@ def run_episodes_batched(buyer_model, seller_model, tokenizer, products_expanded
         buyer_texts = generate_batched(buyer_model, tokenizer, buyer_prompts, MAX_NEW_TOKENS, BUYER_TEMP, device)
 
         still_active_for_seller = []
-        for s, b_text in zip(active_buyer, buyer_texts):
+        for idx, (s, b_text) in enumerate(zip(active_buyer, buyer_texts)):
+            if DEBUG_SAMPLE_BUYER_OUTPUTS > 0 and idx < DEBUG_SAMPLE_BUYER_OUTPUTS:
+                print(f"  [DEBUG buyer raw turn={turn_round} ep={s.idx}] {b_text[:800]!r}", flush=True)
+                print(f"  [DEBUG buyer public turn={turn_round} ep={s.idx}] {strip_thought(b_text)[:500]!r}", flush=True)
             b_act = extract_action(b_text)
             s.buyer_texts.append(b_text)
             s.all_turns.append(("buyer", b_text))
@@ -1424,6 +1480,13 @@ def _normalize_completion_for_update(completion_text):
     text = completion_text or ""
     if CHAT_TEMPLATE_ENABLE_THINKING:
         text = re.sub(r"^\s*<think\b[^>]*>\s*", "", text, count=1, flags=re.IGNORECASE)
+        if NATIVE_REASONING_PROTOCOL:
+            # The supervised target should match the model's generated completion
+            # after the prompt-prefilled <think>, but public Action is the only
+            # externally verifiable part we want to reinforce. Dropping the native
+            # private thought avoids spending the policy-gradient signal on long
+            # hidden chains while still letting generation use them.
+            text = strip_qwen_native_thinking(text)
     return text
 
 
@@ -1883,7 +1946,8 @@ def main():
     print(f"[CONFIG] BuyerTemp={BUYER_TEMP} SellerTemp={SELLER_TEMP} MaxNew={MAX_NEW_TOKENS}")
     print(
         f"[CONFIG] ReasoningMode={REASONING_MODE} NativeThinking={ENABLE_NATIVE_THINKING} "
-        f"ChatTemplateThinking={CHAT_TEMPLATE_ENABLE_THINKING} StripNativeFromHistory={STRIP_NATIVE_THINKING_FROM_HISTORY}"
+        f"NativeProtocol={NATIVE_REASONING_PROTOCOL} ChatTemplateThinking={CHAT_TEMPLATE_ENABLE_THINKING} "
+        f"StripNativeFromHistory={STRIP_NATIVE_THINKING_FROM_HISTORY} DebugBuyerOutputs={DEBUG_SAMPLE_BUYER_OUTPUTS}"
     )
     print(f"[CONFIG] GradCheckpoint={GRADIENT_CHECKPOINTING} GenBatchLimit={GEN_BATCH_LIMIT} RolloutMaxLength={ROLLOUT_MAX_LENGTH}")
     print(f"[CONFIG] DeviceMap={MODEL_DEVICE_MAP} MaxMemoryPerGPUGiB={MAX_MEMORY_PER_GPU_GIB or '(unset)'}")
@@ -1941,8 +2005,10 @@ def main():
                 "seller_temp": SELLER_TEMP,
                 "reasoning_mode": REASONING_MODE,
                 "enable_native_thinking": ENABLE_NATIVE_THINKING,
+                "native_reasoning_protocol": NATIVE_REASONING_PROTOCOL,
                 "chat_template_enable_thinking": CHAT_TEMPLATE_ENABLE_THINKING,
                 "strip_native_thinking_from_history": STRIP_NATIVE_THINKING_FROM_HISTORY,
+                "debug_sample_buyer_outputs": DEBUG_SAMPLE_BUYER_OUTPUTS,
                 "normalize_advantages": NORMALIZE_ADVANTAGES,
                 "num_inner_epochs": NUM_INNER_EPOCHS,
                 "sdpo_lambda": SDPO_LAMBDA,
