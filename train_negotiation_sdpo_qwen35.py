@@ -703,16 +703,16 @@ def _parse_action_match(m):
 
 
 def extract_action(text):
-    public_text = strip_qwen_native_thinking(text or "")
+    # Parse only the canonical public surface form. Raw generations may contain
+    # useful private Thought/self-correction after the first public Action; those
+    # tails are kept in the acting model's private history but must not affect the
+    # economic action or leak to the counterparty.
+    public_text = strip_thought(text or "")
 
-    # Prefer explicit Action: lines outside any native Qwen thinking block.
     line_matches = list(ACTION_LINE_RE.finditer(public_text))
     if line_matches:
         return _parse_action_match(line_matches[-1])
 
-    # If the model produced our structured Thought field, remove it before any
-    # fallback parse so an action mentioned only in private reasoning is not used.
-    public_text = strip_thought(public_text)
     matches = list(ACTION_RE.finditer(public_text or ""))
     m = matches[-1] if matches else None
     if m:
@@ -721,54 +721,91 @@ def extract_action(text):
 
 
 def replace_final_action(text, action_type, price, product):
-    """Replace the final public structured action after environment regulation."""
+    """Replace the first public structured action after environment regulation.
+
+    Keep any raw private Thought tail for the acting model, but modify only the
+    canonical public Action that downstream parsing/visibility will use.
+    """
     replacement = f"[{action_type}] ${price:.2f} (1x {product['codename']})"
     text = strip_qwen_native_thinking(text or "")
-    line_matches = list(ACTION_LINE_RE.finditer(text))
-    if line_matches:
-        m = line_matches[-1]
-        old_match = list(ACTION_RE.finditer(m.group(0)))[-1]
-        start = m.start() + old_match.start()
-        end = m.start() + old_match.end()
+
+    talk_match = re.search(r"(?:^|\n)\s*Talk\s*:", text, re.IGNORECASE)
+    action_match = re.search(r"(?:^|\n)\s*Action\s*:", text, re.IGNORECASE)
+    thought_match = re.search(r"(?:^|\n)\s*Thought\s*:", text, re.IGNORECASE)
+    if talk_match:
+        public_start = talk_match.start()
+    elif action_match and thought_match and thought_match.start() < action_match.start():
+        public_start = action_match.start()
+    else:
+        public_start = 0
+
+    public_tail = text[public_start:]
+    line_match = ACTION_LINE_RE.search(public_tail)
+    if line_match:
+        old_match = list(ACTION_RE.finditer(line_match.group(0)))[-1]
+        start = public_start + line_match.start() + old_match.start()
+        end = public_start + line_match.start() + old_match.end()
         return text[:start] + replacement + text[end:]
+
     visible = strip_thought(text)
     matches = list(ACTION_RE.finditer(visible))
     if not matches:
         return text.rstrip() + f"\nAction: {replacement}"
-    old = matches[-1].group(0)
-    idx = text.rfind(old)
+    old = matches[0].group(0)
+    idx = text.find(old, public_start)
     if idx < 0:
         return text.rstrip() + f"\nAction: {replacement}"
     return text[:idx] + replacement + text[idx + len(old) :]
 
 
-def strip_thought(text):
-    """Remove hidden scratchpads, keeping only Talk + Action for the counterparty.
+def canonical_public_message(text):
+    """Return the counterparty-visible Talk/Action surface form.
 
-    Paper §3.1: reasoning is a hidden scratchpad and is trimmed before being
-    passed to the opponent. This also strips Qwen3 native <think> blocks so a
-    Qwen thinking-mode ablation does not leak private reasoning.
+    Option A: preserve the raw generation in the acting model's private history,
+    but canonicalize anything shown to the opponent. The visible message starts at
+    the first public Talk: marker when available, drops private Thought: content,
+    and hard-truncates immediately after the first complete Action: line. This
+    handles reasoning models that produce a valid public action and then continue
+    with a second private Thought/self-correction block.
     """
     text = strip_qwen_native_thinking(text or "")
-    m = re.search(r"(?:^|\n)\s*Talk\s*:", text, re.IGNORECASE)
-    if m:
-        result = text[m.start() :].strip()
-        _assert_strip_thought_complete(result, text)
-        return result
-    m = re.search(r"(?:^|\n)\s*Action\s*:", text, re.IGNORECASE)
-    if m and re.search(r"(?:^|\n)\s*Thought\s*:", text[: m.start()], re.IGNORECASE):
-        result = text[m.start() :].strip()
-        _assert_strip_thought_complete(result, text)
-        return result
-    m = re.search(r"(?:^|\n)\s*Thought\s*:.*?(?=\n\s*(?:Talk|Action)\s*:)", text, re.IGNORECASE | re.DOTALL)
-    if m:
-        result = text[m.end() :].strip()
-        _assert_strip_thought_complete(result, text)
-        return result
-    if re.search(r"(?:^|\n)\s*Thought\s*:", text, re.IGNORECASE):
+
+    talk_match = re.search(r"(?:^|\n)\s*Talk\s*:", text, re.IGNORECASE)
+    action_match = re.search(r"(?:^|\n)\s*Action\s*:", text, re.IGNORECASE)
+    thought_match = re.search(r"(?:^|\n)\s*Thought\s*:", text, re.IGNORECASE)
+
+    if talk_match:
+        public = text[talk_match.start() :]
+    elif action_match and thought_match and thought_match.start() < action_match.start():
+        public = text[action_match.start() :]
+    elif thought_match:
         return ""
-    _assert_strip_thought_complete(text, text)
-    return text
+    else:
+        public = text
+
+    action_line = ACTION_LINE_RE.search(public)
+    if action_line:
+        # Keep the whole public action line (including any harmless trailing text
+        # before its newline), but discard any subsequent hidden/self-correction
+        # content. This prevents private Thought tails after a valid Action from
+        # leaking to the counterparty while preserving the raw text elsewhere.
+        line_end = public.find("\n", action_line.end())
+        public = public[: line_end if line_end >= 0 else len(public)]
+    else:
+        # No parseable structured Action line: still prevent post-public hidden
+        # scratchpad leaks if the model starts another Thought block later.
+        leaked_thought = re.search(r"\n\s*Thought\s*:", public, re.IGNORECASE)
+        if leaked_thought:
+            public = public[: leaked_thought.start()]
+
+    result = public.strip()
+    _assert_strip_thought_complete(result, text)
+    return result
+
+
+def strip_thought(text):
+    """Remove hidden scratchpads, keeping only canonical Talk + Action text."""
+    return canonical_public_message(text)
 
 
 def _assert_strip_thought_complete(stripped_text, original_text):
