@@ -972,7 +972,10 @@ def _assert_strip_thought_complete(stripped_text, original_text):
 def _assert_no_private_info_leak(prompt_text, product, role):
     """Crash on clear counterparty-private-info leakage.
 
-    Avoids regex heuristics that caused false positives in JOURNAL v10.4.
+    Keep the guard focused on structured private fields. A buyer may naturally say
+    "shopping list" in public Talk text; that phrase alone is not a private-info
+    leak. The actual private buyer data is the structured Shopping List block and
+    especially the budget_limit field, which must never appear in seller prompts.
     """
     budget_str = f"${product['budget']:.2f}"
     if role == "buyer":
@@ -981,13 +984,17 @@ def _assert_no_private_info_leak(prompt_text, product, role):
                 f"INFORMATION LEAK: buyer prompt contains seller cost field. Product={product['codename']}"
             )
     elif role == "seller":
-        if "Shopping List" in prompt_text:
+        leaked_budget_field = "budget_limit:" in prompt_text or f"budget_limit: {budget_str}" in prompt_text
+        leaked_structured_shopping_block = bool(
+            re.search(r"(?:^|\n)\s*Shopping List\s*\n(?:(?!\n\s*\n).)*budget_limit\s*:", prompt_text, re.IGNORECASE | re.DOTALL)
+        )
+        if leaked_structured_shopping_block:
             raise AssertionError(
-                f"INFORMATION LEAK: seller prompt contains buyer Shopping List. Product={product['codename']}"
+                f"INFORMATION LEAK: seller prompt contains structured buyer Shopping List block. Product={product['codename']}"
             )
-        if f"budget_limit: {budget_str}" in prompt_text:
+        if leaked_budget_field:
             raise AssertionError(
-                f"INFORMATION LEAK: seller prompt contains buyer budget_limit={budget_str}. "
+                f"INFORMATION LEAK: seller prompt contains buyer budget_limit field. "
                 f"Product={product['codename']}"
             )
 
