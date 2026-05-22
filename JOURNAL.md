@@ -1469,6 +1469,18 @@ Loss values are no longer numerically comparable to the previous fixed-reference
 - Config: `Qwen/Qwen3-0.6B`, `NUM_ITERS=1`, `BATCH_SIZE=1`, `GROUP_SIZE=2`, `MAX_TURNS=1`, `MAX_NEW_TOKENS=32`, `KL_COEF=0.0`, `UPDATE_MICROBATCH_SIZE=4`, `OPTIM_STEP_EVERY_GROUPS=16`, `UPDATE_MAX_LENGTH=512`, `OPTIMIZER=adamw_cpu`.
 - Result: completed in 24.0s and pushed the final checkpoint. Logs confirm `RefFree=True`, no reference-policy model load, `ref_fwd=0.0s(ref-free)`, `objective/ref_free=1`, `objective/reference_model_used=0`, and one CPU AdamW optimizer step. The tiny truncating rollout produced buyer format errors as expected for smoke-only settings, but the update path, metrics logging, W&B sync, and Hub push succeeded.
 
+### Qwen3.5 9B option-B 2-iteration production-shape smoke
+
+- Job: [`6a0fbffbb33ece92698bfe69`](https://huggingface.co/jobs/ZeterMordio/6a0fbffbb33ece92698bfe69)
+- Final model/metrics: [`ZeterMordio/anchor-negotiation-sdpo-qwen35-2iter-gen96`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-qwen35-2iter-gen96)
+- Script source: [`ZeterMordio/anchor-negotiation-sdpo-qwen35-smoke/train_negotiation_sdpo_qwen35.py`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-qwen35-smoke/blob/main/train_negotiation_sdpo_qwen35.py)
+- Local commits: `22ec2ad` parser/fast-path/update optimizations and `2648a5a` seller privacy-guard false-positive fix.
+- Config: `Qwen/Qwen3.5-9B` buyer + seller, `NUM_ITERS=2`, `BATCH_SIZE=16`, `GROUP_SIZE=8`, `MAX_TURNS=6`, option-B native thinking, `NATIVE_THINK_TOKENS=300`, `NATIVE_FINAL_TOKENS=96`, `ROLLOUT_MAX_LENGTH=UPDATE_MAX_LENGTH=3072`, `LR=3e-6`, `WARMUP_STEPS=10`, `SDPO_LAMBDA=0.9 -> 0.88`, strict feedback, CPU-state AdamW, `UPDATE_LENGTH_BUCKETING=1`, and self-teacher forward in `torch.inference_mode()`.
+- Dependency decision: the requested Qwen3.5 fast-path packages were tested but disabled for this run. `causal-conv1d`/`flash-linear-attention` failed through combinations of missing NVCC for source builds, torch/cu130 requiring a newer driver than the HF A100 image exposed, and ABI-mismatched prebuilt wheels under torch 2.6. The known-good torch 2.6/cu124 path was used; startup diagnostics confirmed fallback to Transformers' slower torch gated-delta path.
+- Result: completed in 49.2 min, pushed `iter-1`, `iter-2`, and final `main`. Iter0: reward `-0.0744`, deal `46.9%`, format errors `12/128`, role confusions `3`, first-offer ratio `0.820`, peak reserved VRAM `79.8GB`. Iter1: reward `-0.1196`, deal `38.3%`, format errors `19/128`, role confusions `0`, first-offer ratio `0.706`, peak reserved VRAM `80.3GB`. Early stop triggered after 2 consecutive buyer-format-warning iterations.
+- Runtime analysis: average iteration time was `~20.9 min`: rollout `~661s` and update `~595s`. Update timers show pretokenize/collate are already negligible (`<1%`), while backward is dominant (`~56%` of update), policy+teacher forwards are `~29%`, and CPU AdamW optimizer is `~13%`. Length bucketing plus inference-mode teacher did not make the update cheap because full-parameter 9B backward and CPU optimizer remain the bottlenecks.
+- Next safe objective-preserving run: keep the objective unchanged but improve stability and throughput by (1) lowering LR to `1e-6` or increasing warmup, (2) slowing SDPO handoff / using more GRPO-heavy early iterations because format errors rose despite low effective warmup LR, (3) reducing `NATIVE_THINK_TOKENS` after measuring whether long hidden thinking improves reward, and (4) using larger hardware (`a100x4`/`l40sx4`) only with a deliberate single-GPU-vs-sharded plan because the current A100x1 run nearly saturates 80GB.
+
 ---
 
 ## 2026-05-18: SDPO Serious-Run Optimizer Defaults
