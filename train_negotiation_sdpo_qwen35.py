@@ -24,6 +24,7 @@ Default run policy:
 """
 
 import gc
+import importlib.metadata
 import json
 import os
 import random
@@ -52,15 +53,13 @@ except ImportError:  # Older Transformers fallback; Qwen3.5 canary will fail lou
 
 # ─── Liger Kernel: optional fused Triton kernels for Qwen3 ────────────────────
 # Liger's Triton kernels are safe on a single fully-GPU-resident model, but they
-# are not safe with Accelerate device_map CPU/offload. The previous a10g-largex4
-# run used MAX_MEMORY_PER_GPU_GIB and hit:
-#   ValueError: Pointer argument ... cannot be accessed from Triton (cpu tensor?)
-# Default Liger off whenever explicit multi-GPU memory caps are requested; users
+# are not safe with Accelerate device_map CPU/offload. Explicit memory caps may
+# force CPU/disk offload, so default Liger off when those caps are present; users
 # can still force USE_LIGER=1 for a known fully GPU-resident sharded setup.
-_MULTI_GPU_MEMORY_CAP_REQUESTED = bool(os.environ.get("MAX_MEMORY_PER_GPU_GIB", "").strip())
-_DEFAULT_USE_LIGER = "0" if _MULTI_GPU_MEMORY_CAP_REQUESTED else "1"
+_EXPLICIT_MEMORY_CAP_REQUESTED = bool(os.environ.get("MAX_MEMORY_PER_GPU_GIB", "").strip())
+_DEFAULT_USE_LIGER = "0" if _EXPLICIT_MEMORY_CAP_REQUESTED else "1"
 USE_LIGER = os.environ.get("USE_LIGER", _DEFAULT_USE_LIGER) == "1"
-if _MULTI_GPU_MEMORY_CAP_REQUESTED and USE_LIGER:
+if _EXPLICIT_MEMORY_CAP_REQUESTED and USE_LIGER:
     print("[LIGER] WARNING: USE_LIGER=1 with explicit max_memory caps; disable it if device_map offloads to CPU")
 if USE_LIGER:
     try:
@@ -78,6 +77,18 @@ if USE_LIGER:
 
 _IMAGE_TEXT_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe"}
 _TEXT_BATCH_KEYS = {"input_ids", "attention_mask", "position_ids", "labels"}
+_QWEN35_FASTPATH_IMPORTS = (
+    ("causal_conv1d", "causal_conv1d_fn"),
+    ("causal_conv1d", "causal_conv1d_update"),
+    ("fla.modules", "FusedRMSNormGated"),
+    ("fla.ops.gated_delta_rule", "chunk_gated_delta_rule"),
+    ("fla.ops.gated_delta_rule", "fused_recurrent_gated_delta_rule"),
+)
+# Transformers checks the import names `causal_conv1d` and `fla`. On CUDA jobs,
+# the PyPI packages below provide those modules and enable the optimized Qwen3.5
+# gated-delta/conv path. They are CUDA-only, so local macOS/CPU installs may fail.
+_QWEN35_FASTPATH_PACKAGES = ("causal-conv1d", "flash-linear-attention")
+_QWEN35_FASTPATH_INSTALL_HINT = " ".join(_QWEN35_FASTPATH_PACKAGES)
 
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -165,6 +176,9 @@ OPTIMIZER = os.environ.get("OPTIMIZER", "adamw_cpu").lower()
 UPDATE_MICROBATCH_SIZE = int(os.environ.get("UPDATE_MICROBATCH_SIZE", "4"))
 OPTIM_STEP_EVERY_GROUPS = int(os.environ.get("OPTIM_STEP_EVERY_GROUPS", "16"))
 UPDATE_PAD_TO_MULTIPLE_OF = int(os.environ.get("UPDATE_PAD_TO_MULTIPLE_OF", "8"))
+# Same objective, lower padding waste: sort buyer-turn update examples by padded
+# student/teacher sequence length before forming microbatches within each GRPO group.
+UPDATE_LENGTH_BUCKETING = os.environ.get("UPDATE_LENGTH_BUCKETING", "1") == "1"
 ROLLOUT_MAX_LENGTH = int(os.environ.get("ROLLOUT_MAX_LENGTH", "3072"))
 UPDATE_MAX_LENGTH = int(os.environ.get("UPDATE_MAX_LENGTH", "3072"))
 # Experimental SDPO/SDRO design metadata for run naming and W&B config. These do
@@ -288,7 +302,7 @@ torch.manual_seed(SEED)
 
 
 def _model_load_kwargs():
-    """Shared model loading kwargs, with optional multi-GPU memory caps."""
+    """Shared model loading kwargs."""
     kwargs = {
         "dtype": torch.bfloat16,
         "device_map": MODEL_DEVICE_MAP,
@@ -298,11 +312,50 @@ def _model_load_kwargs():
         if not torch.cuda.is_available():
             return kwargs
         n_gpu = torch.cuda.device_count()
-        # Reserve a CPU entry so Accelerate has an explicit place for layers that
-        # do not fit on the GPUs instead of failing unpredictably.
+        # Explicit memory caps are primarily for manual sharding experiments. They
+        # can cause CPU/disk offload; _assert_no_cpu_offload() fails fast because
+        # this full-parameter training script requires all layers on GPU.
         kwargs["max_memory"] = {i: f"{MAX_MEMORY_PER_GPU_GIB}GiB" for i in range(n_gpu)}
         kwargs["max_memory"]["cpu"] = "240GiB"
     return kwargs
+
+
+def _dependency_version(package_name):
+    try:
+        return importlib.metadata.version(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    except Exception:
+        return "unknown"
+
+
+def _probe_qwen35_fastpath():
+    missing = []
+    for module_name, attr_name in _QWEN35_FASTPATH_IMPORTS:
+        try:
+            module = __import__(module_name, fromlist=[attr_name])
+            obj = getattr(module, attr_name, None)
+            if obj is None:
+                missing.append(f"{module_name}.{attr_name}=None")
+        except Exception as exc:
+            missing.append(f"{module_name}.{attr_name}: {type(exc).__name__}: {exc}")
+    versions = {pkg: _dependency_version(pkg) for pkg in _QWEN35_FASTPATH_PACKAGES}
+    ok = not missing
+    return ok, missing, versions
+
+
+def _log_qwen35_fastpath_status():
+    ok, missing, versions = _probe_qwen35_fastpath()
+    version_text = ", ".join(f"{k}={v or 'missing'}" for k, v in versions.items())
+    if ok:
+        print(f"[QWEN3.5 FASTPATH] OK: optimized gated-delta/conv kernels import. Versions: {version_text}")
+    else:
+        print("[QWEN3.5 FASTPATH] MISSING: transformers will fall back to slower torch gated-delta path.")
+        print(f"[QWEN3.5 FASTPATH] Versions: {version_text}")
+        print(f"[QWEN3.5 FASTPATH] Install with: pip install {_QWEN35_FASTPATH_INSTALL_HINT}")
+        for item in missing[:8]:
+            print(f"[QWEN3.5 FASTPATH] Missing detail: {item}")
+    return ok
 
 
 def _config_model_type(config):
@@ -462,9 +515,9 @@ def _qwen35_text_canary(model, processor_or_tokenizer, tokenizer, device, label)
 def _assert_no_cpu_offload(model, name):
     """Fail fast if Accelerate placed any module on CPU/disk.
 
-    The previous a10g-largex4 run allowed CPU/offload and then failed inside a
-    Triton RMSNorm during generation. Full fine-tuning also needs all trainable
-    buyer weights on GPU for meaningful optimizer updates.
+    Full fine-tuning and rollout generation require all modules on GPU. CPU/disk
+    offload is especially unsafe with Triton/Liger kernels and would make dense
+    optimizer updates invalid or unusably slow.
     """
     hf_map = getattr(model, "hf_device_map", None)
     if not isinstance(hf_map, dict):
@@ -746,7 +799,11 @@ def build_seller_prompt(product):
 
 
 # ─── Action extraction + hidden scratchpad stripping ─────────────────────────
-ACTION_PATTERN = r"\[(BUY|SELL|DEAL|REJECT|QUIT)\](?:\s*\$([\d,\.]+))?(?:\s*\(([^)]*)\))?"
+# Capture numeric prices without swallowing trailing sentence punctuation such as
+# "$25.00.". The old [\d,.]+ pattern could include the final period and crash
+# float() during long rollouts.
+PRICE_PATTERN = r"([0-9][0-9,]*(?:\.[0-9]+)?)"
+ACTION_PATTERN = r"\[(BUY|SELL|DEAL|REJECT|QUIT)\](?:\s*\$" + PRICE_PATTERN + r")?(?:\s*\(([^)]*)\))?"
 ACTION_RE = re.compile(ACTION_PATTERN, re.IGNORECASE)
 ACTION_LINE_RE = re.compile(r"(?:^|\n)\s*Action\s*:\s*" + ACTION_PATTERN, re.IGNORECASE)
 QWEN_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
@@ -1618,6 +1675,28 @@ def _encode_prompt_completion(tokenizer, prompt_text, completion_text):
     }
 
 
+def _encoded_padded_len(item):
+    seq_len = len(item["input_ids"])
+    if UPDATE_PAD_TO_MULTIPLE_OF > 1:
+        rem = seq_len % UPDATE_PAD_TO_MULTIPLE_OF
+        if rem:
+            seq_len += UPDATE_PAD_TO_MULTIPLE_OF - rem
+    return seq_len
+
+
+def _update_example_bucket_key(example):
+    # Sort by the larger of student/teacher padded lengths because both forwards
+    # are executed for each microbatch. This preserves per-turn loss weights; only
+    # the grouping into forward/backward calls changes.
+    return max(_encoded_padded_len(example["student"]), _encoded_padded_len(example["teacher"]))
+
+
+def _maybe_length_bucket_examples(examples):
+    if not UPDATE_LENGTH_BUCKETING or len(examples) <= UPDATE_MICROBATCH_SIZE:
+        return examples
+    return sorted(examples, key=_update_example_bucket_key)
+
+
 def _pad_encoded_batch(encoded_items, tokenizer, device):
     if not encoded_items:
         raise ValueError("Cannot collate an empty update microbatch")
@@ -1783,6 +1862,7 @@ def sdpo_grpo_update(
         sdpo_demo_count += demo_count
         if not group_examples:
             continue
+        group_examples = _maybe_length_bucket_examples(group_examples)
 
         group_turn_count = len(group_examples)
         window_start_group = (g // optim_every) * optim_every
@@ -1800,7 +1880,7 @@ def sdpo_grpo_update(
                 _timer_add(timers, "update_policy_forward_s", start)
 
                 start = _timer_start()
-                with torch.no_grad():
+                with torch.inference_mode():
                     teacher_lp = _token_logprobs(
                         buyer_model, teacher_batch["input_ids"], teacher_batch["attention_mask"]
                     )
@@ -2016,11 +2096,13 @@ def save_and_push_checkpoint(buyer_model, tokenizer, metrics, iteration, final=F
 def check_cuda():
     print(f"PyTorch: {torch.__version__}")
     print(f"CUDA available: {torch.cuda.is_available()}")
+    _log_qwen35_fastpath_status()
     if not torch.cuda.is_available():
         print("FATAL: No CUDA")
         sys.exit(1)
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    print(f"CUDA device count: {torch.cuda.device_count()}")
+    for idx in range(torch.cuda.device_count()):
+        print(f"GPU[{idx}]: {torch.cuda.get_device_name(idx)} VRAM={torch.cuda.get_device_properties(idx).total_memory / 1e9:.1f} GB")
     x = torch.randn(2, 2).cuda() @ torch.randn(2, 2).cuda()
     print(f"Compute test: {x.device} OK")
     print("=" * 70, flush=True)
@@ -2052,7 +2134,8 @@ def main():
     print(
         f"[CONFIG] UpdateMicrobatch={UPDATE_MICROBATCH_SIZE} "
         f"OptimStepEveryGroups={OPTIM_STEP_EVERY_GROUPS} "
-        f"UpdatePadMultiple={UPDATE_PAD_TO_MULTIPLE_OF} UpdateMaxLength={UPDATE_MAX_LENGTH}"
+        f"UpdatePadMultiple={UPDATE_PAD_TO_MULTIPLE_OF} UpdateLengthBucketing={UPDATE_LENGTH_BUCKETING} "
+        f"UpdateMaxLength={UPDATE_MAX_LENGTH}"
     )
     print(
         f"[CONFIG] EarlyStop format>={FORMAT_STOP_THRESHOLD}x{FORMAT_STOP_PATIENCE} "
@@ -2132,6 +2215,7 @@ def main():
                 "update_microbatch_size": UPDATE_MICROBATCH_SIZE,
                 "optim_step_every_groups": OPTIM_STEP_EVERY_GROUPS,
                 "update_pad_to_multiple_of": UPDATE_PAD_TO_MULTIPLE_OF,
+                "update_length_bucketing": UPDATE_LENGTH_BUCKETING,
                 "rollout_max_length": ROLLOUT_MAX_LENGTH,
                 "update_max_length": UPDATE_MAX_LENGTH,
                 "model_device_map": MODEL_DEVICE_MAP,
