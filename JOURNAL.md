@@ -1,7 +1,7 @@
 # Anchor Negotiation — Engineering Journal
 
 > Authored by: Anton Künzi
-> Last updated: 2026-05-15 20:15 UTC
+> Last updated: 2026-05-23 01:35 UTC
 > Session with: ZeterMordio
 
 This document is the single source of truth for all design decisions,
@@ -12,26 +12,41 @@ It replaces the old `engineering_notebook.md` which is archived for reference.
 
 ## Quick Reference
 
-### Hyperparameters (canonical)
+### Current direction / canonical active plan
 
-| Parameter | v10 A100 ✅ | v10 L40S ❌ | Real Run (planned) |
-|-----------|------------|------------|-------------------|
-| Model | Qwen3-4B-Instruct-2507 | Qwen3-4B-Instruct-2507 | Qwen3-8B |
-| Iters | 15 ✅ | 15 (OOM at iter 1) | 40-60 |
-| Batch (products) | 16 | 16 | 64 (paper) |
-| Group (rollouts/product) | 8 | 8 | 8 |
-| LR | 1e-6 | 1e-6 | 1e-6 |
-| Max turns | 6 | 6 | 6 |
-| Max tokens/turn | 300 | 300 | 300 |
-| Buyer temp | 1.0 | 1.0 | 1.0 |
-| Seller temp | 1.0 | 1.0 | 1.0 (self-play) |
-| KL penalty | 0.01 | 0.0 (ref-free) | 0.01 |
-| RAE decay | 0.95 | 0.95 | 0.95 |
-| Dual-role ratio | 0.5 | 0.5 | 0.5-1.0 |
-| Clip epsilon | 0.2 | 0.2 | 0.2 |
-| AdamW betas | (0.9, 0.95) | (0.9, 0.95) | (0.9, 0.95) |
-| Ref model | ✅ frozen | ❌ (USE_REF_MODEL=0) | ✅ frozen |
-| Hardware | a100-large (80GB) | l40sx1 (44GB) | a100-large |
+SDPO+GRPO buyer-only training is now the main approach for improving negotiation. It preserves the negotiation RLVR paper's buyer-vs-frozen-regulated-seller setup and adds feedback-conditioned self-teacher token credit. Pure GRPO remains the baseline; the dual-role/SPIRAL+RAE script is archived under `deprecated/` for provenance/comparison only.
+
+| Parameter | Active SDPO plan | Qwen3.5 smoke lesson |
+|-----------|------------------|----------------------|
+| Main script | `train_negotiation_sdpo.py` | `train_negotiation_sdpo_qwen35.py` |
+| Model | `Qwen/Qwen3-8B` | `Qwen/Qwen3.5-9B` or resumed smoke repo |
+| Environment | Buyer-only vs frozen regulated seller | Same, with ImageTextToText loader/native thinking support |
+| Iters | 60 | 2-iter production-shape smoke first |
+| Batch × group | 16 × 8 = 128 episodes/iter | 16 × 8 = 128 episodes/iter |
+| LR | `5e-6` in script default, but recent smoke suggests lowering to `1e-6` for stability | `3e-6` with warmup was still format-error prone |
+| Max turns / tokens | 6 / 300 | 6 / 300 hidden-think + short public finalizer |
+| Buyer / seller temp | 1.0 / 0.7 | 1.0 / 0.7 |
+| KL/reference | `KL_COEF=0.0`, no frozen reference-policy forward | same |
+| SDPO lambda | `0.5` for balanced 8B real run | GRPO-heavy handoff (`0.9 -> 0.5`) looked safer than immediate SDPO-heavy updates |
+| Hardware | `a100-large` minimum; Qwen3.5 9B saturates 80GB | consider larger hardware only with an explicit sharding plan |
+
+### Historical dual-role hyperparameters (archived)
+
+| Parameter | v10 A100 ✅ | v10 L40S ❌ |
+|-----------|------------|------------|
+| Model | Qwen3-4B-Instruct-2507 | Qwen3-4B-Instruct-2507 |
+| Iters | 15 ✅ | 15 (OOM at iter 1) |
+| Batch (products) | 16 | 16 |
+| Group (rollouts/product) | 8 | 8 |
+| LR | 1e-6 | 1e-6 |
+| Max turns | 6 | 6 |
+| Max tokens/turn | 300 | 300 |
+| Buyer temp | 1.0 | 1.0 |
+| Seller temp | 1.0 | 1.0 (self-play) |
+| KL penalty | 0.01 | 0.0 (ref-free) |
+| RAE decay | 0.95 | 0.95 |
+| Dual-role ratio | 0.5 | 0.5 |
+| Hardware | a100-large (80GB) | l40sx1 (44GB) |
 
 ### Verified Model IDs
 
@@ -39,7 +54,8 @@ It replaces the old `engineering_notebook.md` which is archived for reference.
 |-------|--------|------|-------|
 | `Qwen/Qwen3-4B` | ✅ | ~7.5GB bf16 | Instruct-merged. Toy Runs 1-3 v1-v6. |
 | `Qwen/Qwen3-4B-Instruct-2507` | ✅ | ~7.5GB bf16 | **Toy Run 3 v7+.** Aug 2025, better IFEval. |
-| `Qwen/Qwen3-8B` | ✅ | ~15GB bf16 | Real Run target. |
+| `Qwen/Qwen3-8B` | ✅ | ~15GB bf16 | Current SDPO real-run target. |
+| `Qwen/Qwen3.5-9B` | ✅ | ~18.8GB bf16 | Qwen3.5/ImageTextToText SDPO smoke target; requires processor-aware loader. |
 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | ✅ | ~56GB | Paper's exact model. |
 | `Qwen/Qwen3-1.7B` | ✅ | ~3.4GB | Toy Run 1 successful. |
 
@@ -1495,3 +1511,28 @@ Updated the SDPO defaults for the next serious Qwen3-8B ref-free run:
 - `GRAD_CLIP_NORM=1.0`: made the existing hardcoded clip configurable and logged.
 - `ROLLOUT_MAX_LENGTH=3072`, `UPDATE_MAX_LENGTH=3072`: modestly reduces prompt truncation for 6-turn, 300-token negotiations while avoiding the memory hit of jumping straight to 4096.
 - W&B / metrics now include `train/optimizer_global_step`, active optimizer LR as `train/lr`, and `lr_last`, useful during warmup.
+
+---
+
+## 2026-05-23: Repo Health / SDPO-First Cleanup
+
+Committed the Qwen3.5 SDPO smoke logs intentionally under `runs/qwen35_sdpo_smokes/` with a run-card README rather than leaving anonymous `job_*.log` files in the parent `QwenGT/` directory. The archived logs document the VRAM/format-error tradeoffs behind the current SDPO/Qwen3.5 recommendations:
+
+- `job_6a0d34952dc5b1243da50b26.log`: `GEN_BATCH_LIMIT=128`, `LR=5e-6`, Qwen3.5-9B buyer+seller, completed 2 iterations and pushed [`ZeterMordio/anchor-negotiation-sdpo-qwen35-vram-2iter-20260520-041204`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-qwen35-vram-2iter-20260520-041204), but reward/deal/format metrics were poor.
+- `job_6a0f8d7fb33ece92698bfba9.log`: real-shape clean native-finalizer test at `GEN_BATCH_LIMIT=8`, useful for memory/finalizer context.
+- `job_6a0f9688b33ece92698bfc1b.log`: real-shape clean native-finalizer test at `GEN_BATCH_LIMIT=96`, reached iter0 reward `-0.0483`, deal `50.8%`, buyer format errors `21/128`, and peak reserved VRAM around `83GB`.
+
+Repo organization decisions:
+
+- `train_negotiation_sdpo.py` and `train_negotiation_sdpo_qwen35.py` are the active training path.
+- `train_negotiation_pure.py` stays active as the pure-GRPO baseline.
+- `deprecated/train_negotiation_dual_role.py` now holds the older SPIRAL/RLVR dual-role script. It is still useful for comparison/provenance, but not the preferred path for the current negotiation-improvement goal.
+- `deprecated/engineering_notebook.md` holds the original notebook because `JOURNAL.md` is the maintained source of truth.
+- `tools/backfill_pure_to_wandb.py` remains as a support utility rather than a top-level training script.
+- A local `/Users/tosha/code/QwenGT/AGENTS.md` copy was created from `LOCAL_NOTES.md` for future agent discoverability. It is outside this Git repo and should stay local unless sanitized intentionally.
+
+Health-check updates:
+
+- `README.md` now states SDPO+GRPO buyer-only training as the main direction and points dual-role/spiral users to `deprecated/`.
+- `eval_negotiation.py` now defaults to the SDPO model/seller setup, uses the safer Qwen3.5 numeric action parser, and supports both CausalLM checkpoints and Qwen3.5 ImageTextToText wrappers via `AutoProcessor` + `AutoModelForImageTextToText` fallback logic.
+- Local syntax import smoke could not run fully on this machine because the local environment lacks `torch`; run `python3 -m py_compile ...` inside the HF Jobs/uv environment before a GPU evaluation launch.

@@ -1,0 +1,15 @@
+# Qwen3.5 SDPO smoke logs
+
+These logs were originally captured in `/Users/tosha/code/QwenGT/job_*.log` while debugging Qwen3.5 SDPO/GRPO runs. They are archived here intentionally because they contain useful context for the current SDPO-first negotiation direction: VRAM pressure, native-thinking/finalizer behavior, format-error failure modes, and W&B/Hub links.
+
+| Log | HF job | Hub repo | W&B | Purpose / result |
+|---|---|---|---|---|
+| `job_6a0d34952dc5b1243da50b26.log` | [`6a0d34952dc5b1243da50b26`](https://huggingface.co/jobs/ZeterMordio/6a0d34952dc5b1243da50b26) | [`ZeterMordio/anchor-negotiation-sdpo-qwen35-vram-2iter-20260520-041204`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-qwen35-vram-2iter-20260520-041204) | [`ypxys97l`](https://wandb.ai/chalk/anchor-negotiation-sdpo/runs/ypxys97l) | Earlier VRAM/throughput test with `GEN_BATCH_LIMIT=128`, `LR=5e-6`, Qwen3.5-9B buyer+seller, and W&B enabled. Completed 2 iters and pushed final model, but metrics were poor: iter0 reward `-0.6547`, deal `10.9%`, buyer format errors `55/128`; iter1 reward `-0.7517`, deal `9.4%`, buyer format errors `61/128`. Useful as evidence that the naive/bolder setting destabilized format adherence despite fitting. |
+| `job_6a0f8d7fb33ece92698bfba9.log` | [`6a0f8d7fb33ece92698bfba9`](https://huggingface.co/jobs/ZeterMordio/6a0f8d7fb33ece92698bfba9) | [`ZeterMordio/anchor-negotiation-sdpo-qwen35-clean-native-finalizer-realshape-iter2-a100-gen8`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-qwen35-clean-native-finalizer-realshape-iter2-a100-gen8) | not captured in this local log | Real-shape clean native-finalizer test with `GEN_BATCH_LIMIT=8`, seller `Qwen/Qwen3.5-9B`, buyer initialized from `ZeterMordio/anchor-negotiation-sdpo-qwen35-smoke`, `LR=3e-6`. Kept mainly for rollout/finalizer debugging context and memory comparison against the `gen96` run. |
+| `job_6a0f9688b33ece92698bfc1b.log` | [`6a0f9688b33ece92698bfc1b`](https://huggingface.co/jobs/ZeterMordio/6a0f9688b33ece92698bfc1b) | [`ZeterMordio/anchor-negotiation-sdpo-qwen35-clean-native-finalizer-realshape-iter2-a100-gen96`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-qwen35-clean-native-finalizer-realshape-iter2-a100-gen96) | not captured in this local log | Real-shape clean native-finalizer test with `GEN_BATCH_LIMIT=96`. Iter0 reached reward `-0.0483`, deal `50.8%`, buyer format errors `21/128`, peak reserved VRAM about `83GB`, then began iter1. This motivated the later documented `gen96` production-shape smoke result and the recommendation to lower LR / slow SDPO handoff. |
+
+Notes:
+
+- These logs are intentionally force-added even though `runs/` is normally ignored.
+- Future bulky raw logs should stay out of git unless they document an important run decision. Prefer committing a short run card plus links to HF Jobs/W&B/Hub artifacts.
+- The root copies in `/Users/tosha/code/QwenGT/` can be deleted after this archive commit; the committed copies here are the canonical local context.

@@ -15,22 +15,23 @@ Paper evaluation protocol (Table 6, Appendix A.2):
   - max_tokens = 4000 (evaluation), max_turns = 6
   - Seller uses neutral persona (no adversarial traits)
 
-Key design decisions for our dual-role setup:
+Key design decisions for the current SDPO-first setup:
   - Buyer = trained checkpoint (e.g. iter-10, iter-20, ... or final main)
-  - Seller = FROZEN base model (untrained Qwen3-4B-Instruct-2507)
-  - This gives apples-to-apples comparison: same seller across all checkpoints
-  - Thought blocks stripped from buyer output before showing to seller (strip_thought)
+  - Seller = frozen base model from the same Qwen family when possible
+  - This gives apples-to-apples comparison: same regulated seller across all checkpoints
+  - Hidden Thought / native <think> blocks are stripped before opponent visibility
   - Seller regulation: cannot accept below cost (same as training)
 
 Usage:
-    # Evaluate final model against frozen base seller
-    BUYER_PATH=ZeterMordio/anchor-negotiation-dual-role \
-    SELLER_PATH=Qwen/Qwen3-4B-Instruct-2507 \
+    # Evaluate current SDPO main model against frozen base seller
+    BUYER_PATH=ZeterMordio/anchor-negotiation-sdpo \
+    SELLER_PATH=Qwen/Qwen3-8B \
     python eval_negotiation.py
 
     # Evaluate a specific checkpoint
-    BUYER_PATH=ZeterMordio/anchor-negotiation-dual-role \
+    BUYER_PATH=ZeterMordio/anchor-negotiation-sdpo \
     BUYER_REV=iter-20 \
+    SELLER_PATH=Qwen/Qwen3-8B \
     python eval_negotiation.py
 
     # Evaluate untrained baseline (buyer = seller = same base model)
@@ -62,12 +63,16 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(line_buffering=True)
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+try:
+    from transformers import AutoModelForImageTextToText
+except ImportError:  # Older Transformers cannot load Qwen3.5 image-text checkpoints.
+    AutoModelForImageTextToText = None
 
 # ─── Config ────────────────────────────────────────────────────────────────
-BUYER_PATH   = os.environ.get("BUYER_PATH", "ZeterMordio/anchor-negotiation-dual-role")
+BUYER_PATH   = os.environ.get("BUYER_PATH", "ZeterMordio/anchor-negotiation-sdpo")
 BUYER_REV    = os.environ.get("BUYER_REV", None)  # HF branch/tag, e.g. "iter-20"
-SELLER_PATH  = os.environ.get("SELLER_PATH", "Qwen/Qwen3-4B-Instruct-2507")
+SELLER_PATH  = os.environ.get("SELLER_PATH", "Qwen/Qwen3-8B")
 N_TEST       = int(os.environ.get("N_TEST", "128"))   # paper: 128 test products
 N_ROLL       = int(os.environ.get("N_ROLL", "4"))     # paper: 4 rollouts per product
 MAX_TURNS    = int(os.environ.get("MAX_TURNS", "6"))   # paper: 6
@@ -80,8 +85,14 @@ TEST_SPLIT_SIZE  = int(os.environ.get("TEST_SPLIT_SIZE", "128"))
 OUT          = os.environ.get("OUT", "eval_results.json")
 HUB_MODEL_ID = os.environ.get("HUB_MODEL_ID", "")  # optional: push results to model repo
 USE_LIGER    = os.environ.get("USE_LIGER", "1") == "1"
+ATTN_IMPLEMENTATION = os.environ.get("ATTN_IMPLEMENTATION", "sdpa")
+CHAT_TEMPLATE_ENABLE_THINKING = os.environ.get("CHAT_TEMPLATE_ENABLE_THINKING", "0") == "1"
 
 random.seed(SEED)
+
+_IMAGE_TEXT_MODEL_TYPES = {"qwen3_5", "qwen3_vl", "qwen2_5_vl", "qwen2_vl"}
+_TEXT_BATCH_KEYS = {"input_ids", "attention_mask", "position_ids"}
+
 
 # ─── Liger Kernel (optional, for faster inference) ──────────────────────────
 if USE_LIGER:
@@ -255,7 +266,10 @@ def build_seller_prompt(product):
 
 
 # ─── Action extraction (identical to training) ──────────────────────────────
-ACTION_PATTERN = r'\[(BUY|SELL|DEAL|REJECT|QUIT)\](?:\s*\$([\d,\.]+))?(?:\s*\(([^)]*)\))?'
+# Capture numeric prices without swallowing trailing sentence punctuation such as
+# "$25.00."; the old [\d,.]+ pattern could include the final period and crash.
+PRICE_PATTERN = r"([0-9][0-9,]*(?:\.[0-9]+)?)"
+ACTION_PATTERN = r"\[(BUY|SELL|DEAL|REJECT|QUIT)\](?:\s*\$" + PRICE_PATTERN + r")?(?:\s*\(([^)]*)\))?"
 ACTION_RE = re.compile(ACTION_PATTERN, re.IGNORECASE)
 ACTION_LINE_RE = re.compile(r'(?:^|\n)\s*Action\s*:\s*' + ACTION_PATTERN, re.IGNORECASE)
 QWEN_THINK_BLOCK_RE = re.compile(r'<think\b[^>]*>.*?</think\s*>', re.IGNORECASE | re.DOTALL)
@@ -379,28 +393,138 @@ def compute_buyer_reward(final_price, budget, cost, outcome):
     return max(-1.0, min(1.0, r))
 
 
-# ─── Generation ──────────────────────────────────────────────────────────────
+# ─── Model loading / generation ──────────────────────────────────────────────
+def _is_image_text_config(config):
+    return getattr(config, "vision_config", None) is not None or str(getattr(config, "model_type", "")) in _IMAGE_TEXT_MODEL_TYPES
+
+
+def _from_pretrained_compat(cls, model_id, **kwargs):
+    """Use current dtype=... API, with torch_dtype fallback for older installs."""
+    try:
+        return cls.from_pretrained(model_id, **kwargs)
+    except TypeError as e:
+        if "dtype" not in str(e) or "dtype" not in kwargs:
+            raise
+        kwargs = dict(kwargs)
+        kwargs["torch_dtype"] = kwargs.pop("dtype")
+        return cls.from_pretrained(model_id, **kwargs)
+
+
+def _model_input_device(model):
+    hf_map = getattr(model, "hf_device_map", None)
+    if isinstance(hf_map, dict):
+        for key in ("model.embed_tokens", "language_model.model.embed_tokens", "model", "language_model"):
+            if key in hf_map:
+                dev = torch.device(hf_map[key])
+                if dev.type == "cpu":
+                    raise RuntimeError(f"Input layer {key} is on CPU in hf_device_map; use larger GPU memory")
+                return dev
+        dev = torch.device(next(iter(hf_map.values())))
+        if dev.type == "cpu":
+            raise RuntimeError("First model shard is on CPU; use larger GPU memory")
+        return dev
+    return next(model.parameters()).device
+
+
+def _as_vlm_messages(messages):
+    out = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        out.append({"role": msg["role"], "content": content})
+    return out
+
+
+def _text_only_batch(batch):
+    return {k: v for k, v in batch.items() if k in _TEXT_BATCH_KEYS and v is not None}
+
+
+def _move_batch_to_device(batch, device):
+    return {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
+
+
+def load_eval_stack(model_id, revision=None):
+    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True, **({"revision": revision} if revision else {}))
+    common = {
+        "dtype": torch.bfloat16,
+        "device_map": "auto",
+        "trust_remote_code": True,
+        **({"revision": revision} if revision else {}),
+    }
+    if ATTN_IMPLEMENTATION:
+        common["attn_implementation"] = ATTN_IMPLEMENTATION
+
+    if _is_image_text_config(cfg):
+        if AutoModelForImageTextToText is None:
+            raise RuntimeError(
+                f"{model_id} looks like an image-text checkpoint but this Transformers install lacks "
+                "AutoModelForImageTextToText. Upgrade transformers."
+            )
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True, **({"revision": revision} if revision else {}))
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError(f"AutoProcessor for {model_id} does not expose .tokenizer")
+        model = _from_pretrained_compat(AutoModelForImageTextToText, model_id, **common)
+        stack = {"model": model, "processor": processor, "tokenizer": tokenizer, "is_image_text": True}
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, **({"revision": revision} if revision else {}))
+        model = _from_pretrained_compat(AutoModelForCausalLM, model_id, **common)
+        stack = {"model": model, "processor": tokenizer, "tokenizer": tokenizer, "is_image_text": False}
+
+    if stack["tokenizer"].pad_token is None:
+        stack["tokenizer"].pad_token = stack["tokenizer"].eos_token
+    model.eval()
+    return stack
+
+
 @torch.no_grad()
-def generate_single(model, tokenizer, messages, max_new, temp, device):
-    """Generate a single response. Used for eval (not batched — clarity over speed)."""
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
-    )
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096).to(device)
-    output_ids = model.generate(
-        **inputs,
-        max_new_tokens=max_new,
-        do_sample=True,
-        temperature=max(temp, 0.01),
-        top_p=1.0,
-        repetition_penalty=1.1,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
-    gen_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
-    # Protocol is Thought/Talk/Action with Qwen native thinking disabled. If a
-    # backend/model still emits <think>, strip it before storing/evaluating.
-    return strip_qwen_native_thinking(tokenizer.decode(gen_tokens, skip_special_tokens=True))
+def generate_single(stack, messages, max_new, temp):
+    """Generate a single response. Supports CausalLM and Qwen3.5 image-text wrappers."""
+    model = stack["model"]
+    tokenizer = stack["tokenizer"]
+    device = _model_input_device(model)
+    gen_kwargs = {
+        "max_new_tokens": max_new,
+        "do_sample": True,
+        "temperature": max(temp, 0.01),
+        "top_p": 1.0,
+        "repetition_penalty": 1.1,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+
+    if stack["is_image_text"]:
+        processor = stack["processor"]
+        inputs = processor.apply_chat_template(
+            _as_vlm_messages(messages),
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            enable_thinking=CHAT_TEMPLATE_ENABLE_THINKING,
+        )
+        inputs.pop("token_type_ids", None)
+        inputs = _move_batch_to_device(_text_only_batch(inputs), device)
+        output_ids = model.generate(**inputs, **gen_kwargs)
+        gen_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
+        text = processor.batch_decode([gen_tokens], skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+    else:
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=CHAT_TEMPLATE_ENABLE_THINKING,
+        )
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+        inputs = _move_batch_to_device(_text_only_batch(inputs), device)
+        output_ids = model.generate(**inputs, **gen_kwargs)
+        gen_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
+        text = tokenizer.decode(gen_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+    # Evaluation defaults to no native thinking; if a backend/model still emits
+    # <think>, strip it before storing/evaluating/opponent visibility.
+    return strip_qwen_native_thinking(text)
 
 
 # ─── Episode data ────────────────────────────────────────────────────────────
@@ -418,7 +542,7 @@ class EvalEpisode:
     budget_violations: int = 0  # count of [BUY] $X where X > budget
 
 
-def run_eval_episode(buyer_model, seller_model, buyer_tok, seller_tok, product, device):
+def run_eval_episode(buyer_stack, seller_stack, product):
     """Run one evaluation episode: trained buyer vs frozen seller.
     
     Protocol matches the RLVR paper:
@@ -435,7 +559,7 @@ def run_eval_episode(buyer_model, seller_model, buyer_tok, seller_tok, product, 
     
     for turn in range(MAX_TURNS):
         # ── Buyer turn ──
-        b_text = generate_single(buyer_model, buyer_tok, buyer_msgs, MAX_NEW, BUYER_TEMP, device)
+        b_text = generate_single(buyer_stack, buyer_msgs, MAX_NEW, BUYER_TEMP)
         b_act = extract_action(b_text)
         ep.buyer_texts.append(b_text)
         ep.num_turns += 1
@@ -487,7 +611,7 @@ def run_eval_episode(buyer_model, seller_model, buyer_tok, seller_tok, product, 
         # Add buyer's STRIPPED text to seller's context
         seller_msgs.append({"role": "user", "content": strip_thought(b_text)})
         
-        s_text = generate_single(seller_model, seller_tok, seller_msgs, MAX_NEW, SELLER_TEMP, device)
+        s_text = generate_single(seller_stack, seller_msgs, MAX_NEW, SELLER_TEMP)
         s_act = extract_action(s_text)
         ep.seller_texts.append(s_text)
         
@@ -608,7 +732,6 @@ def main():
     if not torch.cuda.is_available():
         print("FATAL: No CUDA")
         sys.exit(1)
-    device = torch.device("cuda:0")
     print(f"GPU: {torch.cuda.get_device_name(0)} ({torch.cuda.get_device_properties(0).total_memory/1e9:.1f}GB)")
     
     # Load dataset (same seed/split as training)
@@ -621,34 +744,19 @@ def main():
     
     # Load models
     print(f"\n[2/4] Loading buyer model: {BUYER_PATH}" + (f" @ {BUYER_REV}" if BUYER_REV else "") + "...")
-    buyer_kwargs = {"dtype": torch.bfloat16, "device_map": "auto", "trust_remote_code": True}
-    if BUYER_REV:
-        buyer_kwargs["revision"] = BUYER_REV
-    buyer_model = AutoModelForCausalLM.from_pretrained(BUYER_PATH, **buyer_kwargs)
-    buyer_model.eval()
-    buyer_tok = AutoTokenizer.from_pretrained(BUYER_PATH, trust_remote_code=True,
-                                              **({"revision": BUYER_REV} if BUYER_REV else {}))
-    if buyer_tok.pad_token is None:
-        buyer_tok.pad_token = buyer_tok.eos_token
-    print(f"  [OK] VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB")
+    buyer_stack = load_eval_stack(BUYER_PATH, BUYER_REV)
+    print(f"  [OK] image_text={buyer_stack['is_image_text']} VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB")
     
     # Seller model (frozen baseline)
     same_model = (SELLER_PATH == BUYER_PATH and not BUYER_REV)
     if same_model:
         print(f"\n[3/4] Seller = same as buyer (self-play eval)")
-        seller_model = buyer_model
-        seller_tok = buyer_tok
+        seller_stack = buyer_stack
     else:
         print(f"\n[3/4] Loading seller model: {SELLER_PATH}...")
-        seller_model = AutoModelForCausalLM.from_pretrained(
-            SELLER_PATH, dtype=torch.bfloat16, device_map="auto", trust_remote_code=True,
-        )
-        seller_model.eval()
-        seller_tok = AutoTokenizer.from_pretrained(SELLER_PATH, trust_remote_code=True)
-        if seller_tok.pad_token is None:
-            seller_tok.pad_token = seller_tok.eos_token
-        print(f"  [OK] VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB")
-    
+        seller_stack = load_eval_stack(SELLER_PATH)
+    print(f"  [OK] image_text={seller_stack['is_image_text']} VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB")
+
     # Run evaluation
     print(f"\n[4/4] Running {N_TEST * N_ROLL} evaluation episodes...")
     print(f"{'─' * 70}")
@@ -658,7 +766,7 @@ def main():
     
     for prod_idx, product in enumerate(test_products):
         for roll in range(N_ROLL):
-            ep = run_eval_episode(buyer_model, seller_model, buyer_tok, seller_tok, product, device)
+            ep = run_eval_episode(buyer_stack, seller_stack, product)
             all_episodes.append(ep)
         
         # Progress logging every 16 products
