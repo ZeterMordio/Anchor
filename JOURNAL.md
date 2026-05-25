@@ -1,7 +1,7 @@
 # Anchor Negotiation — Engineering Journal
 
 > Authored by: Anton Künzi
-> Last updated: 2026-05-23 01:35 UTC
+> Last updated: 2026-05-25 22:47 UTC
 > Session with: ZeterMordio
 
 This document is the single source of truth for all design decisions,
@@ -18,17 +18,18 @@ SDPO+GRPO buyer-only training is now the main approach for improving negotiation
 
 | Parameter | Active SDPO plan | Qwen3.5 smoke lesson |
 |-----------|------------------|----------------------|
-| Main script | `train_negotiation_sdpo.py` | `train_negotiation_sdpo_qwen35.py` |
-| Model | `Qwen/Qwen3-8B` | `Qwen/Qwen3.5-9B` or resumed smoke repo |
+| Main script | `train_negotiation_sdpo_qwen35.py` | `train_negotiation_sdpo.py` remains Qwen3-8B fallback/control |
+| Model | `Qwen/Qwen3.5-9B` | Qwen3-8B if Qwen3.5 adapter path or native-thinking stability blocks progress |
 | Environment | Buyer-only vs frozen regulated seller | Same, with ImageTextToText loader/native thinking support |
 | Iters | 60 | 2-iter production-shape smoke first |
 | Batch × group | 16 × 8 = 128 episodes/iter | 16 × 8 = 128 episodes/iter |
-| LR | `5e-6` in script default, but recent smoke suggests lowering to `1e-6` for stability | `3e-6` with warmup was still format-error prone |
+| LR | dense Qwen3.5 remains the serious path; LoRA `LR=1e-5` was too aggressive | lower-LR LoRA is not worth more A100 time for wall-clock speed unless specifically testing quality |
 | Max turns / tokens | 6 / 300 | 6 / 300 hidden-think + short public finalizer |
 | Buyer / seller temp | 1.0 / 0.7 | 1.0 / 0.7 |
 | KL/reference | `KL_COEF=0.0`, no frozen reference-policy forward | same |
-| SDPO lambda | `0.5` for balanced 8B real run | GRPO-heavy handoff (`0.9 -> 0.5`) looked safer than immediate SDPO-heavy updates |
-| Hardware | `a100-large` minimum; Qwen3.5 9B saturates 80GB | consider larger hardware only with an explicit sharding plan |
+| SDPO lambda | GRPO-heavy handoff `0.9 -> 0.5` for Qwen3.5 LoRA canary | immediate balanced/dense updates looked less safe |
+| Adapter path | dense full-parameter by default; `USE_LORA=1` is opt-in only | LoRA helps memory/checkpoint size, not current end-to-end wall clock |
+| Hardware | `a100-large` minimum; Qwen3.5 rollout saturates 80GB | LoRA reduced update peak but rollout still needs A100-class VRAM |
 
 ### Historical dual-role hyperparameters (archived)
 
@@ -79,6 +80,102 @@ Qwen3-4B dual-role on A100 (80GB):
 
 Qwen3-8B would need ~64GB operational — fits on A100x1 but tight.
 Real Run needs A100x4 (320GB) safe.
+
+---
+
+## Session 2026-05-23 — LoRA SDPO Update Canary
+
+### Direction change
+
+The active path is now Qwen3.5-first. `train_negotiation_sdpo_qwen35.py` is the main training entrypoint; `train_negotiation_sdpo.py` remains the Qwen3-8B fallback/control. This reflects the newer Qwen3.5/ImageTextToText stack and the recent native-thinking/finalizer work.
+
+### Why LoRA now
+
+The latest Qwen3.5 dense production-shape smoke proved the full-parameter update is feasible but expensive and format-fragile: A100 80GB is effectively saturated, update time is still dominated by backward plus policy/teacher forwards, and CPU-state AdamW remains non-trivial. The LoRA ablation is intended to preserve the same ref-free SDPO+GRPO objective while reducing trainable parameters and optimizer state.
+
+### Implementation choices
+
+- Added opt-in `USE_LORA=1` to both active SDPO scripts.
+- Default LoRA config for canaries: `LORA_R=64`, `LORA_ALPHA=64`, `LORA_DROPOUT=0.0`.
+- LoRA target selection is dynamic and exact-name based. It adapts only text-transformer `torch.nn.Linear` modules under `model.language_model.layers.*` or `model.layers.*`, including attention/linear-attention/MLP projections.
+- Broad `LORA_TARGET_MODULES=all-linear` is rejected because Qwen3.5 has adjacent vision/MTP/head modules that should not be adapted for this text-only negotiation run.
+- LoRA defaults to `OPTIMIZER=adamw_cuda`; dense full-parameter training keeps `adamw_cpu`.
+- Seller/environment model remains frozen and unadapted.
+- Pre-LoRA scripts were preserved under `working_docs/script_snapshots/2026-05-23-pre-lora/`.
+
+### Planned evidence gates before full Qwen3.5 run
+
+1. Local LoRA target/config tests pass.
+2. Local compile/ruff checks pass.
+3. Tiny HF GPU smoke imports PEFT, wraps Qwen3.5, runs dataset/model load, reaches first rollout/update, and pushes a durable artifact.
+4. Production-shape 2-iteration Qwen3.5 LoRA canary completes or early-stops with interpretable metrics.
+5. Compare against dense Qwen3.5 smoke on reward, deal rate, format errors, budget violations, rollout/update timers, optimizer time, trainable params, and peak VRAM.
+6. Stop before full 60-iteration Qwen3.5 launch; launch only after explicit review of the canary evidence.
+
+### Tiny smoke results
+
+- First tiny HF job `6a111227b33ece92698c0fa4` failed before model load because `AutoProcessor` pulled Qwen3.5 image-processing backends and the uv environment lacked `pillow`/`torchvision`.
+- Fix: Qwen3.5 text-only loader now falls back to `AutoTokenizer` if `AutoProcessor` raises an image-backend `ImportError`; canary commands also include `pillow` and `torchvision`.
+- Second tiny HF job `6a1112aae3c0b51e1ca5d8b1` completed. W&B run: `https://wandb.ai/chalk/anchor-negotiation-sdpo/runs/9fe34g0k`. Hub artifact: `ZeterMordio/anchor-negotiation-sdpo-qwen35-lora-r64-tiny-smoke2-20260523`.
+- LoRA injected `248` exact text targets, `173,113,344` trainable params out of `9,582,927,088` total (`1.806%`). Seller trainable params remained `0`.
+- Tiny run was intentionally too small for quality: 2 episodes, reward `-0.5000`, deal rate `0%`, outcomes `TIMEOUT=1`, `BUYER_FORMAT_ERROR=1`. It proved the load/wrap/update/save path, not training quality.
+- Tiny update timing: rollout `44s`, update `8s`, policy forward `1.7s`, teacher forward `0.9s`, backward `4.1s`, optimizer `0.2s`; peak reserved VRAM `44.0GB`.
+
+### Production-shape 2-iteration LoRA canary
+
+- HF job `6a111358b33ece92698c0fb4` completed and early-stopped after two format-warning iterations. W&B run: `https://wandb.ai/chalk/anchor-negotiation-sdpo/runs/1c7zz7e9`. Hub artifact: `ZeterMordio/anchor-negotiation-sdpo-qwen35-lora-r64-canary-20260523`.
+- Config: `Qwen/Qwen3.5-9B`, `NUM_ITERS=2`, `BATCH_SIZE=16`, `GROUP_SIZE=8`, option-B native thinking, `NATIVE_FINAL_TOKENS=96`, `USE_LORA=1`, `LORA_R=64`, `LORA_ALPHA=64`, `LR=1e-5`, CUDA AdamW, ref-free SDPO+GRPO, `CHECKPOINT_EVERY=1`.
+- Adapter scope remained correct: `248` exact text-transformer targets, `173,113,344 / 9,582,927,088` trainable params (`1.806%`), seller trainable params `0`.
+- Iter0 matched the dense control before any learned update: reward `-0.0744`, deal `46.9%`, buyer-format errors `12/128`, rollout `778s`, update `602s`.
+- Iter1 after one LoRA update degraded below the dense `LR=3e-6` Qwen3.5 smoke: reward `-0.1890` vs dense `-0.1196`, deal `32.8%` vs dense `38.3%`, buyer-format errors `18/128` vs dense `19/128`, overshoot `7.0%`.
+- Update timers were dense-like despite trainable params dropping to `1.806%`: iter0 policy forward `104.3s`, teacher forward `122.9s`, backward `367.3s`, optimizer `0.2s`; iter1 policy forward `100.2s`, teacher forward `116.5s`, backward `349.0s`, optimizer `0.1s`.
+- Memory result is the real win: update reserved peak dropped to `54.6GB`/`57.6GB`, and adapter checkpoints were ~`693MB`. Overall peak still reached `81.0GB`/`83.0GB` during rollout, so LoRA does not lower the current Qwen3.5 hardware class.
+- Decision: do not launch a 60-iteration Qwen3.5 LoRA run at `LR=1e-5`. Keep LoRA as opt-in; if continuing, run only another 2-iteration canary at `5e-6` or `3e-6` and compare against the dense control before promotion.
+
+### Follow-up sweep cancellation / dense-path guardrail
+
+- Two lower-LR LoRA canaries were briefly launched, then canceled during iteration-0 rollout before useful metrics because the observed bottleneck is not LoRA-sensitive enough for wall-clock optimization.
+- Canceled jobs: `6a1121b6e3c0b51e1ca5d928` (`LR=5e-6`) and `6a1121b6e3c0b51e1ca5d92a` (`LR=3e-6`). Both had passed startup, injected `248` targets, and reached rollout; neither produced training metrics before cancellation.
+- Dense-path guardrail added: when `USE_LORA` is unset, `train_negotiation_sdpo_qwen35.py` and `train_negotiation_sdpo.py` keep the pre-LoRA dense defaults for `OPTIMIZER`, default run name, and default W&B group. LoRA-specific W&B config/logging and model wrapping now run only under `USE_LORA=1`.
+- Side-by-side import check against `working_docs/script_snapshots/2026-05-23-pre-lora/` confirmed dense defaults match the snapshots for both Qwen3.5 and Qwen3 scripts.
+- Current recommendation: stop spending compute on LoRA as a speed lever. If wall-clock is the target, work next on rollout generation cost, Qwen3.5 fastpath kernels (`causal-conv1d`/`flash-linear-attention`), or architecture changes that avoid keeping buyer+seller live at rollout peak.
+
+### Rollout token telemetry / Qwen3.5 fastpath canary
+
+- Added `ROLLOUT_TOKEN_TELEMETRY=1` to `train_negotiation_sdpo_qwen35.py`. This is instrumentation only. It logs per-role and total rollout token counters: sequence count, prompt mean, first-pass generated mean, finalizer rate/tokens, total generated mean, first-pass parseable-action rate, final parseable-action rate, public tokens to first action, public tail tokens after first action, tail share, and max prompt/generated lengths.
+- The telemetry is printed after rollout and included in metrics rows plus W&B under `perf/rollout_token_*`. It is meant to decide whether parseable-action early stopping is worth implementing; it does not alter generation or training.
+- Added `tools/qwen35_fastpath_canary.py` as a reusable import/load/generate/backward smoke for the Qwen3.5 fastpath stack.
+- Fastpath uv-image canary [`6a112b6ee3c0b51e1ca5d98a`](https://huggingface.co/jobs/ZeterMordio/6a112b6ee3c0b51e1ca5d98a) failed before script execution. `causal-conv1d==1.6.2.post1` has only an sdist on PyPI; the standard HF uv image lacks `nvcc`, so the source build failed.
+- Two devel-image command-shape attempts were canceled/failed before useful model work: `6a112c13b33ece92698c113c` / `6a112c28b33ece92698c1144` misparsed `bash -lc` until the HF CLI `--` separator was used, and `6a112c4bb33ece92698c114c` hit PEP-668/system-pip plus empty mounted-script lookup.
+- Fastpath devel-image canary [`6a112d34e3c0b51e1ca5d99a`](https://huggingface.co/jobs/ZeterMordio/6a112d34e3c0b51e1ca5d99a) failed usefully: build isolation pulled torch `2.12.0+cu130` while the image CUDA was 12.8, causing a CUDA version mismatch during `causal-conv1d` build.
+- Final no-build-isolation devel-image canary [`6a112e00e3c0b51e1ca5d9a4`](https://huggingface.co/jobs/ZeterMordio/6a112e00e3c0b51e1ca5d9a4) completed. Environment: `pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel`, Python `3.12.3`, `torch=2.10.0+cu128`, `transformers=5.9.0`, `accelerate=1.13.0`, `causal-conv1d=1.6.2.post1`, `flash-linear-attention=0.5.0`, `triton=3.6.0`, A100 80GB with driver `575.57.08`.
+- Passing install recipe: install `numpy packaging ninja wheel setuptools transformers>=4.57.0 accelerate flash-linear-attention safetensors`, then install `causal-conv1d` with `--no-build-isolation` so it compiles against the image's torch/cu128 stack rather than an isolated torch/cu130 build env.
+- Result: all Qwen3.5 fastpath imports passed (`causal_conv1d_fn`, `causal_conv1d_update`, `FusedRMSNormGated`, `chunk_gated_delta_rule`, `fused_recurrent_gated_delta_rule`), `Qwen/Qwen3.5-9B` loaded, a 24-token generate completed, and a tiny full-model backward completed. Canary timings/VRAM: load `15.2s`, generate `44.72s` cold, backward `71.08s`, after-load `17.91GB`, after-generate peak `18.19GB`, after-backward peak `35.85GB`.
+- Interpretation: the fastpath stack is now technically viable on HF Jobs, but only with a CUDA-devel image or prebuilt/wheel artifact strategy. The canary is not a production throughput benchmark because it includes cold dependency work, cold Hub download, and one tiny prompt.
+
+### Same-shape Qwen3.5 fastpath 2-iteration run
+
+- HF job [`6a11339eb33ece92698c11b9`](https://huggingface.co/jobs/ZeterMordio/6a11339eb33ece92698c11b9) completed on `pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel`; W&B run [`fat0mgqc`](https://wandb.ai/chalk/anchor-negotiation-sdpo/runs/fat0mgqc); model/metrics repo [`ZeterMordio/anchor-negotiation-sdpo-qwen35-fastpath-2iter-20260523-045622`](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-qwen35-fastpath-2iter-20260523-045622) has `main`, `iter-1`, and `iter-2` branches.
+- Config matched the prior dense Qwen3.5 2-iter smoke shape: `Qwen/Qwen3.5-9B` buyer + seller, `NUM_ITERS=2`, `BATCH_SIZE=16`, `GROUP_SIZE=8`, `MAX_TURNS=6`, option-B native thinking, `NATIVE_THINK_TOKENS=300`, `NATIVE_FINAL_TOKENS=96`, `ROLLOUT_MAX_LENGTH=UPDATE_MAX_LENGTH=3072`, `LR=3e-6`, `WARMUP_STEPS=10`, `SDPO_LAMBDA=0.9 -> 0.88`, strict feedback, CPU-state AdamW, `UPDATE_LENGTH_BUCKETING=1`, `UPDATE_MICROBATCH_SIZE=4`, `OPTIM_STEP_EVERY_GROUPS=16`, `USE_LORA=0`, and `ROLLOUT_TOKEN_TELEMETRY=1`.
+- Iter0: reward `-0.1019`, deal `46.1%`, buyer-format errors `21/128`, budget violations `3/128`, printed time `1098s` (`rollout=675s`, `update=423s`), reserved peak `73.3GB`. Update timers: policy forward `54.0s`, teacher forward `53.4s`, backward `224.7s`, CPU optimizer `85.9s`.
+- Iter1: reward `-0.1905`, deal `35.2%`, buyer-format errors `17/128`, budget violations `11/128`, printed time `798s` (`rollout=523s`, `update=276s`), reserved peak `74.6GB`. Update timers: policy forward `37.1s`, teacher forward `49.9s`, backward `107.1s`, CPU optimizer `76.5s`.
+- Speed read: compared with the old dense fallback-stack run (`~661s` rollout, `~595s` update, `~20.9 min/iter`), the fastpath stack materially improves update compute (`423s`/`276s`) and lowers reserved VRAM (`73-75GB` vs `~80GB`). It does not fix rollout: rollout remained `675s`/`523s`, and full script wall time was still `39.2 min` because dense checkpoint writes/uploads plus generation dominate a 2-iter canary.
+- Token telemetry explains the remaining bottleneck: total sequences `652`/`613`, prompt mean `1067`/`1040`, first-pass generated mean `299.9`/`298.8`, finalizer rate `99.2%`/`98.9%`, total generated mean `349.3`/`348.6`, first-pass action rate only `0.8%`/`1.1%`, parseable action rate `95.9%`/`96.6%`.
+- Decision: keep the CUDA-devel fastpath recipe as viable for dense Qwen3.5 if running more Qwen3.5 work, especially for memory and update time. Do not spend more effort on fastpath sweeps as the main wall-clock lever. Next meaningful speed work is rollout-token reduction: parseable-action stop criteria, native-thinking/finalizer budget changes, or a design that avoids buyer+seller live generation pressure.
+
+### Cost-safe Qwen3.5 launch policy
+
+- User accepted the objective-preserving cost policy: keep `a100-large`, use the fastpath stack, set `CHECKPOINT_EVERY=10` while keeping W&B per-iteration logging, enforce finite timeouts/cancel discipline, and move dependency install/build work into a prebuilt image. Pre-update health gates and rollout-only canary mode are intentionally not part of this pass.
+- Added `docker/qwen35-fastpath/Dockerfile` for a pinned dependency image based on `pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel` with `transformers==5.9.0`, `accelerate==1.13.0`, `flash-linear-attention==0.5.0`, `causal-conv1d==1.6.2.post1`, `wandb==0.27.0`, and `huggingface_hub==1.16.1`.
+- Added `docker/qwen35-fastpath/README.md` with build/push instructions and the `causal-conv1d --no-build-isolation` invariant.
+- Added `tools/launch_qwen35_fastpath_sdpo.py`. It uploads the current `train_negotiation_sdpo_qwen35.py` to a script repo, launches the prebuilt image with `hf jobs run`, and dry-runs unless `--execute` is passed. It refuses non-`a100-large` flavors and refuses `CHECKPOINT_EVERY` values other than `10`.
+- Launcher default for the serious dense Qwen3.5 run is `NUM_ITERS=60`, `BATCH_SIZE=16`, `GROUP_SIZE=8`, `LR=3e-6`, `USE_LORA=0`, `OPTIMIZER=adamw_cpu`, `ROLLOUT_TOKEN_TELEMETRY=1`, `--timeout 22h`, and labels `project=anchor`, `purpose=qwen35-fastpath-dense`, `cost_policy=a100-checkpoint10-timeout`.
+- Rationale: HF Jobs currently bills per minute while Starting/Running; `a100-large` is still the cheapest shape that fits dense Qwen3.5 buyer+seller without changing model/protocol. The prebuilt image reduces repeated setup/build overhead across canaries/runs, while checkpoint cadence avoids dense model uploads every iteration.
+- Local Docker build succeeded for `anchor-qwen35-fastpath:torch2.10-cu128-fla0.5.0` with image ID `sha256:73e9d2e4553e9ca20b3edf2d985e31de76d72581d81f4c75ce6edc545c3fcea4` (`linux/amd64`, `17.6GB`). Build-time and runtime import checks printed `torch=2.10.0+cu128`, `transformers=5.9.0`, `accelerate=1.13.0`, `flash-linear-attention=0.5.0`, `causal-conv1d=1.6.2.post1`, `wandb=0.27.0`, and `huggingface_hub=1.16.1`, plus all required Qwen3.5 fastpath symbols. The Apple-local build warned that the base image is `linux/amd64` while the local host is `arm64`, and runtime warned that no NVIDIA driver was present; both are expected locally and fine for the HF GPU target.
+- Follow-up guardrail: HF docs describe Jobs images as Docker Hub or Hugging Face Spaces images (`hf.co/spaces/<owner>/<space>`). The launcher now rejects local-only image refs such as `anchor-qwen35-fastpath:...` or `localhost/...` before submission, so an accidental `--execute` cannot burn paid A100 startup time on an image HF Jobs cannot pull.
+- User approved either Docker Hub or HF Space image publication; HF Space was chosen because Jobs/artifacts/auth are already Hugging Face-centered. Created [`ZeterMordio/anchor-qwen35-fastpath`](https://huggingface.co/spaces/ZeterMordio/anchor-qwen35-fastpath) as a public Docker Space and uploaded the pinned Dockerfile at commit `b9ae2ebc32b548e9fa4f5a251aaae85c47872dc8`.
+- HF Space build succeeded: it installed the pinned stack, built `causal-conv1d` with `--no-build-isolation`, printed the expected package versions, pushed the image, and exported cache. A later metadata/default-command update landed at commit `c0c67b6db1492b9944823dd15405f959e8669ec0`, and the Space README was clarified at commit `d74870b3ef6e5f3dc2a68f801d74b21d13d04417`. The canonical prebuilt image ref is now `hf.co/spaces/ZeterMordio/anchor-qwen35-fastpath`, and the launcher defaults to this ref.
+- Cheap CPU HF Jobs import smokes [`6a14d140404eb93b204f1c82`](https://huggingface.co/jobs/ZeterMordio/6a14d140404eb93b204f1c82) and final [`6a14d2e4404eb93b204f1c99`](https://huggingface.co/jobs/ZeterMordio/6a14d2e4404eb93b204f1c99) completed using `space_id=ZeterMordio/anchor-qwen35-fastpath`. Logs confirmed HF Jobs can pull the Space image and import `causal_conv1d_fn`, `causal_conv1d_update`, `FusedRMSNormGated`, `chunk_gated_delta_rule`, and `fused_recurrent_gated_delta_rule`, with package versions `torch=2.10.0+cu128`, `transformers=5.9.0`, `accelerate=1.13.0`, `flash-linear-attention=0.5.0`, `causal-conv1d=1.6.2.post1`, `wandb=0.27.0`, and `huggingface_hub=1.16.1`.
 
 ---
 

@@ -12,11 +12,9 @@ update with Self-Distillation Policy Optimization (SDPO):
 - SDPO adds feedback-conditioned self-teacher log-probs for dense token credit.
 
 Default run policy:
-- Use this Qwen3-8B script as the fallback/control path. The main current path
-  is Qwen3.5 in train_negotiation_sdpo_qwen35.py.
+- Use Qwen/Qwen3-8B, not 4B. SDPO depends on retrospective in-context learning,
+  and the self-distillation paper shows this improves with model scale.
 - Use a balanced hybrid for the next real run: A_total = 0.5 * A_GRPO + 0.5 * A_SDPO.
-- Optional LoRA canaries freeze the base buyer and adapt exact text-transformer
-  Linear modules only; the frozen seller/environment model is never adapted.
 - Use strict feedback by default: no exact seller cost or private floor is placed
   into the teacher prompt. Oracle feedback is an explicit ablation only.
 - Keep the HF Jobs shape analogous to train_negotiation_pure.py: one standalone
@@ -118,18 +116,14 @@ SDPO_FEEDBACK_MODE = os.environ.get("SDPO_FEEDBACK_MODE", "strict").lower()
 SDPO_ADV_CLIP = float(os.environ.get("SDPO_ADV_CLIP", "5.0"))
 SDPO_MAX_DEMO_CHARS = int(os.environ.get("SDPO_MAX_DEMO_CHARS", "1400"))
 SDPO_MAX_FEEDBACK_CHARS = int(os.environ.get("SDPO_MAX_FEEDBACK_CHARS", "1800"))
-USE_LORA = os.environ.get("USE_LORA", "0") == "1"
-LORA_R = int(os.environ.get("LORA_R", "64"))
-LORA_ALPHA = int(os.environ.get("LORA_ALPHA", str(LORA_R)))
-LORA_DROPOUT = float(os.environ.get("LORA_DROPOUT", "0.0"))
-LORA_TARGET_MODULES_RAW = os.environ.get("LORA_TARGET_MODULES", "").strip()
 # On 8B full fine-tuning, foreach AdamW briefly materializes extra tensor lists
 # at optimizer.step(); disabling foreach preserves the objective and lowers peak VRAM.
 ADAMW_FOREACH = os.environ.get("ADAMW_FOREACH", "0") == "1"
 # Optimizer choice is an implementation detail, not a training-method change. The
-# default remains exact full-parameter AdamW+CPU-state for dense runs. LoRA
-# defaults to CUDA AdamW because only adapter params are trainable.
-OPTIMIZER = os.environ.get("OPTIMIZER", "adamw_cuda" if USE_LORA else "adamw_cpu").lower()
+# default remains exact full-parameter AdamW updates, but stores optimizer state
+# on CPU to avoid the 8B A100 optimizer.step OOM seen in job 6a05acb... .
+# Set OPTIMIZER=adamw_cuda for a fully CUDA AdamW attempt; keep it only if VRAM is enough.
+OPTIMIZER = os.environ.get("OPTIMIZER", "adamw_cpu").lower()
 # Update-path performance controls. The old implementation processed one buyer
 # turn at a time and stepped CPU AdamW once per GRPO group. These defaults batch
 # buyer turns into microbatches and step once per 16 groups (= once per 16-product
@@ -173,20 +167,9 @@ def _distill_slug():
     return "tokgap"
 
 
-def training_adapter_slug():
-    if USE_LORA:
-        return f"lora-r{LORA_R}-a{LORA_ALPHA}"
-    return "fullft"
-
-
-def _adapter_run_suffix():
-    return f"__{training_adapter_slug()}" if USE_LORA else ""
-
-
 def default_run_name():
     return (
         f"sdpo__{_model_slug(MODEL_NAME)}__l{_fmt_run_value(SDPO_LAMBDA)}__{_distill_slug()}"
-        f"{_adapter_run_suffix()}"
         f"__i{NUM_ITERS}_b{BATCH_SIZE}xg{GROUP_SIZE}"
         f"__fb{SDPO_FEEDBACK_MODE}_clip{_fmt_run_value(SDPO_ADV_CLIP)}"
         f"__lr{_fmt_run_value(LR)}_kl{_fmt_run_value(KL_COEF)}__s{SEED}"
@@ -194,7 +177,7 @@ def default_run_name():
 
 
 def default_wandb_group():
-    return f"sdpo__{_model_slug(MODEL_NAME)}__{_distill_slug()}{_adapter_run_suffix()}__fb{SDPO_FEEDBACK_MODE}"
+    return f"sdpo__{_model_slug(MODEL_NAME)}__{_distill_slug()}__fb{SDPO_FEEDBACK_MODE}"
 
 
 random.seed(SEED)
@@ -217,104 +200,6 @@ def _model_load_kwargs():
         kwargs["max_memory"] = {i: f"{MAX_MEMORY_PER_GPU_GIB}GiB" for i in range(n_gpu)}
         kwargs["max_memory"]["cpu"] = "240GiB"
     return kwargs
-
-
-_TEXT_LORA_TARGET_RE = re.compile(
-    r"^(?:model\.language_model\.layers|model\.layers)\.\d+\."
-    r"(?:linear_attn|self_attn|mlp)\."
-)
-
-
-def _parse_lora_target_modules(raw):
-    if not raw:
-        return []
-    targets = [item.strip() for item in raw.split(",") if item.strip()]
-    if any(item == "all-linear" for item in targets):
-        raise ValueError(
-            "LORA_TARGET_MODULES=all-linear is unsafe for this script because it "
-            "can adapt non-transformer/head modules. Leave LORA_TARGET_MODULES "
-            "unset for text-transformer-only inference, or pass explicit module names."
-        )
-    return targets
-
-
-def _infer_lora_target_modules(model):
-    """Return exact text-transformer Linear module names for Qwen3/Qwen3.5."""
-    targets = []
-    for name, module in model.named_modules():
-        if not isinstance(module, torch.nn.Linear):
-            continue
-        if _TEXT_LORA_TARGET_RE.match(name):
-            targets.append(name)
-    return sorted(targets)
-
-
-def _resolve_lora_target_modules(model):
-    explicit = _parse_lora_target_modules(LORA_TARGET_MODULES_RAW)
-    if explicit:
-        return explicit
-    targets = _infer_lora_target_modules(model)
-    if not targets:
-        raise RuntimeError(
-            "USE_LORA=1 but no text-transformer Linear modules were found for "
-            "LoRA injection. Check model architecture or set LORA_TARGET_MODULES."
-        )
-    return targets
-
-
-def _trainable_parameter_summary(model):
-    total = 0
-    trainable = 0
-    for p in model.parameters():
-        n = p.numel()
-        total += n
-        if p.requires_grad:
-            trainable += n
-    pct = (100.0 * trainable / total) if total else 0.0
-    return {
-        "trainable_params": trainable,
-        "total_params": total,
-        "trainable_pct": pct,
-    }
-
-
-def apply_lora_to_buyer_model(model):
-    """Wrap the buyer policy with LoRA adapters when USE_LORA=1."""
-    if not USE_LORA:
-        return model, {
-            "adapter": "fullft",
-            "lora_target_count": 0,
-            **_trainable_parameter_summary(model),
-        }
-    try:
-        from peft import LoraConfig, get_peft_model
-    except ImportError as exc:
-        raise ImportError("USE_LORA=1 requires the `peft` package; add `--with peft` to HF Jobs.") from exc
-
-    target_modules = _resolve_lora_target_modules(model)
-    config = LoraConfig(
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        target_modules=target_modules,
-        lora_dropout=LORA_DROPOUT,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, config)
-    summary = _trainable_parameter_summary(model)
-    summary.update(
-        {
-            "adapter": "lora",
-            "lora_r": LORA_R,
-            "lora_alpha": LORA_ALPHA,
-            "lora_dropout": LORA_DROPOUT,
-            "lora_target_count": len(target_modules),
-            "lora_target_modules": target_modules,
-        }
-    )
-    if hasattr(model, "print_trainable_parameters"):
-        model.print_trainable_parameters()
-    return model, summary
 
 
 def _first_model_device(model):
@@ -1590,12 +1475,6 @@ def main():
         f"OptimStepEveryGroups={OPTIM_STEP_EVERY_GROUPS} "
         f"UpdatePadMultiple={UPDATE_PAD_TO_MULTIPLE_OF} UpdateMaxLength={UPDATE_MAX_LENGTH}"
     )
-    if USE_LORA:
-        print(
-            f"[CONFIG] Adapter={training_adapter_slug()} UseLoRA={USE_LORA} "
-            f"LoRA(r={LORA_R}, alpha={LORA_ALPHA}, dropout={LORA_DROPOUT}, "
-            f"targets={'auto-text' if not LORA_TARGET_MODULES_RAW else LORA_TARGET_MODULES_RAW})"
-        )
     print(f"[CONFIG] CheckpointEvery={CHECKPOINT_EVERY} Hub={HUB_MODEL_ID or '(disabled)'}")
     print("=" * 70, flush=True)
 
@@ -1603,60 +1482,6 @@ def main():
         import wandb
 
         run_name = RUN_NAME or default_run_name()
-        wandb_config = {
-            "method": "negotiation_sdpo_grpo_ref_free",
-            "buyer_model": MODEL_NAME,
-            "seller_model": SELLER_MODEL_NAME,
-            "num_iters": NUM_ITERS,
-            "batch_size": BATCH_SIZE,
-            "group_size": GROUP_SIZE,
-            "max_turns": MAX_TURNS,
-            "lr": LR,
-            "weight_decay": WEIGHT_DECAY,
-            "warmup_steps": WARMUP_STEPS,
-            "grad_clip_norm": GRAD_CLIP_NORM,
-            "epsilon": EPSILON,
-            "kl_coef": KL_COEF,
-            "ref_free_objective": True,
-            "reference_model_used": False,
-            "max_new_tokens": MAX_NEW_TOKENS,
-            "buyer_temp": BUYER_TEMP,
-            "seller_temp": SELLER_TEMP,
-            "normalize_advantages": NORMALIZE_ADVANTAGES,
-            "num_inner_epochs": NUM_INNER_EPOCHS,
-            "sdpo_lambda": SDPO_LAMBDA,
-            "sdpo_feedback_mode": SDPO_FEEDBACK_MODE,
-            "sdpo_adv_clip": SDPO_ADV_CLIP,
-            "distillation_level": DISTILLATION_LEVEL,
-            "top_k_distillation": TOP_K_DISTILLATION,
-            "distillation_divergence": DISTILLATION_DIVERGENCE,
-            "trust_region_interpolation": TRUST_REGION_INTERPOLATION,
-            "teacher_ema_decay": TEACHER_EMA_DECAY,
-            "sdpo_max_demo_chars": SDPO_MAX_DEMO_CHARS,
-            "sdpo_max_feedback_chars": SDPO_MAX_FEEDBACK_CHARS,
-            "optimizer": OPTIMIZER,
-            "adamw_foreach": ADAMW_FOREACH,
-            "update_microbatch_size": UPDATE_MICROBATCH_SIZE,
-            "optim_step_every_groups": OPTIM_STEP_EVERY_GROUPS,
-            "update_pad_to_multiple_of": UPDATE_PAD_TO_MULTIPLE_OF,
-            "rollout_max_length": ROLLOUT_MAX_LENGTH,
-            "update_max_length": UPDATE_MAX_LENGTH,
-            "model_device_map": MODEL_DEVICE_MAP,
-            "max_memory_per_gpu_gib": MAX_MEMORY_PER_GPU_GIB,
-            "liger_kernel": USE_LIGER,
-            "dataset_categories": CATEGORIES,
-        }
-        if USE_LORA:
-            wandb_config.update(
-                {
-                    "adapter": training_adapter_slug(),
-                    "use_lora": USE_LORA,
-                    "lora_r": LORA_R,
-                    "lora_alpha": LORA_ALPHA,
-                    "lora_dropout": LORA_DROPOUT,
-                    "lora_target_modules_raw": LORA_TARGET_MODULES_RAW,
-                }
-            )
         wandb_run = wandb.init(
             entity=WANDB_ENTITY,
             project=WANDB_PROJECT,
@@ -1666,7 +1491,49 @@ def main():
             mode=WANDB_MODE,
             tags=WANDB_TAGS,
             save_code=False,
-            config=wandb_config,
+            config={
+                "method": "negotiation_sdpo_grpo_ref_free",
+                "buyer_model": MODEL_NAME,
+                "seller_model": SELLER_MODEL_NAME,
+                "num_iters": NUM_ITERS,
+                "batch_size": BATCH_SIZE,
+                "group_size": GROUP_SIZE,
+                "max_turns": MAX_TURNS,
+                "lr": LR,
+                "weight_decay": WEIGHT_DECAY,
+                "warmup_steps": WARMUP_STEPS,
+                "grad_clip_norm": GRAD_CLIP_NORM,
+                "epsilon": EPSILON,
+                "kl_coef": KL_COEF,
+                "ref_free_objective": True,
+                "reference_model_used": False,
+                "max_new_tokens": MAX_NEW_TOKENS,
+                "buyer_temp": BUYER_TEMP,
+                "seller_temp": SELLER_TEMP,
+                "normalize_advantages": NORMALIZE_ADVANTAGES,
+                "num_inner_epochs": NUM_INNER_EPOCHS,
+                "sdpo_lambda": SDPO_LAMBDA,
+                "sdpo_feedback_mode": SDPO_FEEDBACK_MODE,
+                "sdpo_adv_clip": SDPO_ADV_CLIP,
+                "distillation_level": DISTILLATION_LEVEL,
+                "top_k_distillation": TOP_K_DISTILLATION,
+                "distillation_divergence": DISTILLATION_DIVERGENCE,
+                "trust_region_interpolation": TRUST_REGION_INTERPOLATION,
+                "teacher_ema_decay": TEACHER_EMA_DECAY,
+                "sdpo_max_demo_chars": SDPO_MAX_DEMO_CHARS,
+                "sdpo_max_feedback_chars": SDPO_MAX_FEEDBACK_CHARS,
+                "optimizer": OPTIMIZER,
+                "adamw_foreach": ADAMW_FOREACH,
+                "update_microbatch_size": UPDATE_MICROBATCH_SIZE,
+                "optim_step_every_groups": OPTIM_STEP_EVERY_GROUPS,
+                "update_pad_to_multiple_of": UPDATE_PAD_TO_MULTIPLE_OF,
+                "rollout_max_length": ROLLOUT_MAX_LENGTH,
+                "update_max_length": UPDATE_MAX_LENGTH,
+                "model_device_map": MODEL_DEVICE_MAP,
+                "max_memory_per_gpu_gib": MAX_MEMORY_PER_GPU_GIB,
+                "liger_kernel": USE_LIGER,
+                "dataset_categories": CATEGORIES,
+            },
         )
         WANDB_OK = True
         print(f"[WANDB] Run: {wandb_run.url}")
@@ -1691,32 +1558,12 @@ def main():
         **_model_load_kwargs(),
     )
     _assert_no_cpu_offload(buyer_model, "buyer_model")
-    adapter_summary = None
-    if USE_LORA:
-        buyer_model, adapter_summary = apply_lora_to_buyer_model(buyer_model)
-    if USE_LORA and WANDB_OK and wandb_run is not None:
-        try:
-            wandb_run.config.update(adapter_summary, allow_val_change=True)
-        except Exception as e:
-            print(f"  [WANDB] Adapter config update failed (non-fatal): {e}")
     if GRADIENT_CHECKPOINTING:
-        if USE_LORA and hasattr(buyer_model, "enable_input_require_grads"):
-            buyer_model.enable_input_require_grads()
         buyer_model.gradient_checkpointing_enable()
         if hasattr(buyer_model, "config"):
             buyer_model.config.use_cache = False
     dev = _model_input_device(buyer_model)
-    if USE_LORA:
-        print(
-            f"  [OK] Adapter={adapter_summary['adapter']} "
-            f"Trainable={adapter_summary['trainable_params']:,}/{adapter_summary['total_params']:,} "
-            f"({adapter_summary['trainable_pct']:.3f}%) "
-            f"Targets={adapter_summary.get('lora_target_count', 0)} "
-            f"InputDevice={dev} FirstParamDevice={_first_model_device(buyer_model)} "
-            f"VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB"
-        )
-    else:
-        print(f"  [OK] InputDevice={dev} FirstParamDevice={_first_model_device(buyer_model)} VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
+    print(f"  [OK] InputDevice={dev} FirstParamDevice={_first_model_device(buyer_model)} VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
 
     print("\n[4/5] Loading frozen seller/environment model (no reference-policy model)...")
     seller_model = AutoModelForCausalLM.from_pretrained(
@@ -1739,11 +1586,8 @@ def main():
         cpu_adamw_state = {}
         print("  [OK] AdamW optimizer state will be stored on CPU to avoid CUDA optimizer-step OOM")
     elif OPTIMIZER == "adamw_cuda":
-        optimizer_params = list(buyer_model.parameters()) if not USE_LORA else [p for p in buyer_model.parameters() if p.requires_grad]
-        if not optimizer_params:
-            raise RuntimeError("No trainable buyer parameters found for AdamW.")
         optimizer = torch.optim.AdamW(
-            optimizer_params,
+            buyer_model.parameters(),
             lr=LR,
             betas=(0.9, 0.95),
             weight_decay=WEIGHT_DECAY,

@@ -17,8 +17,6 @@ Default run policy:
   wrappers around processor/model calls and runs a startup canary by default.
 - Start GRPO-heavy and gradually hand off to SDPO shaping: by default
   A_total decays from 0.9 * A_GRPO + 0.1 * A_SDPO to a balanced 0.5/0.5 mix by iter 20.
-- Optional LoRA canaries freeze the base buyer and adapt exact text-transformer
-  Linear modules only; the frozen seller/environment model is never adapted.
 - Use strict feedback by default: no exact seller cost or private floor is placed
   into the teacher prompt. Oracle feedback is an explicit ablation only.
 - Keep the HF Jobs shape analogous to train_negotiation_pure.py: one standalone
@@ -123,7 +121,6 @@ GRADIENT_CHECKPOINTING = os.environ.get("GRADIENT_CHECKPOINTING", "1") == "1"
 MODEL_DEVICE_MAP = os.environ.get("MODEL_DEVICE_MAP", "auto")
 MAX_MEMORY_PER_GPU_GIB = os.environ.get("MAX_MEMORY_PER_GPU_GIB", "").strip()
 GEN_BATCH_LIMIT = int(os.environ.get("GEN_BATCH_LIMIT", "128"))
-ROLLOUT_TOKEN_TELEMETRY = os.environ.get("ROLLOUT_TOKEN_TELEMETRY", "1") == "1"
 NUM_INNER_EPOCHS = int(os.environ.get("NUM_INNER_EPOCHS", "1"))
 NORMALIZE_ADVANTAGES = os.environ.get("NORMALIZE_ADVANTAGES", "1") == "1"
 CHECKPOINT_EVERY = int(os.environ.get("CHECKPOINT_EVERY", "10"))
@@ -164,18 +161,14 @@ SDPO_FEEDBACK_MODE = os.environ.get("SDPO_FEEDBACK_MODE", "strict").lower()
 SDPO_ADV_CLIP = float(os.environ.get("SDPO_ADV_CLIP", "5.0"))
 SDPO_MAX_DEMO_CHARS = int(os.environ.get("SDPO_MAX_DEMO_CHARS", "1400"))
 SDPO_MAX_FEEDBACK_CHARS = int(os.environ.get("SDPO_MAX_FEEDBACK_CHARS", "1800"))
-USE_LORA = os.environ.get("USE_LORA", "0") == "1"
-LORA_R = int(os.environ.get("LORA_R", "64"))
-LORA_ALPHA = int(os.environ.get("LORA_ALPHA", str(LORA_R)))
-LORA_DROPOUT = float(os.environ.get("LORA_DROPOUT", "0.0"))
-LORA_TARGET_MODULES_RAW = os.environ.get("LORA_TARGET_MODULES", "").strip()
 # On 8B full fine-tuning, foreach AdamW briefly materializes extra tensor lists
 # at optimizer.step(); disabling foreach preserves the objective and lowers peak VRAM.
 ADAMW_FOREACH = os.environ.get("ADAMW_FOREACH", "0") == "1"
 # Optimizer choice is an implementation detail, not a training-method change. The
-# default remains exact full-parameter AdamW+CPU-state for dense runs. LoRA
-# defaults to CUDA AdamW because only adapter params are trainable.
-OPTIMIZER = os.environ.get("OPTIMIZER", "adamw_cuda" if USE_LORA else "adamw_cpu").lower()
+# default remains exact full-parameter AdamW updates, but stores optimizer state
+# on CPU to avoid the 8B A100 optimizer.step OOM seen in job 6a05acb... .
+# Set OPTIMIZER=adamw_cuda for a fully CUDA AdamW attempt; keep it only if VRAM is enough.
+OPTIMIZER = os.environ.get("OPTIMIZER", "adamw_cpu").lower()
 # Update-path performance controls. The old implementation processed one buyer
 # turn at a time and stepped CPU AdamW once per GRPO group. These defaults batch
 # buyer turns into microbatches and step once per 16 groups (= once per 16-product
@@ -231,20 +224,9 @@ def _distill_slug():
     return "tokgap"
 
 
-def training_adapter_slug():
-    if USE_LORA:
-        return f"lora-r{LORA_R}-a{LORA_ALPHA}"
-    return "fullft"
-
-
-def _adapter_run_suffix():
-    return f"__{training_adapter_slug()}" if USE_LORA else ""
-
-
 def default_run_name():
     return (
         f"sdpo__{_model_slug(MODEL_NAME)}__l{_fmt_run_value(SDPO_LAMBDA)}__{_distill_slug()}"
-        f"{_adapter_run_suffix()}"
         f"__i{NUM_ITERS}_b{BATCH_SIZE}xg{GROUP_SIZE}"
         f"__fb{SDPO_FEEDBACK_MODE}_clip{_fmt_run_value(SDPO_ADV_CLIP)}"
         f"__lr{_fmt_run_value(LR)}_kl{_fmt_run_value(KL_COEF)}__s{SEED}"
@@ -252,7 +234,7 @@ def default_run_name():
 
 
 def default_wandb_group():
-    return f"sdpo__{_model_slug(MODEL_NAME)}__{_distill_slug()}{_adapter_run_suffix()}__fb{SDPO_FEEDBACK_MODE}"
+    return f"sdpo__{_model_slug(MODEL_NAME)}__{_distill_slug()}__fb{SDPO_FEEDBACK_MODE}"
 
 
 def active_sdpo_lambda(iteration):
@@ -376,109 +358,6 @@ def _log_qwen35_fastpath_status():
     return ok
 
 
-_TEXT_LORA_TARGET_RE = re.compile(
-    r"^(?:model\.language_model\.layers|model\.layers)\.\d+\."
-    r"(?:linear_attn|self_attn|mlp)\."
-)
-
-
-def _parse_lora_target_modules(raw):
-    if not raw:
-        return []
-    targets = [item.strip() for item in raw.split(",") if item.strip()]
-    if any(item == "all-linear" for item in targets):
-        raise ValueError(
-            "LORA_TARGET_MODULES=all-linear is unsafe for Qwen3.5 because it can "
-            "adapt vision/MTP/head modules. Leave LORA_TARGET_MODULES unset for "
-            "text-transformer-only inference, or pass explicit module names."
-        )
-    return targets
-
-
-def _infer_lora_target_modules(model):
-    """Return exact text-transformer Linear module names for Qwen3/Qwen3.5.
-
-    Qwen3.5 is an ImageTextToText wrapper with vision and MTP modules adjacent to
-    the language model. PEFT's list matching supports exact module names, so use
-    full names rather than broad suffixes like ``q_proj``.
-    """
-    targets = []
-    for name, module in model.named_modules():
-        if not isinstance(module, torch.nn.Linear):
-            continue
-        if _TEXT_LORA_TARGET_RE.match(name):
-            targets.append(name)
-    return sorted(targets)
-
-
-def _resolve_lora_target_modules(model):
-    explicit = _parse_lora_target_modules(LORA_TARGET_MODULES_RAW)
-    if explicit:
-        return explicit
-    targets = _infer_lora_target_modules(model)
-    if not targets:
-        raise RuntimeError(
-            "USE_LORA=1 but no text-transformer Linear modules were found for "
-            "LoRA injection. Check model architecture or set LORA_TARGET_MODULES."
-        )
-    return targets
-
-
-def _trainable_parameter_summary(model):
-    total = 0
-    trainable = 0
-    for p in model.parameters():
-        n = p.numel()
-        total += n
-        if p.requires_grad:
-            trainable += n
-    pct = (100.0 * trainable / total) if total else 0.0
-    return {
-        "trainable_params": trainable,
-        "total_params": total,
-        "trainable_pct": pct,
-    }
-
-
-def apply_lora_to_buyer_model(model):
-    """Wrap the buyer policy with LoRA adapters when USE_LORA=1."""
-    if not USE_LORA:
-        return model, {
-            "adapter": "fullft",
-            "lora_target_count": 0,
-            **_trainable_parameter_summary(model),
-        }
-    try:
-        from peft import LoraConfig, get_peft_model
-    except ImportError as exc:
-        raise ImportError("USE_LORA=1 requires the `peft` package; add `--with peft` to HF Jobs.") from exc
-
-    target_modules = _resolve_lora_target_modules(model)
-    config = LoraConfig(
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        target_modules=target_modules,
-        lora_dropout=LORA_DROPOUT,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, config)
-    summary = _trainable_parameter_summary(model)
-    summary.update(
-        {
-            "adapter": "lora",
-            "lora_r": LORA_R,
-            "lora_alpha": LORA_ALPHA,
-            "lora_dropout": LORA_DROPOUT,
-            "lora_target_count": len(target_modules),
-            "lora_target_modules": target_modules,
-        }
-    )
-    if hasattr(model, "print_trainable_parameters"):
-        model.print_trainable_parameters()
-    return model, summary
-
-
 def _config_model_type(config):
     return str(getattr(config, "model_type", "") or "")
 
@@ -488,15 +367,7 @@ def _is_image_text_config(config):
 
 
 def _is_image_text_model(model):
-    if _is_image_text_config(getattr(model, "config", None)):
-        return True
-    # PEFT wraps the underlying Transformers model; keep the startup text canary
-    # active after LoRA injection.
-    for attr in ("base_model", "model"):
-        inner = getattr(model, attr, None)
-        if inner is not None and inner is not model and _is_image_text_model(inner):
-            return True
-    return False
+    return _is_image_text_config(getattr(model, "config", None))
 
 
 def _first_model_device(model):
@@ -543,19 +414,10 @@ def _load_text_or_image_text_stack(model_name):
                 f"{model_name} is {_config_model_type(cfg)} and requires AutoModelForImageTextToText. "
                 "Install a recent transformers version (Qwen3.5 model card uses >=4.57)."
             )
-        try:
-            processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-            tokenizer = getattr(processor, "tokenizer", None)
-            if tokenizer is None:
-                raise RuntimeError(f"AutoProcessor for {model_name} does not expose .tokenizer")
-        except ImportError as exc:
-            # Text-only negotiation does not need image/video preprocessing. Some
-            # HF Jobs uv environments omit pillow/torchvision, which AutoProcessor
-            # imports only for Qwen3.5's image processor. Fall back to tokenizer
-            # chat templates and keep processor/tokenizer as the same object.
-            print(f"[QWEN3.5 LOADER] AutoProcessor unavailable for text-only run; using AutoTokenizer. Detail: {exc}")
-            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-            processor = tokenizer
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError(f"AutoProcessor for {model_name} does not expose .tokenizer")
         model = AutoModelForImageTextToText.from_pretrained(model_name, **_model_load_kwargs())
         return model, processor, tokenizer
 
@@ -958,6 +820,7 @@ def strip_qwen_native_thinking(text):
     public protocol marker (Thought/Talk/Action), otherwise drop the tail.
     """
     text = text or ""
+    had_native_marker = bool(QWEN_THINK_OPEN_RE.search(text) or QWEN_THINK_CLOSE_RE.search(text))
     text = QWEN_THINK_BLOCK_RE.sub("", text)
 
     closes = list(QWEN_THINK_CLOSE_RE.finditer(text))
@@ -1095,176 +958,6 @@ def strip_thought(text):
     return canonical_public_message(text)
 
 
-def _new_rollout_token_bucket():
-    return {
-        "sequences": 0,
-        "prompt_tokens": 0,
-        "first_pass_generated_tokens": 0,
-        "finalizer_sequences": 0,
-        "finalizer_generated_tokens": 0,
-        "total_generated_tokens": 0,
-        "first_pass_parseable_actions": 0,
-        "parseable_actions": 0,
-        "public_tokens": 0,
-        "public_tokens_to_first_action_end": 0,
-        "public_tail_tokens_after_action": 0,
-        "max_prompt_tokens": 0,
-        "max_first_pass_generated_tokens": 0,
-        "max_total_generated_tokens": 0,
-    }
-
-
-def _new_rollout_token_telemetry():
-    return {
-        "enabled": ROLLOUT_TOKEN_TELEMETRY,
-        "roles": {},
-        "total": _new_rollout_token_bucket(),
-    }
-
-
-def _rollout_token_bucket(telemetry, role):
-    roles = telemetry.setdefault("roles", {})
-    if role not in roles:
-        roles[role] = _new_rollout_token_bucket()
-    return roles[role]
-
-
-def _token_count_text(tokenizer, text):
-    if not text:
-        return 0
-    try:
-        return len(tokenizer.encode(text, add_special_tokens=False))
-    except Exception:
-        encoded = tokenizer(text, add_special_tokens=False)
-        ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
-        if ids and isinstance(ids[0], list):
-            return len(ids[0])
-        return len(ids)
-
-
-def _first_public_action_line_end(text):
-    match = ACTION_LINE_RE.search(text or "")
-    if not match:
-        return None
-    line_end = text.find("\n", match.end())
-    return line_end if line_end >= 0 else len(text)
-
-
-def _public_surface_for_token_telemetry(text):
-    text = strip_qwen_native_thinking(text or "")
-    talk_match = re.search(r"(?:^|\n)\s*Talk\s*:", text, re.IGNORECASE)
-    action_match = re.search(r"(?:^|\n)\s*Action\s*:", text, re.IGNORECASE)
-    thought_match = re.search(r"(?:^|\n)\s*Thought\s*:", text, re.IGNORECASE)
-    if talk_match:
-        return text[talk_match.start() :]
-    if action_match and thought_match and thought_match.start() < action_match.start():
-        return text[action_match.start() :]
-    if thought_match:
-        return ""
-    return text
-
-
-def _record_rollout_token_result(
-    telemetry,
-    role,
-    tokenizer,
-    prompt_tokens,
-    first_pass_generated_tokens,
-    first_pass_had_action,
-    finalizer_generated_tokens,
-    finalizer_used,
-    decoded,
-):
-    if not telemetry or not telemetry.get("enabled"):
-        return
-
-    total_generated_tokens = int(first_pass_generated_tokens) + int(finalizer_generated_tokens)
-    public_text = _public_surface_for_token_telemetry(decoded)
-    public_tokens = _token_count_text(tokenizer, public_text)
-    action_end = _first_public_action_line_end(public_text)
-    tokens_to_action = 0
-    tail_tokens = 0
-    has_action = action_end is not None
-    if has_action:
-        tokens_to_action = _token_count_text(tokenizer, public_text[:action_end])
-        tail_tokens = max(0, public_tokens - tokens_to_action)
-
-    for bucket in (_rollout_token_bucket(telemetry, role), telemetry["total"]):
-        bucket["sequences"] += 1
-        bucket["prompt_tokens"] += int(prompt_tokens)
-        bucket["first_pass_generated_tokens"] += int(first_pass_generated_tokens)
-        bucket["finalizer_generated_tokens"] += int(finalizer_generated_tokens)
-        bucket["total_generated_tokens"] += total_generated_tokens
-        bucket["public_tokens"] += public_tokens
-        bucket["max_prompt_tokens"] = max(bucket["max_prompt_tokens"], int(prompt_tokens))
-        bucket["max_first_pass_generated_tokens"] = max(
-            bucket["max_first_pass_generated_tokens"], int(first_pass_generated_tokens)
-        )
-        bucket["max_total_generated_tokens"] = max(bucket["max_total_generated_tokens"], total_generated_tokens)
-        if first_pass_had_action:
-            bucket["first_pass_parseable_actions"] += 1
-        if finalizer_used:
-            bucket["finalizer_sequences"] += 1
-        if has_action:
-            bucket["parseable_actions"] += 1
-            bucket["public_tokens_to_first_action_end"] += tokens_to_action
-            bucket["public_tail_tokens_after_action"] += tail_tokens
-
-
-def _summarize_rollout_token_telemetry(telemetry):
-    if not telemetry or not telemetry.get("enabled"):
-        return {}
-
-    summary = {}
-    buckets = {"total": telemetry["total"], **telemetry.get("roles", {})}
-    for role, bucket in buckets.items():
-        seq = bucket["sequences"]
-        if seq <= 0:
-            continue
-        actions = max(1, bucket["parseable_actions"])
-        finalizers = max(1, bucket["finalizer_sequences"])
-        action_public_tokens = bucket["public_tokens_to_first_action_end"] + bucket["public_tail_tokens_after_action"]
-        prefix = f"rollout_token_{role}"
-        summary[f"{prefix}_sequences"] = seq
-        summary[f"{prefix}_prompt_mean"] = bucket["prompt_tokens"] / seq
-        summary[f"{prefix}_first_pass_generated_mean"] = bucket["first_pass_generated_tokens"] / seq
-        summary[f"{prefix}_finalizer_rate"] = bucket["finalizer_sequences"] / seq
-        summary[f"{prefix}_finalizer_generated_mean"] = bucket["finalizer_generated_tokens"] / finalizers
-        summary[f"{prefix}_total_generated_mean"] = bucket["total_generated_tokens"] / seq
-        summary[f"{prefix}_first_pass_action_rate"] = bucket["first_pass_parseable_actions"] / seq
-        summary[f"{prefix}_parseable_action_rate"] = bucket["parseable_actions"] / seq
-        summary[f"{prefix}_public_tokens_mean"] = bucket["public_tokens"] / seq
-        summary[f"{prefix}_tokens_to_action_mean"] = bucket["public_tokens_to_first_action_end"] / actions
-        summary[f"{prefix}_tail_after_action_mean"] = bucket["public_tail_tokens_after_action"] / actions
-        summary[f"{prefix}_tail_after_action_share"] = (
-            bucket["public_tail_tokens_after_action"] / max(1, action_public_tokens)
-        )
-        summary[f"{prefix}_max_prompt_tokens"] = bucket["max_prompt_tokens"]
-        summary[f"{prefix}_max_first_pass_generated_tokens"] = bucket["max_first_pass_generated_tokens"]
-        summary[f"{prefix}_max_total_generated_tokens"] = bucket["max_total_generated_tokens"]
-    return summary
-
-
-def _print_rollout_token_telemetry(summary):
-    if not summary:
-        return
-    for role in ("buyer", "seller", "total"):
-        seq = summary.get(f"rollout_token_{role}_sequences")
-        if not seq:
-            continue
-        print(
-            f"  Rollout tokens [{role}]: seq={int(seq)} "
-            f"prompt_mean={summary[f'rollout_token_{role}_prompt_mean']:.0f} "
-            f"first_gen_mean={summary[f'rollout_token_{role}_first_pass_generated_mean']:.1f} "
-            f"total_gen_mean={summary[f'rollout_token_{role}_total_generated_mean']:.1f} "
-            f"finalizer={summary[f'rollout_token_{role}_finalizer_rate']:.1%} "
-            f"first_pass_action={summary[f'rollout_token_{role}_first_pass_action_rate']:.1%} "
-            f"parseable_action={summary[f'rollout_token_{role}_parseable_action_rate']:.1%} "
-            f"tail_after_action={summary[f'rollout_token_{role}_tail_after_action_mean']:.1f}tok "
-            f"tail_share={summary[f'rollout_token_{role}_tail_after_action_share']:.1%}"
-        )
-
-
 def _assert_strip_thought_complete(stripped_text, original_text):
     has_structured_thought = bool(re.search(r"(?:^|\n)\s*Thought\s*:", original_text or ""))
     leaked_thought = bool(re.search(r"(?:^|\n)\s*Thought\s*:", stripped_text or ""))
@@ -1378,7 +1071,7 @@ def _append_native_public_finalizer(prompt_text, decoded_thinking):
 
 
 @torch.no_grad()
-def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device, *, role="unknown", token_telemetry=None):
+def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device):
     """Generate completions for a list of prompts using sub-batched HF generate."""
     if not prompts_text_list:
         return []
@@ -1397,7 +1090,6 @@ def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device,
         )
         inputs = _move_batch_to_device(_text_only_batch(inputs), device)
         tokenizer.padding_side = orig_side
-        prompt_token_counts = [int(inputs["attention_mask"][i].sum().item()) for i in range(len(batch_prompts))]
 
         think_budget = max_new
         if NATIVE_PUBLIC_FINALIZER and NATIVE_REASONING_PROTOCOL and CHAT_TEMPLATE_ENABLE_THINKING:
@@ -1415,14 +1107,9 @@ def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device,
         )
         prompt_len = inputs["input_ids"].shape[1]
         decoded_batch = []
-        first_pass_token_counts = []
-        first_pass_had_action = []
-        finalizer_token_counts = [0 for _ in batch_prompts]
-        finalizer_used = [False for _ in batch_prompts]
         for i in range(len(batch_prompts)):
             gen_tokens = output_ids[i][prompt_len:]
             gen_tokens = gen_tokens[gen_tokens != tokenizer.pad_token_id]
-            first_pass_token_counts.append(int(gen_tokens.numel()))
             # Option A stores explicit Thought/Talk/Action only and strips any
             # unexpected native Qwen <think> blocks from private history. Option B
             # intentionally enables native thinking; keep those raw blocks in the
@@ -1430,10 +1117,9 @@ def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device,
             # removes them before opponent visibility and action parsing.
             decoded = tokenizer.decode(gen_tokens, skip_special_tokens=True)
             decoded_batch.append(decoded)
-            first_pass_had_action.append(bool(ACTION_LINE_RE.search(strip_qwen_native_thinking(decoded))))
 
         if NATIVE_PUBLIC_FINALIZER and NATIVE_REASONING_PROTOCOL and CHAT_TEMPLATE_ENABLE_THINKING:
-            unfinished = [i for i, had_action in enumerate(first_pass_had_action) if not had_action]
+            unfinished = [i for i, decoded in enumerate(decoded_batch) if not ACTION_LINE_RE.search(strip_qwen_native_thinking(decoded))]
             if unfinished:
                 finalizer_prompts = [_append_native_public_finalizer(batch_prompts[i], decoded_batch[i]) for i in unfinished]
                 orig_side = tokenizer.padding_side
@@ -1461,8 +1147,6 @@ def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device,
                 for local_i, orig_i in enumerate(unfinished):
                     fin_tokens = fin_output_ids[local_i][fin_prompt_len:]
                     fin_tokens = fin_tokens[fin_tokens != tokenizer.pad_token_id]
-                    finalizer_token_counts[orig_i] = int(fin_tokens.numel())
-                    finalizer_used[orig_i] = True
                     fin_decoded = tokenizer.decode(fin_tokens, skip_special_tokens=True)
                     decoded_batch[orig_i] = (
                         (decoded_batch[orig_i] or "").rstrip()
@@ -1470,7 +1154,7 @@ def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device,
                         + fin_decoded.lstrip()
                     )
 
-        for i, decoded in enumerate(decoded_batch):
+        for decoded in decoded_batch:
             # The native-thinking prompt pre-fills an opening '<think>\n' inside
             # the prompt. Decoded new tokens may therefore contain only the body
             # plus a closing tag. Reattach the opening tag so private histories and
@@ -1479,17 +1163,6 @@ def generate_batched(model, tokenizer, prompts_text_list, max_new, temp, device,
                 decoded = "<think>\n" + decoded
             if STRIP_NATIVE_THINKING_FROM_HISTORY:
                 decoded = strip_qwen_native_thinking(decoded)
-            _record_rollout_token_result(
-                token_telemetry,
-                role,
-                tokenizer,
-                prompt_token_counts[i],
-                first_pass_token_counts[i],
-                first_pass_had_action[i],
-                finalizer_token_counts[i],
-                finalizer_used[i],
-                decoded,
-            )
             all_results.append(decoded)
     return all_results
 
@@ -1520,15 +1193,7 @@ class Episode:
     budget_violations: int
 
 
-def run_episodes_batched(
-    buyer_model,
-    seller_model,
-    tokenizer,
-    products_expanded,
-    device,
-    seller_tokenizer=None,
-    token_telemetry=None,
-):
+def run_episodes_batched(buyer_model, seller_model, tokenizer, products_expanded, device, seller_tokenizer=None):
     """Run buyer-only negotiation episodes with frozen seller, batched per turn."""
     seller_tokenizer = seller_tokenizer or tokenizer
     states = [EpisodeState(product=p, idx=i) for i, p in enumerate(products_expanded)]
@@ -1550,16 +1215,7 @@ def run_episodes_batched(
             _assert_no_private_info_leak(prompt_text, s.product, "buyer")
             buyer_prompts.append(prompt_text)
 
-        buyer_texts = generate_batched(
-            buyer_model,
-            tokenizer,
-            buyer_prompts,
-            MAX_NEW_TOKENS,
-            BUYER_TEMP,
-            device,
-            role="buyer",
-            token_telemetry=token_telemetry,
-        )
+        buyer_texts = generate_batched(buyer_model, tokenizer, buyer_prompts, MAX_NEW_TOKENS, BUYER_TEMP, device)
 
         still_active_for_seller = []
         for idx, (s, b_text) in enumerate(zip(active_buyer, buyer_texts)):
@@ -1624,16 +1280,7 @@ def run_episodes_batched(
             _assert_no_private_info_leak(prompt_text, s.product, "seller")
             seller_prompts.append(prompt_text)
 
-        seller_texts = generate_batched(
-            seller_model,
-            seller_tokenizer,
-            seller_prompts,
-            MAX_NEW_TOKENS,
-            SELLER_TEMP,
-            device,
-            role="seller",
-            token_telemetry=token_telemetry,
-        )
+        seller_texts = generate_batched(seller_model, seller_tokenizer, seller_prompts, MAX_NEW_TOKENS, SELLER_TEMP, device)
 
         for s, s_text in zip(still_active_for_seller, seller_texts):
             s_act = extract_action(s_text)
@@ -2422,7 +2069,7 @@ def save_and_push_checkpoint(buyer_model, tokenizer, metrics, iteration, final=F
         json.dump(metrics, f, indent=2)
     if PUSH_TRAINING_SCRIPT:
         try:
-            shutil.copyfile(__file__, path / Path(__file__).name)
+            shutil.copyfile(__file__, path / "train_negotiation_sdpo.py")
         except Exception:
             pass
 
@@ -2483,10 +2130,7 @@ def main():
         f"NativeFinalizer={NATIVE_PUBLIC_FINALIZER} ThinkTokens={NATIVE_THINK_TOKENS} FinalTokens={NATIVE_FINAL_TOKENS} "
         f"StripNativeFromHistory={STRIP_NATIVE_THINKING_FROM_HISTORY} DebugBuyerOutputs={DEBUG_SAMPLE_BUYER_OUTPUTS}"
     )
-    print(
-        f"[CONFIG] GradCheckpoint={GRADIENT_CHECKPOINTING} GenBatchLimit={GEN_BATCH_LIMIT} "
-        f"RolloutMaxLength={ROLLOUT_MAX_LENGTH} RolloutTokenTelemetry={ROLLOUT_TOKEN_TELEMETRY}"
-    )
+    print(f"[CONFIG] GradCheckpoint={GRADIENT_CHECKPOINTING} GenBatchLimit={GEN_BATCH_LIMIT} RolloutMaxLength={ROLLOUT_MAX_LENGTH}")
     print(f"[CONFIG] DeviceMap={MODEL_DEVICE_MAP} MaxMemoryPerGPUGiB={MAX_MEMORY_PER_GPU_GIB or '(unset)'}")
     print(f"[CONFIG] InnerEpochs={NUM_INNER_EPOCHS} NormAdvantages={NORMALIZE_ADVANTAGES}")
     print(
@@ -2500,12 +2144,6 @@ def main():
         f"UpdatePadMultiple={UPDATE_PAD_TO_MULTIPLE_OF} UpdateLengthBucketing={UPDATE_LENGTH_BUCKETING} "
         f"UpdateMaxLength={UPDATE_MAX_LENGTH}"
     )
-    if USE_LORA:
-        print(
-            f"[CONFIG] Adapter={training_adapter_slug()} UseLoRA={USE_LORA} "
-            f"LoRA(r={LORA_R}, alpha={LORA_ALPHA}, dropout={LORA_DROPOUT}, "
-            f"targets={'auto-text' if not LORA_TARGET_MODULES_RAW else LORA_TARGET_MODULES_RAW})"
-        )
     print(
         f"[CONFIG] EarlyStop format>={FORMAT_STOP_THRESHOLD}x{FORMAT_STOP_PATIENCE} "
         f"budget>={BUDGET_STOP_THRESHOLD}x{BUDGET_STOP_PATIENCE} "
@@ -2519,82 +2157,6 @@ def main():
         import wandb
 
         run_name = RUN_NAME or default_run_name()
-        wandb_config = {
-            "method": "negotiation_sdpo_grpo_qwen35_ref_free",
-            "buyer_model": MODEL_NAME,
-            "seller_model": SELLER_MODEL_NAME,
-            "num_iters": NUM_ITERS,
-            "batch_size": BATCH_SIZE,
-            "group_size": GROUP_SIZE,
-            "max_turns": MAX_TURNS,
-            "lr": LR,
-            "weight_decay": WEIGHT_DECAY,
-            "warmup_steps": WARMUP_STEPS,
-            "grad_clip_norm": GRAD_CLIP_NORM,
-            "epsilon": EPSILON,
-            "kl_coef": KL_COEF,
-            "ref_free_objective": True,
-            "reference_model_used": False,
-            "max_new_tokens": MAX_NEW_TOKENS,
-            "buyer_temp": BUYER_TEMP,
-            "seller_temp": SELLER_TEMP,
-            "reasoning_mode": REASONING_MODE,
-            "enable_native_thinking": ENABLE_NATIVE_THINKING,
-            "native_reasoning_protocol": NATIVE_REASONING_PROTOCOL,
-            "chat_template_enable_thinking": CHAT_TEMPLATE_ENABLE_THINKING,
-            "native_public_finalizer": NATIVE_PUBLIC_FINALIZER,
-            "native_think_tokens": NATIVE_THINK_TOKENS,
-            "native_final_tokens": NATIVE_FINAL_TOKENS,
-            "rollout_token_telemetry": ROLLOUT_TOKEN_TELEMETRY,
-            "strip_native_thinking_from_history": STRIP_NATIVE_THINKING_FROM_HISTORY,
-            "debug_sample_buyer_outputs": DEBUG_SAMPLE_BUYER_OUTPUTS,
-            "normalize_advantages": NORMALIZE_ADVANTAGES,
-            "num_inner_epochs": NUM_INNER_EPOCHS,
-            "sdpo_lambda": SDPO_LAMBDA,
-            "sdpo_lambda_final": SDPO_LAMBDA_FINAL,
-            "sdpo_lambda_decay_iters": SDPO_LAMBDA_DECAY_ITERS,
-            "sdpo_feedback_mode": SDPO_FEEDBACK_MODE,
-            "sdpo_adv_clip": SDPO_ADV_CLIP,
-            "distillation_level": DISTILLATION_LEVEL,
-            "top_k_distillation": TOP_K_DISTILLATION,
-            "distillation_divergence": DISTILLATION_DIVERGENCE,
-            "trust_region_interpolation": TRUST_REGION_INTERPOLATION,
-            "teacher_ema_decay": TEACHER_EMA_DECAY,
-            "sdpo_max_demo_chars": SDPO_MAX_DEMO_CHARS,
-            "sdpo_max_feedback_chars": SDPO_MAX_FEEDBACK_CHARS,
-            "format_warn_threshold": FORMAT_WARN_THRESHOLD,
-            "format_stop_threshold": FORMAT_STOP_THRESHOLD,
-            "format_stop_patience": FORMAT_STOP_PATIENCE,
-            "budget_warn_threshold": BUDGET_WARN_THRESHOLD,
-            "budget_stop_threshold": BUDGET_STOP_THRESHOLD,
-            "budget_stop_patience": BUDGET_STOP_PATIENCE,
-            "reward_stop_threshold": REWARD_STOP_THRESHOLD,
-            "reward_stop_patience": REWARD_STOP_PATIENCE,
-            "early_stop_save_checkpoint": EARLY_STOP_SAVE_CHECKPOINT,
-            "optimizer": OPTIMIZER,
-            "adamw_foreach": ADAMW_FOREACH,
-            "update_microbatch_size": UPDATE_MICROBATCH_SIZE,
-            "optim_step_every_groups": OPTIM_STEP_EVERY_GROUPS,
-            "update_pad_to_multiple_of": UPDATE_PAD_TO_MULTIPLE_OF,
-            "update_length_bucketing": UPDATE_LENGTH_BUCKETING,
-            "rollout_max_length": ROLLOUT_MAX_LENGTH,
-            "update_max_length": UPDATE_MAX_LENGTH,
-            "model_device_map": MODEL_DEVICE_MAP,
-            "max_memory_per_gpu_gib": MAX_MEMORY_PER_GPU_GIB,
-            "liger_kernel": USE_LIGER,
-            "dataset_categories": CATEGORIES,
-        }
-        if USE_LORA:
-            wandb_config.update(
-                {
-                    "adapter": training_adapter_slug(),
-                    "use_lora": USE_LORA,
-                    "lora_r": LORA_R,
-                    "lora_alpha": LORA_ALPHA,
-                    "lora_dropout": LORA_DROPOUT,
-                    "lora_target_modules_raw": LORA_TARGET_MODULES_RAW,
-                }
-            )
         wandb_run = wandb.init(
             entity=WANDB_ENTITY,
             project=WANDB_PROJECT,
@@ -2604,7 +2166,70 @@ def main():
             mode=WANDB_MODE,
             tags=WANDB_TAGS,
             save_code=False,
-            config=wandb_config,
+            config={
+                "method": "negotiation_sdpo_grpo_qwen35_ref_free",
+                "buyer_model": MODEL_NAME,
+                "seller_model": SELLER_MODEL_NAME,
+                "num_iters": NUM_ITERS,
+                "batch_size": BATCH_SIZE,
+                "group_size": GROUP_SIZE,
+                "max_turns": MAX_TURNS,
+                "lr": LR,
+                "weight_decay": WEIGHT_DECAY,
+                "warmup_steps": WARMUP_STEPS,
+                "grad_clip_norm": GRAD_CLIP_NORM,
+                "epsilon": EPSILON,
+                "kl_coef": KL_COEF,
+                "ref_free_objective": True,
+                "reference_model_used": False,
+                "max_new_tokens": MAX_NEW_TOKENS,
+                "buyer_temp": BUYER_TEMP,
+                "seller_temp": SELLER_TEMP,
+                "reasoning_mode": REASONING_MODE,
+                "enable_native_thinking": ENABLE_NATIVE_THINKING,
+                "native_reasoning_protocol": NATIVE_REASONING_PROTOCOL,
+                "chat_template_enable_thinking": CHAT_TEMPLATE_ENABLE_THINKING,
+                "native_public_finalizer": NATIVE_PUBLIC_FINALIZER,
+                "native_think_tokens": NATIVE_THINK_TOKENS,
+                "native_final_tokens": NATIVE_FINAL_TOKENS,
+                "strip_native_thinking_from_history": STRIP_NATIVE_THINKING_FROM_HISTORY,
+                "debug_sample_buyer_outputs": DEBUG_SAMPLE_BUYER_OUTPUTS,
+                "normalize_advantages": NORMALIZE_ADVANTAGES,
+                "num_inner_epochs": NUM_INNER_EPOCHS,
+                "sdpo_lambda": SDPO_LAMBDA,
+                "sdpo_lambda_final": SDPO_LAMBDA_FINAL,
+                "sdpo_lambda_decay_iters": SDPO_LAMBDA_DECAY_ITERS,
+                "sdpo_feedback_mode": SDPO_FEEDBACK_MODE,
+                "sdpo_adv_clip": SDPO_ADV_CLIP,
+                "distillation_level": DISTILLATION_LEVEL,
+                "top_k_distillation": TOP_K_DISTILLATION,
+                "distillation_divergence": DISTILLATION_DIVERGENCE,
+                "trust_region_interpolation": TRUST_REGION_INTERPOLATION,
+                "teacher_ema_decay": TEACHER_EMA_DECAY,
+                "sdpo_max_demo_chars": SDPO_MAX_DEMO_CHARS,
+                "sdpo_max_feedback_chars": SDPO_MAX_FEEDBACK_CHARS,
+                "format_warn_threshold": FORMAT_WARN_THRESHOLD,
+                "format_stop_threshold": FORMAT_STOP_THRESHOLD,
+                "format_stop_patience": FORMAT_STOP_PATIENCE,
+                "budget_warn_threshold": BUDGET_WARN_THRESHOLD,
+                "budget_stop_threshold": BUDGET_STOP_THRESHOLD,
+                "budget_stop_patience": BUDGET_STOP_PATIENCE,
+                "reward_stop_threshold": REWARD_STOP_THRESHOLD,
+                "reward_stop_patience": REWARD_STOP_PATIENCE,
+                "early_stop_save_checkpoint": EARLY_STOP_SAVE_CHECKPOINT,
+                "optimizer": OPTIMIZER,
+                "adamw_foreach": ADAMW_FOREACH,
+                "update_microbatch_size": UPDATE_MICROBATCH_SIZE,
+                "optim_step_every_groups": OPTIM_STEP_EVERY_GROUPS,
+                "update_pad_to_multiple_of": UPDATE_PAD_TO_MULTIPLE_OF,
+                "update_length_bucketing": UPDATE_LENGTH_BUCKETING,
+                "rollout_max_length": ROLLOUT_MAX_LENGTH,
+                "update_max_length": UPDATE_MAX_LENGTH,
+                "model_device_map": MODEL_DEVICE_MAP,
+                "max_memory_per_gpu_gib": MAX_MEMORY_PER_GPU_GIB,
+                "liger_kernel": USE_LIGER,
+                "dataset_categories": CATEGORIES,
+            },
         )
         WANDB_OK = True
         print(f"[WANDB] Run: {wandb_run.url}")
@@ -2625,17 +2250,7 @@ def main():
     print("\n[3/5] Loading trainable buyer model...")
     buyer_model, buyer_processor, tokenizer = _load_text_or_image_text_stack(MODEL_NAME)
     _assert_no_cpu_offload(buyer_model, "buyer_model")
-    adapter_summary = None
-    if USE_LORA:
-        buyer_model, adapter_summary = apply_lora_to_buyer_model(buyer_model)
-    if USE_LORA and WANDB_OK and wandb_run is not None:
-        try:
-            wandb_run.config.update(adapter_summary, allow_val_change=True)
-        except Exception as e:
-            print(f"  [WANDB] Adapter config update failed (non-fatal): {e}")
     if GRADIENT_CHECKPOINTING:
-        if USE_LORA and hasattr(buyer_model, "enable_input_require_grads"):
-            buyer_model.enable_input_require_grads()
         buyer_model.gradient_checkpointing_enable()
         if hasattr(buyer_model, "config"):
             buyer_model.config.use_cache = False
@@ -2643,17 +2258,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     _qwen35_text_canary(buyer_model, buyer_processor, tokenizer, dev, "buyer_model")
-    if USE_LORA:
-        print(
-            f"  [OK] Adapter={adapter_summary['adapter']} "
-            f"Trainable={adapter_summary['trainable_params']:,}/{adapter_summary['total_params']:,} "
-            f"({adapter_summary['trainable_pct']:.3f}%) "
-            f"Targets={adapter_summary.get('lora_target_count', 0)} "
-            f"InputDevice={dev} FirstParamDevice={_first_model_device(buyer_model)} "
-            f"VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB"
-        )
-    else:
-        print(f"  [OK] InputDevice={dev} FirstParamDevice={_first_model_device(buyer_model)} VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
+    print(f"  [OK] InputDevice={dev} FirstParamDevice={_first_model_device(buyer_model)} VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB")
 
     print("\n[4/5] Loading frozen seller/environment model (no reference-policy model)...")
     seller_model, seller_processor, seller_tokenizer = _load_text_or_image_text_stack(SELLER_MODEL_NAME)
@@ -2681,11 +2286,8 @@ def main():
         cpu_adamw_state = {}
         print("  [OK] AdamW optimizer state will be stored on CPU to avoid CUDA optimizer-step OOM")
     elif OPTIMIZER == "adamw_cuda":
-        optimizer_params = list(buyer_model.parameters()) if not USE_LORA else [p for p in buyer_model.parameters() if p.requires_grad]
-        if not optimizer_params:
-            raise RuntimeError("No trainable buyer parameters found for AdamW.")
         optimizer = torch.optim.AdamW(
-            optimizer_params,
+            buyer_model.parameters(),
             lr=LR,
             betas=(0.9, 0.95),
             weight_decay=WEIGHT_DECAY,
@@ -2725,23 +2327,12 @@ def main():
         buyer_model.eval()
         seller_model.eval()
         _reset_peak_memory_stats_all_gpus()
-        rollout_token_telemetry = _new_rollout_token_telemetry()
         rollout_t0 = time.time()
-        episodes = run_episodes_batched(
-            buyer_model,
-            seller_model,
-            tokenizer,
-            products_expanded,
-            dev,
-            seller_tokenizer=seller_tokenizer,
-            token_telemetry=rollout_token_telemetry,
-        )
+        episodes = run_episodes_batched(buyer_model, seller_model, tokenizer, products_expanded, dev, seller_tokenizer=seller_tokenizer)
         rollout_time = time.time() - rollout_t0
-        rollout_token_summary = _summarize_rollout_token_telemetry(rollout_token_telemetry)
         rollout_peak_vram, rollout_peak_vram_per_gpu = _peak_memory_allocated_all_gpus_gb()
         rollout_reserved_peak_vram, rollout_reserved_peak_vram_per_gpu = _peak_memory_reserved_all_gpus_gb()
         print(f"  Rollout: {n_episodes} episodes in {rollout_time:.0f}s ({rollout_time/n_episodes:.1f}s/ep)")
-        _print_rollout_token_telemetry(rollout_token_summary)
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -2866,7 +2457,6 @@ def main():
             "time": elapsed,
             "rollout_time": rollout_time,
             "update_time": update_time,
-            **rollout_token_summary,
             "update_pretokenize_s": update_stats["update_pretokenize_s"],
             "update_collate_s": update_stats["update_collate_s"],
             "update_policy_forward_s": update_stats["update_policy_forward_s"],
@@ -2923,7 +2513,6 @@ def main():
                         "perf/iter_time_s": elapsed,
                         "perf/rollout_time_s": rollout_time,
                         "perf/update_time_s": update_time,
-                        **{f"perf/{k}": v for k, v in rollout_token_summary.items()},
                         "objective/ref_free": 1,
                         "objective/reference_model_used": 0,
                         "objective/kl_coef": KL_COEF,
@@ -3036,7 +2625,7 @@ def main():
         json.dump(metrics, f, indent=2)
     if PUSH_TRAINING_SCRIPT:
         try:
-            shutil.copyfile(__file__, save_path / Path(__file__).name)
+            shutil.copyfile(__file__, save_path / "train_negotiation_sdpo.py")
         except Exception:
             pass
     print(f"  Saved to {save_path}")
