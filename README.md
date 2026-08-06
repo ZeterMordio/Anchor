@@ -28,15 +28,6 @@ The reward is clipped to `[-1, 1]`. A failed negotiation scores `0`; buyer forma
 
 Pure GRPO uses the episode reward for group-relative advantages. The SDPO path also evaluates the sampled buyer response under hindsight verifier feedback. The log-probability gap from that same-policy teacher supplies token-level credit. The main launcher starts with a GRPO-heavy mixture and moves to an even GRPO/SDPO split by iteration 20. The update is on-policy and does not load a separate reference policy.
 
-## Current status
-
-| Run | Outcome |
-| --- | --- |
-| [Pure GRPO, Qwen3 4B](https://huggingface.co/ZeterMordio/anchor-negotiation-pure) | Completed the planned 42 iterations. This is the reproduction baseline. |
-| [Qwen3.5 9B SDPO fastpath smoke](https://huggingface.co/ZeterMordio/anchor-negotiation-sdpo-qwen35-fastpath-2iter-20260523-045622) | Completed two production-shaped iterations and early-stopped on format warnings. Mean reward moved from `-0.1019` to `-0.1905`; deal rate moved from `46.1%` to `35.2%`. |
-
-The Qwen3.5 run validates model loading, rollouts, dense updates, checkpointing, and telemetry on the pinned CUDA fastpath image. It does not establish that SDPO improves negotiation quality. See [`JOURNAL.md`](JOURNAL.md) for run configurations, failed approaches, timing data, and the reasoning behind current defaults.
-
 ## Run the main experiment
 
 The supported production path uses Hugging Face Jobs and the prebuilt Qwen3.5 image. It requires:
@@ -80,30 +71,6 @@ The launcher deliberately fixes dense training to `a100-large`, saves every 10 i
 
 The training scripts are standalone and configured through environment variables. Their defaults are part of the experiment definition and are logged with each run. `train_negotiation_sdpo_qwen35.py` currently defaults to Qwen3.5 9B, 60 iterations, batches of 16 products with 8 rollouts each, six turns, and strict feedback that does not reveal the seller's private cost.
 
-## Local checks
-
-Syntax-check the active scripts without downloading model weights:
-
-```bash
-python3 -m py_compile \
-  train_negotiation_pure.py \
-  train_negotiation_sdpo.py \
-  train_negotiation_sdpo_qwen35.py \
-  eval_negotiation.py
-```
-
-Run the lightweight launcher tests:
-
-```bash
-uv run --with pytest pytest -q tests/test_launch_qwen35_fastpath_sdpo.py
-```
-
-The LoRA and training-module tests also require PyTorch and Transformers. GPU execution uses the pinned image rather than a local macOS environment.
-
 ## Scope and limitations
 
-- Dense Qwen3.5 training keeps a live buyer and seller on one GPU. The current path needs an A100 with 80 GB of memory.
-- The scripts fetch the dataset from GitHub at runtime, so runs depend on network access and the upstream file layout.
-- Evaluation and training share the seeded `802/128` split across all 18 dataset categories.
-- There is no installable package or stable API. The repository contains research scripts and their experiment log.
-- No software license has been added.
+- Dense Qwen3.5 training keeps a live buyer and seller on one GPU. **The current path needs an A100 with 80 GB of memory.**
