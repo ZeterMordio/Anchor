@@ -4,7 +4,7 @@ Anchor trains Qwen-3 in bilateral price negotiation with RLVR (reinforcement lea
 
 The buyer has a private budget, a frozen seller has a private cost. They bargain over products drawn from [AmazonPriceHistory](https://github.com/TianXiaSJTU/AmazonPriceHistory), and only the buyer receives gradient updates.
 
-**This is active, unfinished research code.**
+*This is unfinished active research code!*
 
 ## Method
 
