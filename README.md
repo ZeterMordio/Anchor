@@ -1,6 +1,8 @@
 # Anchor
 
-Anchor trains Qwen-3 in bilateral price negotiation with RLVR (reinforcement learning from verifiable rewards). It reproduces the buyer-only protocol from [*Instructing LLMs to Negotiate using Reinforcement Learning with Verifiable Rewards*](https://huggingface.co/papers/2604.09855) and tests whether hindsight feedback through self-distillation policy optimization (SDPO) improves on pure GRPO.
+Anchor trains Qwen-3 in bilateral price negotiation through RLVR (reinforcement learning from verifiable rewards). 
+
+It reproduces the buyer-only protocol from [*Instructing LLMs to Negotiate using Reinforcement Learning with Verifiable Rewards*](https://huggingface.co/papers/2604.09855) and tests whether hindsight feedback through self-distillation policy optimization (SDPO) improves on pure GRPO.
 
 The buyer has a private budget, a frozen seller has a private cost. They bargain over products drawn from [AmazonPriceHistory](https://github.com/TianXiaSJTU/AmazonPriceHistory), and only the buyer receives gradient updates.
 
