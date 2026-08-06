@@ -73,8 +73,8 @@ The launcher deliberately fixes dense training to `a100-large`, saves every 10 i
 | [`train_negotiation_sdpo.py`](train_negotiation_sdpo.py) | Qwen3 8B fallback and control. |
 | [`train_negotiation_pure.py`](train_negotiation_pure.py) | Pure buyer-only GRPO baseline. |
 | [`eval_negotiation.py`](eval_negotiation.py) | Checkpoint evaluation against the frozen seller on the held-out split. |
-| [`tools/`](tools/) | HF Jobs launcher, fastpath canary, and maintenance utilities. |
-| [`deprecated/`](deprecated/) | Archived dual-role and SPIRAL experiments. |
+| [`tools/`](tools/README.md) | HF Jobs launcher, fastpath canary, and maintenance utilities. |
+| [`deprecated/`](deprecated/README.md) | Archived dual-role and SPIRAL experiments. |
 
 The training scripts are standalone and configured through environment variables. Their defaults are part of the experiment definition and are logged with each run. `train_negotiation_sdpo_qwen35.py` currently defaults to Qwen3.5 9B, 60 iterations, batches of 16 products with 8 rollouts each, six turns, and strict feedback that does not reveal the seller's private cost.
 
