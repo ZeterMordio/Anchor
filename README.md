@@ -73,4 +73,4 @@ The training scripts are standalone and configured through environment variables
 
 ## Scope and limitations
 
-- Dense Qwen3.5 training keeps a live buyer and seller on one GPU. **The current path needs an A100 with 80 GB of memory.**
+Dense Qwen3.5 training keeps a live buyer and seller on one GPU. **The current path needs an A100 with 80 GB of memory.**
