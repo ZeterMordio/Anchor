@@ -73,4 +73,4 @@ The training scripts are standalone and configured through environment variables
 
 ## GPU requirements
 
-**The current path needs an A100 (or comparable GPU) with 80 GB of VRAM!**
+**The current path needs an A100 (or comparable) with 80 GB of VRAM.**
