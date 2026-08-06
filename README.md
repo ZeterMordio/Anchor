@@ -28,7 +28,7 @@ The reward is clipped to `[-1, 1]`. A failed negotiation scores `0`; buyer forma
 
 Pure GRPO uses the episode reward for group-relative advantages. The SDPO path also evaluates the sampled buyer response under hindsight verifier feedback. The log-probability gap from that same-policy teacher supplies token-level credit. The main launcher starts with a GRPO-heavy mixture and moves to an even GRPO/SDPO split by iteration 20. The update is on-policy and does not load a separate reference policy.
 
-## Run the main experiment
+## Running the experiment
 
 The supported production path uses Hugging Face Jobs and the prebuilt Qwen3.5 image. It requires:
 
@@ -71,6 +71,6 @@ The launcher deliberately fixes dense training to `a100-large`, saves every 10 i
 
 The training scripts are standalone and configured through environment variables. Their defaults are part of the experiment definition and are logged with each run. `train_negotiation_sdpo_qwen35.py` currently defaults to Qwen3.5 9B, 60 iterations, batches of 16 products with 8 rollouts each, six turns, and strict feedback that does not reveal the seller's private cost.
 
-## Scope and limitations
+## GPU requirements
 
 **The current path needs an A100 (or comparable GPU) with 80 GB of VRAM!**
